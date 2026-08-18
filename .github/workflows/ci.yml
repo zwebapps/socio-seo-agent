@@ -13,6 +13,30 @@ jobs:
   python:
     name: Python — lint, types, tests
     runs-on: ubuntu-latest
+
+    # The db-marked tests skip when Postgres is unreachable, which is right for a
+    # developer laptop and wrong for CI: a silently-skipped tenant-isolation test
+    # is indistinguishable from a passing one.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: sma
+          POSTGRES_PASSWORD: sma
+          POSTGRES_DB: sma
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U sma -d sma"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      ENVIRONMENT: ci
+      DATABASE_URL: postgresql+asyncpg://sma:sma@localhost:5435/sma
+      APP_DATABASE_URL: postgresql+asyncpg://sma_app:sma_app@localhost:5435/sma
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,9 +55,18 @@ jobs:
       - name: Mypy (strict)
         run: uv run mypy backend tests
 
+      # Creates the schema, the RLS policies, and the restricted sma_app role.
+      - name: Migrate
+        run: uv run alembic upgrade head
+
       # No external network calls: every provider is faked in tests.
       - name: Pytest
         run: uv run pytest
+
+      # A skipped db test in CI would hide the isolation proof, so fail if any
+      # test was skipped rather than run.
+      - name: Assert the database tests actually ran
+        run: uv run pytest tests/db -q --no-header -p no:randomly | tee /tmp/db.txt && ! grep -q "skipped" /tmp/db.txt
 
   web:
     name: Web — types, build

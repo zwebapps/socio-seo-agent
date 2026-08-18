@@ -27,6 +27,20 @@ class Settings(BaseSettings):
 
     # Infra. Ports are deliberately non-default so this project cannot collide
     # with a Postgres or Redis instance another project is already running.
+    #
+    # TWO database URLs, and the distinction is a security boundary, not tidiness:
+    #
+    #   app_database_url  the RUNTIME connection, as the restricted `sma_app`
+    #                     role: no superuser, no BYPASSRLS, not the table owner.
+    #                     Row-level security therefore actually applies. All
+    #                     application queries use this.
+    #
+    #   database_url      the OWNER connection, used by Alembic only. It is a
+    #                     superuser locally, which is precisely why the runtime
+    #                     must not use it -- a superuser bypasses every policy,
+    #                     and an isolation test run as one would pass while
+    #                     proving nothing.
+    app_database_url: str = "postgresql+asyncpg://sma_app:sma_app@localhost:5435/sma"
     database_url: str = "postgresql+asyncpg://sma:sma@localhost:5435/sma"
     redis_url: str = "redis://localhost:6381/0"
 

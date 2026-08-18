@@ -47,7 +47,12 @@ def _engine_modules() -> list[Path]:
 
 
 def _imported_modules(source: str) -> set[str]:
-    """Collect every module name imported by a source file, absolute or relative."""
+    """Collect every module name imported by a source file, absolute or relative.
+
+    A ``SyntaxError`` is re-raised as a readable failure rather than surfacing as
+    an ``ast.py`` traceback -- an unparseable engine is still a broken engine, but
+    the report should name the file and line.
+    """
     tree = ast.parse(source)
     found: set[str] = set()
 
@@ -78,7 +83,14 @@ def test_engines_import_nothing_forbidden() -> None:
     violations: list[str] = []
 
     for path in _engine_modules():
-        for module_name in sorted(_imported_modules(path.read_text(encoding="utf-8"))):
+        try:
+            imported = _imported_modules(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            relative = path.relative_to(ENGINES_DIR.parents[3])
+            violations.append(f"{relative} does not parse: line {exc.lineno}: {exc.msg}")
+            continue
+
+        for module_name in sorted(imported):
             reason = _violation(module_name)
             if reason is not None:
                 relative = path.relative_to(ENGINES_DIR.parents[3])

@@ -10,14 +10,31 @@ dependencies = [
     "pydantic>=2.13.4",
     "pydantic-settings>=2.15.0",
     "httpx>=0.28.1",
+    # Persistence (Phase 1-3)
+    "sqlalchemy[asyncio]>=2.0.52",
+    "alembic>=1.19.1",
+    "asyncpg>=0.31.0",
+    "pgvector>=0.5.0",
+    # HTML fetch + parse, for the crawl and seo engines (Phase 1, 4)
+    "beautifulsoup4>=4.15.0",
+    "lxml>=6.1.1",
+    "trafilatura>=2.2.0",
+    # E.164 phone normalisation, for the NAP audit engine (Phase 4).
+    # A naive string compare produces false "inconsistencies", which destroys
+    # trust in the whole audit screen -- so normalisation is a real library.
+    "phonenumbers>=9.0.37",
+    # Model access. OpenRouter is OpenAI-compatible, so one SDK covers it; the
+    # anthropic SDK is the SECOND adapter, which is what proves the router
+    # abstraction rather than asserting it.
+    "openai>=3.2.0",
+    "anthropic>=0.122.0",
+    # Queue + rate-limit token buckets shared across workers (Phase 2)
+    "redis>=8.1.0",
 ]
 
-# Phase-gated dependencies, added when the phase that needs them lands:
-#   Phase 1  sqlalchemy, alembic, asyncpg, trafilatura, pypdf, python-docx
-#   Phase 2  redis, openai (OpenRouter-compatible), anthropic
-#   Phase 3  pgvector, langgraph, langchain-core
+# Still phase-gated, added when the phase that needs them lands:
+#   Phase 3  langgraph, langchain-core, pypdf, python-docx
 #   Phase 12 langfuse, ragas
-# Installing them before they are used only adds lockfile noise and review surface.
 
 [dependency-groups]
 dev = [
@@ -54,4 +71,7 @@ exclude = ["frontend"]
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+markers = [
+    "db: needs a live Postgres; skipped when unreachable, always run in CI",
+]
 asyncio_mode = "auto"
