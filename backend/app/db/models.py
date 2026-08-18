@@ -5,9 +5,10 @@ with the phase that needs them rather than all at once, so a migration is never
 speculative.
 
 Present here: users, businesses, documents, kb_chunks, crawl_pages, runs,
-run_events, model_usage, actions, opportunities, content_pieces.
-Still to come: keywords, competitors, geo_prompts, geo_results, social_posts,
-leads, feedback, learned_style, approvals.
+run_events, model_usage, actions, opportunities, content_pieces, geo_prompts,
+geo_results.
+Still to come: keywords, competitors, social_posts, leads, feedback,
+learned_style, approvals.
 """
 
 from datetime import datetime
@@ -350,3 +351,69 @@ class ContentPiece(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
             name="status_valid",
         ),
     )
+
+
+class GeoPrompt(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """One question in the AI-visibility prompt set.
+
+    The set is versioned because comparing this week's share of voice to last
+    week's is only valid if the questions did not change. A prompt is deactivated
+    rather than deleted, so historical results stay interpretable.
+    """
+
+    __tablename__ = "geo_prompts"
+
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    set_version: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    active: Mapped[bool] = mapped_column(default=True, server_default=text("true"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "business_id",
+            "set_version",
+            "prompt",
+            name="uq_geo_prompts_business_id_set_version_prompt",
+        ),
+    )
+
+
+class GeoResult(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """One probe: what one model answered to one prompt, at one moment.
+
+    ``no_answer`` is a first-class column, not an absence of data, and it is
+    excluded from the share-of-voice denominator. A model outage or refusal must
+    never be recorded as the brand being absent -- that is the difference between
+    a measurement and a fabrication.
+    """
+
+    __tablename__ = "geo_results"
+
+    geo_prompt_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("geo_prompts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    mentioned: Mapped[bool] = mapped_column(
+        default=False, server_default=text("false"), nullable=False
+    )
+    cited: Mapped[bool] = mapped_column(default=False, server_default=text("false"), nullable=False)
+    no_answer: Mapped[bool] = mapped_column(
+        default=False, server_default=text("false"), nullable=False
+    )
+
+    # A short excerpt only. The full answer is neither ours nor useful to keep,
+    # and storing it would make this table grow without bound.
+    answer_excerpt: Mapped[str | None] = mapped_column(Text)
+    competitors_seen: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    probed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)

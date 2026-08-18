@@ -25,21 +25,24 @@ from sqlalchemy import CursorResult, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from backend.app.db import models  # noqa: F401  -- registers every table on the metadata
+from backend.app.db.base import Base
+
 pytestmark = pytest.mark.db
 
-# Every business-scoped table. A new one added without a policy shows up here as
-# a failure rather than as a review comment.
-BUSINESS_SCOPED_TABLES = [
-    "documents",
-    "kb_chunks",
-    "crawl_pages",
-    "runs",
-    "run_events",
-    "model_usage",
-    "actions",
-    "opportunities",
-    "content_pieces",
-]
+
+def _business_scoped_tables() -> list[str]:
+    """Every table carrying ``business_id``, derived from the ORM.
+
+    Derived rather than hardcoded on purpose. A hardcoded list is a list someone
+    forgets to update, and the thing they would forget is a cross-tenant policy --
+    so a new business-scoped table now fails this test automatically instead of
+    quietly shipping without protection.
+    """
+    return sorted(name for name, table in Base.metadata.tables.items() if "business_id" in table.c)
+
+
+BUSINESS_SCOPED_TABLES = _business_scoped_tables()
 
 
 async def _scoped(engine: AsyncEngine, business_id: UUID) -> AsyncIterator[AsyncSession]:
@@ -59,6 +62,10 @@ async def test_every_business_scoped_table_has_a_policy(app_engine: AsyncEngine)
             text("SELECT tablename FROM pg_policies WHERE schemaname = 'public'")
         )
         with_policy = {r[0] for r in rows}
+
+    assert BUSINESS_SCOPED_TABLES, (
+        "derivation found no business-scoped tables; the test would be vacuous"
+    )
 
     missing = set(BUSINESS_SCOPED_TABLES) - with_policy
     assert not missing, f"business-scoped tables without an RLS policy: {sorted(missing)}"
