@@ -43,6 +43,11 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "respx>=0.23.1",
+    # openai v3 is built on httpx2, NOT httpx, so respx cannot intercept it --
+    # a suite that thinks it is mocking an OpenAI-SDK call is really hitting the
+    # network. Hermetic tests for that surface need httpx2.MockTransport, so the
+    # transitive dependency is declared explicitly rather than relied upon.
+    "httpx2>=0.28.0",
 ]
 
 [tool.uv]

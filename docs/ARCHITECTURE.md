@@ -349,7 +349,7 @@ Agent node ──► ModelRouter.resolve(task_class, business_policy)
 | classify / extract / repack | cheap | INTAKE, REPACK, `geo` answer parsing |
 | plan / prioritise | mid | OPPORTUNITY, PLAN |
 | long-form generation | strong | GENERATE |
-| final quality review | strong | optional review pass |
+| final quality review | mid | optional review pass — **MID, not strong**: a reviewer checks a draft against stated constraints, which is a judgement task rather than a generation one, and GENERATE stays the only STRONG consumer so the per-piece cost stays predictable. A test fails if a second task drifts onto STRONG. |
 | embeddings | dedicated small model | `kb` ingest |
 
 **Never a hardcoded model name outside `models/`.** Prompts are versioned files (`prompts/generate.v3.md`); the version is recorded on every call, so an eval can attribute a quality change to a prompt or a model rather than to folklore.
