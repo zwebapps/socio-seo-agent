@@ -36,7 +36,9 @@ __all__ = [
     "normalise_phone",
     "normalise_postcode",
     "normalise_street_name",
+    "phone_extension_difference",
     "split_street_and_number",
+    "strip_address_annotation",
 ]
 
 
@@ -196,6 +198,83 @@ _STREET_TYPES = (
 )
 
 
+# Floor, entrance and addressee annotations. "Hauptstraße 12a, 3. OG" is the same
+# address as "Hauptstraße 12a" -- the floor says where in the building to go, and
+# a directory appends it freely. Stripped from the comparison form only; the
+# display value keeps it, because the owner may need it on a parcel.
+#
+# Two safety rules, because a greedy stripper here would silently delete real
+# addresses: a separator before the annotation is mandatory (so the "haus" in
+# "Hausvogteiplatz" and the "weg" in "Hochhausweg" cannot match), and a strip that
+# would leave nothing behind is refused.
+_ADDRESS_ANNOTATION = re.compile(
+    r"""
+    [\s,;]+                                       # mandatory separator
+    (?P<annotation>
+        (?:
+            \d{1,2}\s*\.?\s*(?:og|obergeschoss|etage|stock)\b
+          | (?:og|eg|ug|dg)\b
+          | (?:erd|ober|unter|dach)geschoss\b
+          | (?:og|etage|stock)\s*\.?\s*\d{1,2}\b
+          | (?:hinter|vorder|r(?:ü|ue)ck|seiten)(?:haus|geb(?:ä|ae)ude|fl(?:ü|ue)gel)\b
+          | (?:eingang|aufgang|haus|geb(?:ä|ae)ude|whg|wohnung|app|apartment|zimmer)
+            \s*\.?\s*[0-9a-z]{1,4}\b
+          | c\s*/\s*o\b.*
+          | z\.?\s*hd\.?\b.*
+        )
+        \s*\.?
+    )
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_MAX_ANNOTATIONS = 3
+_HAS_LETTER = re.compile(r"[^\W\d_]")
+_BARE_HOUSE_NUMBER = re.compile(r"\d+\s*[a-z]?", re.IGNORECASE)
+
+
+def _keeps_a_real_address(remainder: str) -> bool:
+    """Would stripping still leave something that looks like an address?
+
+    A remainder with a letter is a street. A bare "12" or "12a" is a house number,
+    which is the case where the annotation sat in the house-number field. A
+    remainder of "3." is neither: that digit is the ordinal of "3. OG" and the
+    value was nothing but an annotation to begin with.
+    """
+    if _HAS_LETTER.search(remainder):
+        return True
+    return _BARE_HOUSE_NUMBER.fullmatch(remainder) is not None
+
+
+def strip_address_annotation(value: str | None) -> tuple[str | None, str | None]:
+    """Split ``"Hauptstraße 12a, 3. OG"`` into ``("Hauptstraße 12a", "3. OG")``.
+
+    Handles a stack of them ("Hauptstraße 12, Hinterhaus, 2. OG") and returns the
+    annotations in the order they were written. Returns the input unchanged with
+    ``None`` when there is nothing to strip -- including when the value is
+    *entirely* an annotation, since throwing away the only address line we have
+    would be worse than comparing a strange one.
+    """
+    text = _clean(value)
+    if text is None:
+        return None, None
+
+    annotations: list[str] = []
+    for _ in range(_MAX_ANNOTATIONS):
+        match = _ADDRESS_ANNOTATION.search(text)
+        if match is None:
+            break
+        remainder = text[: match.start()].strip(" ,;")
+        if not _keeps_a_real_address(remainder):
+            break
+        annotations.append(match.group("annotation").strip(" ,;"))
+        text = remainder
+
+    if not annotations:
+        return text, None
+    return text, ", ".join(reversed(annotations))
+
+
 def split_street_and_number(street: str | None) -> tuple[str | None, str | None]:
     """Split ``"Löhrstraße 12a"`` into ``("Löhrstraße", "12a")``.
 
@@ -224,7 +303,7 @@ def normalise_street_name(value: str | None) -> str | None:
     converge through the final space-and-hyphen removal, which is also what makes
     ``Karl-Marx-Straße`` equal ``Karl Marx Strasse``.
     """
-    text = _clean(value)
+    text, _ = strip_address_annotation(value)
     if text is None:
         return None
     folded = fold_for_comparison(text)
@@ -240,7 +319,7 @@ def normalise_house_number(value: str | None) -> str | None:
 
     ``"12a"`` == ``"12 a"`` == ``"12A"``; ``"12-14"`` == ``"12 - 14"`` == ``"12/14"``.
     """
-    text = _clean(value)
+    text, _ = strip_address_annotation(value)
     if text is None:
         return None
     parts = re.findall(r"(\d+)\s*([a-z]*)", fold_for_comparison(text))
@@ -345,6 +424,52 @@ def _display_phone(value: str | None, *, country: str) -> str | None:
     if not phonenumbers.is_valid_number(parsed):
         return text
     return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+
+
+# A German switchboard publishes a Durchwahl: the same line plus an extension,
+# "-0" being the switchboard itself. Two numbers where one is the other plus a
+# short numeric tail are one line, not two subscribers.
+#
+# The bounds matter. Up to five extension digits covers every Durchwahl scheme in
+# use; requiring six shared digits means a genuinely short number can never be
+# read as somebody else's base. Both sides have already passed
+# ``is_valid_number``, so the shared part is a real number rather than a fragment.
+_MAX_EXTENSION_DIGITS = 5
+_MIN_SHARED_DIGITS = 6
+
+
+def phone_extension_difference(left: str, right: str) -> str | None:
+    """Return the extension digits when two E.164 numbers are one line, else ``None``.
+
+    ``+49261123456`` vs ``+492611234560`` -> ``"0"``: the same line, reached
+    through the switchboard. ``+4926112345612`` vs ``+4926199999912`` -> ``None``:
+    the base numbers differ, so these are two different subscribers no matter what
+    they share at the end.
+
+    Direction-agnostic -- it does not matter which side carries the extension.
+    """
+    try:
+        left_number = phonenumbers.parse(left, None)
+        right_number = phonenumbers.parse(right, None)
+    except phonenumbers.NumberParseException:
+        return None
+    if left_number.country_code != right_number.country_code:
+        return None
+
+    left_digits = phonenumbers.national_significant_number(left_number)
+    right_digits = phonenumbers.national_significant_number(right_number)
+    if left_digits == right_digits:
+        return None
+
+    shorter, longer = sorted((left_digits, right_digits), key=len)
+    # Equal lengths cannot be a prefix pair, so this also rejects "one digit
+    # different" -- which is the typo we most want to keep reporting as an error.
+    if not longer.startswith(shorter) or len(shorter) < _MIN_SHARED_DIGITS:
+        return None
+    extension = longer[len(shorter) :]
+    if len(extension) > _MAX_EXTENSION_DIGITS:
+        return None
+    return extension
 
 
 # --------------------------------------------------------------------------- #
@@ -533,13 +658,16 @@ def comparison_form(fields: NapFieldSet, *, country: str = "DE") -> NapCompariso
     Used for the business's own record *and* for every directory listing, so the
     two sides of a diff can never be normalised by different rules.
     """
-    street_name, inline_number = split_street_and_number(fields.street)
-    house_number = _clean(fields.house_number) or inline_number
+    # Annotations come off before the house number is split, or "Hauptstraße 12a,
+    # 3. OG" has no trailing number to find and the whole line becomes the street.
+    address, _ = strip_address_annotation(fields.street)
+    street_name, inline_number = split_street_and_number(address)
+    house_number, _ = strip_address_annotation(fields.house_number)
     return NapComparison(
         legal_name=normalise_business_name(fields.legal_name),
         trading_name=normalise_business_name(fields.trading_name),
         street=normalise_street_name(street_name),
-        house_number=normalise_house_number(house_number),
+        house_number=normalise_house_number(house_number or inline_number),
         postcode=normalise_postcode(fields.postcode, country=country),
         city=normalise_city(fields.city),
         phone=normalise_phone(fields.phone, country=country),
@@ -547,6 +675,32 @@ def comparison_form(fields: NapFieldSet, *, country: str = "DE") -> NapCompariso
         opening_hours=normalise_opening_hours(fields.opening_hours),
         primary_category=normalise_business_name(fields.primary_category),
     )
+
+
+def _display_address(raw: RawNap) -> tuple[str | None, str | None]:
+    """Display street and house number, with any annotation preserved.
+
+    The annotation rides on the house number, because that is where a German
+    address line puts it: concatenating the two display fields gives back
+    "Hauptstraße 12a, 3. OG". It is dropped from the comparison form only, so the
+    owner keeps the detail a courier needs while the diff ignores it.
+
+    (A dedicated ``address_annotation`` field would be tidier still, but that
+    widens the public contract; noted rather than done.)
+    """
+    address, street_annotation = strip_address_annotation(raw.street)
+    street_name, inline_number = split_street_and_number(address)
+    number, number_annotation = strip_address_annotation(raw.house_number)
+
+    house_number = number or inline_number
+    annotation = street_annotation or number_annotation
+    if annotation is None:
+        return street_name, house_number
+    if house_number is not None:
+        return street_name, f"{house_number}, {annotation}"
+    if street_name is not None:
+        return f"{street_name}, {annotation}", None
+    return street_name, house_number
 
 
 def normalise_nap(raw: RawNap, *, country: str = "DE") -> CanonicalNap:
@@ -558,14 +712,15 @@ def normalise_nap(raw: RawNap, *, country: str = "DE") -> CanonicalNap:
     is folded.
 
     An inline house number is lifted out of ``street`` so the display record has
-    the two fields directories ask for separately.
+    the two fields directories ask for separately, and a floor or entrance
+    annotation stays with it.
     """
-    street_name, inline_number = split_street_and_number(raw.street)
+    street_display, house_number_display = _display_address(raw)
     return CanonicalNap(
         legal_name=_clean(raw.legal_name),
         trading_name=_clean(raw.trading_name),
-        street=street_name,
-        house_number=_clean(raw.house_number) or inline_number,
+        street=street_display,
+        house_number=house_number_display,
         # A valid postcode is displayed in its bare five-digit form; an invalid one
         # is echoed back unchanged rather than silently "corrected".
         postcode=normalise_postcode(raw.postcode, country=country) or _clean(raw.postcode),

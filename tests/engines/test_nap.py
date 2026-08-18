@@ -33,7 +33,9 @@ from backend.app.engines.nap import (
     normalise_phone,
     normalise_postcode,
     normalise_street_name,
+    phone_extension_difference,
     split_street_and_number,
+    strip_address_annotation,
 )
 
 # The benchmark business: a real-shaped German SMB. Every field populated, so a
@@ -778,3 +780,267 @@ class TestDeterminism:
         before = (record.model_dump(), [item.model_dump() for item in listings])
         audit_nap(record, listings)
         assert (record.model_dump(), [item.model_dump() for item in listings]) == before
+
+
+# --------------------------------------------------------------------------- #
+# Two benign differences that must never read as faults
+# --------------------------------------------------------------------------- #
+
+# German switchboards publish a Durchwahl: the same line, plus an extension. "-0"
+# is the switchboard itself.
+EXTENSION_SUFFIXES = ["-0", "-1", "-12", "-100", "-1234", " - 0", "/0"]
+
+# Floor, entrance and addressee annotations. The address is identical; these say
+# where in the building to go, and a directory appends them freely.
+ADDRESS_ANNOTATIONS = [
+    "3. OG",
+    "3.OG",
+    "2 OG",
+    "EG",
+    "UG",
+    "DG",
+    "Erdgeschoss",
+    "2. Obergeschoss",
+    "Untergeschoss",
+    "Dachgeschoss",
+    "3. Etage",
+    "1. Stock",
+    "Hinterhaus",
+    "Vorderhaus",
+    "Seitenflügel",
+    "Seitenfluegel",
+    "Rückgebäude",
+    "Eingang B",
+    "Aufgang 2",
+    "Haus 3",
+    "Gebäude C",
+    "Gebaeude C",
+    "Whg 4",
+    "Wohnung 12",
+    "c/o Müller",
+    "z. Hd. Frau Müller",
+]
+
+
+class TestSwitchboardExtensions:
+    """``0261 123456`` and ``0261 123456-0`` are one line, not two numbers.
+
+    Flagging a business's own switchboard in red alongside a genuinely wrong
+    number destroys the severity signal: a user whose correct number is marked
+    ``error`` stops reading the ``error`` rows. So this is reported -- publishing
+    one consistent number is still better for entity matching -- but as ``info``,
+    and it costs nothing.
+    """
+
+    @pytest.mark.parametrize("suffix", EXTENSION_SUFFIXES)
+    def test_an_extension_on_the_listing_is_info_not_error(self, suffix: str) -> None:
+        result = audit_one(phone=f"0261 123456{suffix}")
+        assert len(result.findings) == 1, [f.fix_hint for f in result.findings]
+        finding = result.findings[0]
+        assert finding.field == "phone"
+        assert finding.severity == "info"
+        assert "extension" in finding.fix_hint
+        assert result.consistency_score == 100
+
+    @pytest.mark.parametrize("suffix", EXTENSION_SUFFIXES)
+    def test_an_extension_on_the_canonical_record_is_info_not_error(self, suffix: str) -> None:
+        # The reverse direction: we hold the switchboard, the directory holds the
+        # bare line. Equally benign, equally not an error.
+        result = audit_nap(canonical(phone=f"0261 123456{suffix}"), [listing(phone="0261 123456")])
+        assert len(result.findings) == 1, [f.fix_hint for f in result.findings]
+        finding = result.findings[0]
+        assert (finding.field, finding.severity) == ("phone", "info")
+        assert "extension" in finding.fix_hint
+        assert result.consistency_score == 100
+
+    def test_the_hint_names_both_numbers(self) -> None:
+        finding = audit_one(phone="0261 123456-0").findings[0]
+        assert finding.found_value is not None
+        assert finding.canonical_value is not None
+        assert finding.found_value in finding.fix_hint
+        assert finding.canonical_value in finding.fix_hint
+
+    def test_a_different_base_number_with_the_same_extension_is_still_an_error(self) -> None:
+        result = audit_nap(canonical(phone="0261 123456-12"), [listing(phone="0261 999999-12")])
+        assert len(result.findings) == 1
+        assert (result.findings[0].field, result.findings[0].severity) == ("phone", "error")
+
+    @pytest.mark.parametrize("wrong", ["0261 999999", "+49 30 123456", "0261 123457"])
+    def test_a_genuinely_different_number_is_still_an_error(self, wrong: str) -> None:
+        result = audit_one(phone=wrong)
+        assert [(f.field, f.severity) for f in result.findings] == [("phone", "error")]
+
+    def test_a_long_trailing_difference_is_not_treated_as_an_extension(self) -> None:
+        # Six extra digits is another subscriber, not a Durchwahl.
+        result = audit_one(phone="0261 123456123456")
+        assert [(f.field, f.severity) for f in result.findings] == [("phone", "error")]
+
+
+class TestAddressAnnotations:
+    """``Hauptstraße 12a`` and ``Hauptstraße 12a, 3. OG`` are the same address.
+
+    The floor is delivery detail, not a NAP inconsistency. It is stripped from the
+    comparison form and kept in the display value, because the owner may well need
+    it on a parcel.
+    """
+
+    @staticmethod
+    def address(**overrides: str | None) -> CanonicalNap:
+        return canonical(street="Hauptstraße", house_number="12a", **overrides)
+
+    @pytest.mark.parametrize("annotation", ADDRESS_ANNOTATIONS)
+    def test_an_annotation_after_a_comma_is_not_an_address_mismatch(self, annotation: str) -> None:
+        result = audit_nap(
+            self.address(), [listing(street=f"Hauptstraße 12a, {annotation}", house_number=None)]
+        )
+        assert {f.severity for f in result.findings} <= {"info"}, [
+            (f.field, f.severity, f.fix_hint) for f in result.findings
+        ]
+        assert result.consistency_score == 100
+
+    @pytest.mark.parametrize("annotation", ADDRESS_ANNOTATIONS)
+    def test_an_annotation_without_a_comma_is_not_an_address_mismatch(
+        self, annotation: str
+    ) -> None:
+        result = audit_nap(
+            self.address(), [listing(street=f"Hauptstraße 12a {annotation}", house_number=None)]
+        )
+        assert {f.severity for f in result.findings} <= {"info"}, [
+            (f.field, f.severity, f.fix_hint) for f in result.findings
+        ]
+        assert result.consistency_score == 100
+
+    def test_an_annotation_in_the_house_number_field_is_not_a_mismatch(self) -> None:
+        result = audit_nap(
+            self.address(), [listing(street="Hauptstraße", house_number="12a, 3. OG")]
+        )
+        assert {f.severity for f in result.findings} <= {"info"}
+        assert result.consistency_score == 100
+
+    def test_a_real_street_difference_alongside_an_annotation_is_still_reported(self) -> None:
+        result = audit_nap(
+            self.address(), [listing(street="Nebenstraße 12a, 3. OG", house_number=None)]
+        )
+        assert ("street", "warn") in [(f.field, f.severity) for f in result.findings]
+
+    def test_a_real_house_number_difference_alongside_an_annotation_is_still_reported(
+        self,
+    ) -> None:
+        result = audit_nap(
+            self.address(), [listing(street="Hauptstraße 14, 3. OG", house_number=None)]
+        )
+        assert ("house_number", "warn") in [(f.field, f.severity) for f in result.findings]
+
+    @pytest.mark.parametrize(
+        ("street", "other"),
+        [
+            # The stripper must not mistake part of a street name for an annotation.
+            ("Hausvogteiplatz 1", "Hausvogteiplatz 2"),
+            ("Am Alten Hof 3", "Am Alten Hof 5"),
+            ("Alter Postweg 5", "Alter Postweg 7"),
+            ("Hochhausweg 1", "Hochhausweg 3"),
+        ],
+    )
+    def test_a_street_whose_name_resembles_an_annotation_still_diffs_normally(
+        self, street: str, other: str
+    ) -> None:
+        record = canonical(street=street, house_number=None)
+        assert audit_nap(record, [listing(street=street, house_number=None)]).findings == []
+        differing = audit_nap(record, [listing(street=other, house_number=None)])
+        assert differing.findings != []
+
+    def test_the_annotation_survives_in_the_display_value(self) -> None:
+        record = normalise_nap(
+            RawNap(street="Hauptstraße 12a, 3. OG", postcode="56068", city="Koblenz")
+        )
+        # The annotation rides on the display house number, because that is where a
+        # German address line puts it: "Hauptstraße" + "12a, 3. OG" reads correctly.
+        assert record.street == "Hauptstraße"
+        assert record.house_number == "12a, 3. OG"
+        # ... and it is gone from the comparison forms, which is the whole point.
+        assert record.comparison.street == "hauptstrasse"
+        assert record.comparison.house_number == "12a"
+
+
+class TestExtensionDetectionUnit:
+    """The extension rule, at the unit level: prefix plus a short numeric tail."""
+
+    @pytest.mark.parametrize(
+        ("left", "right", "expected"),
+        [
+            # The same line, extension on either side.
+            ("+49261123456", "+492611234560", "0"),
+            ("+492611234560", "+49261123456", "0"),
+            ("+49261123456", "+4926112345612", "12"),
+            ("+49261123456", "+49261123456100", "100"),
+            ("+49261123456", "+4926112345612345", "12345"),
+            # Identical numbers are not an extension difference.
+            ("+49261123456", "+49261123456", None),
+            # One digit different is a typo, not a Durchwahl: same length, no prefix.
+            ("+49261123456", "+49261123457", None),
+            # Same extension, different base: two different subscribers.
+            ("+4926112345612", "+4926199999912", None),
+            # Six trailing digits is another number, not an extension.
+            ("+49261123456", "+49261123456123456", None),
+            # A different area code shares no base.
+            ("+49261123456", "+4930123456", None),
+            # A different country is never the same line.
+            ("+49261123456", "+41261123456", None),
+        ],
+    )
+    def test_extension_difference(self, left: str, right: str, expected: str | None) -> None:
+        assert phone_extension_difference(left, right) == expected
+
+    def test_the_rule_is_symmetric(self) -> None:
+        assert phone_extension_difference(
+            "+49261123456", "+492611234560"
+        ) == phone_extension_difference("+492611234560", "+49261123456")
+
+
+class TestAnnotationStripperUnit:
+    """The stripper, at the unit level -- including what it must refuse to touch."""
+
+    @pytest.mark.parametrize(
+        ("written", "expected"),
+        [
+            ("Hauptstraße 12a, 3. OG", ("Hauptstraße 12a", "3. OG")),
+            ("Hauptstraße 12a 3. OG", ("Hauptstraße 12a", "3. OG")),
+            ("Hauptstraße 12a, EG", ("Hauptstraße 12a", "EG")),
+            ("Hauptstraße 12, Hinterhaus", ("Hauptstraße 12", "Hinterhaus")),
+            ("Hauptstraße 12, Eingang B", ("Hauptstraße 12", "Eingang B")),
+            ("Hauptstraße 12, c/o Müller", ("Hauptstraße 12", "c/o Müller")),
+            ("Hauptstraße 5, z. Hd. Frau Müller", ("Hauptstraße 5", "z. Hd. Frau Müller")),
+            # Stacked annotations, reported in the order they were written.
+            ("Hauptstraße 12, Hinterhaus, 2. OG", ("Hauptstraße 12", "Hinterhaus, 2. OG")),
+            # The annotation sitting in the house-number field.
+            ("12a, 3. OG", ("12a", "3. OG")),
+        ],
+    )
+    def test_annotations_are_split_off(self, written: str, expected: tuple[str, str]) -> None:
+        assert strip_address_annotation(written) == expected
+
+    @pytest.mark.parametrize(
+        "written",
+        [
+            # Street names that merely resemble the annotation vocabulary. Stripping
+            # any of these would delete a real address.
+            "Hausvogteiplatz 2",
+            "Am Alten Hof 5",
+            "Alter Postweg 7",
+            "Hochhausweg 1",
+            "Löhrstraße, 12a",
+            "Straße des 17. Juni",
+            "Gebäudestraße 4",
+            "Hinterhausener Weg 2",
+            # Nothing but an annotation: there is no address here to keep, so the
+            # value is left alone rather than reduced to "3.".
+            "3. OG",
+            "EG",
+        ],
+    )
+    def test_values_that_must_not_be_stripped(self, written: str) -> None:
+        assert strip_address_annotation(written) == (" ".join(written.split()), None)
+
+    def test_blank_input(self) -> None:
+        assert strip_address_annotation(None) == (None, None)
+        assert strip_address_annotation("   ") == (None, None)

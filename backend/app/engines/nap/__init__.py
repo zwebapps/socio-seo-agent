@@ -48,7 +48,9 @@ from .normalise import (
     normalise_phone,
     normalise_postcode,
     normalise_street_name,
+    phone_extension_difference,
     split_street_and_number,
+    strip_address_annotation,
 )
 
 __all__ = [
@@ -74,5 +76,7 @@ __all__ = [
     "normalise_phone",
     "normalise_postcode",
     "normalise_street_name",
+    "phone_extension_difference",
     "split_street_and_number",
+    "strip_address_annotation",
 ]

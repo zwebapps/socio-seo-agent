@@ -26,7 +26,13 @@ from .contract import (
     NapFinding,
     Severity,
 )
-from .normalise import comparison_form, split_street_and_number
+from .normalise import (
+    comparison_form,
+    fold_for_comparison,
+    phone_extension_difference,
+    split_street_and_number,
+    strip_address_annotation,
+)
 
 __all__ = ["audit_nap", "consistency_score"]
 
@@ -129,6 +135,24 @@ def _unverifiable_hint(
     return (
         f'Check the {label} on {source}: "{found}" could not be read as a valid {label}; '
         f'the canonical value is "{canonical}".'
+    )
+
+
+def _extension_hint(
+    source: str, canonical: str | None, found: str | None, extension: str, on_listing: bool
+) -> str:
+    detail = "with" if on_listing else "without"
+    return (
+        f"{source} shows the same line {detail} the extension -{extension} "
+        f'("{found}"); the canonical number is "{canonical}". Not a wrong number, '
+        f"but one consistent number across every listing matches more reliably."
+    )
+
+
+def _annotation_hint(source: str, canonical: str | None, found: str | None, annotation: str) -> str:
+    return (
+        f'{source} appends "{annotation}" to the address ("{found}"); the address itself '
+        f'matches "{canonical}". Keep it if deliveries need it -- it does not affect the match.'
     )
 
 
@@ -246,6 +270,29 @@ def _field_finding(
     if _matches(field, canonical_normalised, found_normalised):
         return None
 
+    if field == "phone":
+        # A German switchboard number and its extension are one line. Reporting a
+        # business's own "-0" in red next to a genuinely wrong number destroys the
+        # severity signal: once an error row is wrong, no error row gets read. So
+        # it is still surfaced -- one consistent number matches better -- but as
+        # info, which costs nothing against the score.
+        extension = phone_extension_difference(canonical_normalised, found_normalised)
+        if extension is not None:
+            return NapFinding(
+                field=field,
+                canonical_value=canonical_display,
+                found_value=found_raw,
+                source=listing.source,
+                severity="info",
+                fix_hint=_extension_hint(
+                    listing.source,
+                    canonical_display,
+                    found_raw,
+                    extension,
+                    on_listing=len(found_normalised) > len(canonical_normalised),
+                ),
+            )
+
     return NapFinding(
         field=field,
         canonical_value=canonical_display,
@@ -253,6 +300,45 @@ def _field_finding(
         source=listing.source,
         severity=_MISMATCH_SEVERITY[field],
         fix_hint=_mismatch_hint(field, listing.source, canonical_display, found_raw),
+    )
+
+
+_ADDRESS_FIELDS: frozenset[NapField] = frozenset({"street", "house_number"})
+
+
+def _annotation_note(canonical: CanonicalNap, listing: DirectoryListing) -> NapFinding | None:
+    """Note a floor or entrance annotation the canonical record does not carry.
+
+    Only reached when the address otherwise matches, so this is never the reason a
+    listing looks wrong. It is ``info`` because it is not an inconsistency at all
+    -- the annotation is delivery detail, and often the directory added it.
+    """
+    _, annotation = strip_address_annotation(listing.street)
+    line = listing.street
+    if annotation is None:
+        _, annotation = strip_address_annotation(listing.house_number)
+        line = listing.house_number
+    if annotation is None:
+        return None
+
+    _, canonical_annotation = strip_address_annotation(canonical.street)
+    if canonical_annotation is None:
+        _, canonical_annotation = strip_address_annotation(canonical.house_number)
+    if canonical_annotation is not None and fold_for_comparison(
+        canonical_annotation
+    ) == fold_for_comparison(annotation):
+        return None
+
+    canonical_line = " ".join(
+        part for part in (canonical.street, canonical.house_number) if part is not None
+    )
+    return NapFinding(
+        field="street",
+        canonical_value=canonical_line or None,
+        found_value=line,
+        source=listing.source,
+        severity="info",
+        fix_hint=_annotation_hint(listing.source, canonical_line or None, line, annotation),
     )
 
 
@@ -276,15 +362,17 @@ def audit_nap(canonical: CanonicalNap, found: list[DirectoryListing]) -> NapAudi
         # Directories publish "Löhrstraße 12a" in one field about as often as they
         # split it, so the number is lifted out. The value *reported* back is the
         # split part, so a house-number finding never quotes a whole street.
-        street_display, inline_number = split_street_and_number(listing.street)
+        address, _ = strip_address_annotation(listing.street)
+        street_display, inline_number = split_street_and_number(address)
+        house_number_display, _ = strip_address_annotation(listing.house_number)
 
-        findings.extend(_name_findings(canonical, listing, listing_comparison))
+        for_listing: list[NapFinding] = _name_findings(canonical, listing, listing_comparison)
 
         for field in _COMPARED_FIELDS:
             if field == "street":
                 found_raw: str | None = street_display
             elif field == "house_number":
-                found_raw = listing.house_number or inline_number
+                found_raw = house_number_display or inline_number
             else:
                 found_raw = getattr(listing, field)
             finding = _field_finding(
@@ -295,7 +383,16 @@ def audit_nap(canonical: CanonicalNap, found: list[DirectoryListing]) -> NapAudi
                 getattr(listing_comparison, field),
             )
             if finding is not None:
-                findings.append(finding)
+                for_listing.append(finding)
+
+        # Only worth a note when the address agrees apart from the annotation; if
+        # the street or number genuinely differs, that finding is the whole story.
+        if not any(finding.field in _ADDRESS_FIELDS for finding in for_listing):
+            note = _annotation_note(canonical, listing)
+            if note is not None:
+                for_listing.append(note)
+
+        findings.extend(for_listing)
 
     return NapAuditResult(
         consistency_score=consistency_score(findings),
