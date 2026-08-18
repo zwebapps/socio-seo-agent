@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6381/0"
 
     # Browser origins allowed to call the API.
-    cors_origins: tuple[str, ...] = ("http://localhost:3000",)
+    cors_origins: tuple[str, ...] = ("http://localhost:3100",)
 
 
 @lru_cache

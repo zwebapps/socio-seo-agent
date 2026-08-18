@@ -50,11 +50,11 @@ Requires Python 3.13, Node 22, Docker, and [uv](https://docs.astral.sh/uv/).
 cp .env.example .env
 make install          # uv sync + pnpm install
 make up               # postgres :5435, redis :6381
-make api              # terminal 1 — FastAPI on :8000
-make web              # terminal 2 — Next.js on :3000
+make api              # terminal 1 — FastAPI on :8100
+make web              # terminal 2 — Next.js on :3100
 ```
 
-Open http://localhost:3000. The page reports live backend status; stop the API
+Open http://localhost:3100. The page reports live backend status; stop the API
 and press **Re-check** to see the designed failure state.
 
 ```bash

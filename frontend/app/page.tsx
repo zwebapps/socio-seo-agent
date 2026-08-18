@@ -15,7 +15,7 @@ type State =
   | { kind: "ok"; health: Health }
   | { kind: "error"; message: string };
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
 /* A client component on purpose. A server component fetching at render time
    would make `next build` depend on the API being up, which would couple the

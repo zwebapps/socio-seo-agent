@@ -5,8 +5,8 @@ help:
 	@echo "make install    install python + node dependencies"
 	@echo "make up         start postgres + redis (add: --profile storage for minio)"
 	@echo "make down       stop infrastructure"
-	@echo "make api        run FastAPI with hot reload on :8000"
-	@echo "make web        run Next.js with hot reload on :3000"
+	@echo "make api        run FastAPI with hot reload on :8100"
+	@echo "make web        run Next.js with hot reload on :3100"
 	@echo "make test       pytest"
 	@echo "make check      lint + format check + typecheck + test   (what CI runs)"
 	@echo "make images     build both docker images locally"
@@ -26,7 +26,7 @@ logs:
 	docker compose logs -f
 
 api:
-	uv run uvicorn backend.app.main:app --reload --port 8000
+	uv run uvicorn backend.app.main:app --reload --port 8100
 
 web:
 	cd frontend && pnpm dev
