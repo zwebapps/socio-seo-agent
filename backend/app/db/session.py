@@ -73,10 +73,9 @@ async def business_session(business_id: UUID) -> AsyncIterator[AsyncSession]:
     build this statement with an f-string.
     """
     factory = get_session_factory()
-    async with factory() as s:
-        async with s.begin():
-            await s.execute(
-                text("SELECT set_config('app.current_business_id', :bid, true)"),
-                {"bid": str(business_id)},
-            )
-            yield s
+    async with factory() as s, s.begin():
+        await s.execute(
+            text("SELECT set_config('app.current_business_id', :bid, true)"),
+            {"bid": str(business_id)},
+        )
+        yield s

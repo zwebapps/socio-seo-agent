@@ -17,10 +17,11 @@ proving nothing:
 """
 
 from collections.abc import AsyncIterator
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -159,12 +160,20 @@ async def test_business_b_cannot_update_or_delete_business_a(
     await owner_session.commit()
 
     async for s in _scoped(app_engine, business_b):
-        updated = await s.execute(
-            text("UPDATE documents SET filename = 'hijacked.pdf' WHERE id = :id"), {"id": doc_a}
+        updated = cast(
+            "CursorResult[Any]",
+            await s.execute(
+                text("UPDATE documents SET filename = 'hijacked.pdf' WHERE id = :id"),
+                {"id": doc_a},
+            ),
         )
-        assert updated.rowcount == 0
-        deleted = await s.execute(text("DELETE FROM documents WHERE id = :id"), {"id": doc_a})
-        assert deleted.rowcount == 0
+        assert updated.rowcount == 0, "a cross-tenant UPDATE matched a row"
+
+        deleted = cast(
+            "CursorResult[Any]",
+            await s.execute(text("DELETE FROM documents WHERE id = :id"), {"id": doc_a}),
+        )
+        assert deleted.rowcount == 0, "a cross-tenant DELETE matched a row"
 
     row = (
         await owner_session.execute(

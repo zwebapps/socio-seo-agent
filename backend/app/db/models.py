@@ -29,7 +29,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.dialects.postgresql import UUID as PgUUID
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.db.base import Base, BusinessScopedMixin, TimestampMixin, UuidPkMixin
@@ -57,7 +57,7 @@ class Business(Base, UuidPkMixin, TimestampMixin):
     __tablename__ = "businesses"
 
     owner_id: Mapped[UUID] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     website: Mapped[str | None] = mapped_column(String(2048))
@@ -108,7 +108,7 @@ class KbChunk(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "kb_chunks"
 
     document_id: Mapped[UUID] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+        PGUUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
     )
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -221,7 +221,7 @@ class RunEvent(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "run_events"
 
     run_id: Mapped[UUID] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
+        PGUUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     node: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -243,7 +243,7 @@ class ModelUsage(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "model_usage"
 
     run_id: Mapped[UUID | None] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), index=True
+        PGUUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), index=True
     )
     node: Mapped[str | None] = mapped_column(String(32))
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -275,7 +275,7 @@ class Action(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "actions"
 
     run_id: Mapped[UUID | None] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), index=True
+        PGUUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), index=True
     )
     action_type: Mapped[str] = mapped_column(String(64), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
@@ -325,10 +325,10 @@ class ContentPiece(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "content_pieces"
 
     opportunity_id: Mapped[UUID | None] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("opportunities.id", ondelete="SET NULL")
+        PGUUID(as_uuid=True), ForeignKey("opportunities.id", ondelete="SET NULL")
     )
     run_id: Mapped[UUID | None] = mapped_column(
-        PgUUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL")
+        PGUUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL")
     )
     surface: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(512), nullable=False)

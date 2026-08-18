@@ -14,8 +14,8 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from backend.app.core.config import get_settings
-from backend.app.db.base import Base
 from backend.app.db import models  # noqa: F401  -- imported so autogenerate sees the tables
+from backend.app.db.base import Base
 
 config = context.config
 config.set_main_option("sqlalchemy.url", get_settings().database_url)
