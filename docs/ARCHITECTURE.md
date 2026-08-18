@@ -4,6 +4,17 @@ Companion to [../ROADMAP.md](../ROADMAP.md) (what to build, in order) and [../FE
 
 Everything lives inside `Social-Marketing-Agent/`. Nothing in the parent `TuringCollege/` folder is read, written, or depended on.
 
+> **Diagrams:** every diagram for this system — system context, component kinds,
+> the full request flow, the agent state machine, the tool-calling loop, agentic
+> RAG, model routing, the actuator/idempotency sequence, lead attribution, the
+> content spine, the data model, deployment, degradation, and the Track-B
+> multi-agent topology — is in **[DIAGRAMS.md](DIAGRAMS.md)**.
+>
+> **How the agents work** — `AgentState`, all ten nodes with their model tier and
+> tool allowlist, the node loop, prompt assembly, the three memory stores, the
+> validation loop, caps, interrupt/resume, and a costed worked run — is in
+> **[AGENT_RUNTIME.md](AGENT_RUNTIME.md)**.
+
 ---
 
 ## 1. Architecture → business benefit

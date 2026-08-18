@@ -37,6 +37,8 @@ marketers, and small agencies running several clients.
 | [ROADMAP.md](ROADMAP.md) | Strategy, scope, honest constraints |
 | [FEATURES.md](FEATURES.md) | Every feature, and how each one produces a lead |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical design; architecture → business benefit |
+| [docs/DIAGRAMS.md](docs/DIAGRAMS.md) | All 14 diagrams: context, request flow, state machine, data model, deployment |
+| [docs/AGENT_RUNTIME.md](docs/AGENT_RUNTIME.md) | How the agents work: state, nodes, tool loop, prompts, memory, caps |
 | [docs/BUILD_ORDER.md](docs/BUILD_ORDER.md) | **The execution plan — build from this** |
 | [docs/CHANNELS.md](docs/CHANNELS.md) | What we can actually publish, and per-platform content |
 | [docs/FREE_CHANNELS.md](docs/FREE_CHANNELS.md) | Free presence and citations; why Wikipedia is excluded |
