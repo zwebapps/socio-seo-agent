@@ -39,6 +39,14 @@ FORBIDDEN_PREFIXES: dict[str, str] = {
     "backend.app.actuators": "side-effecting layer",
     "backend.app.tools": "tool registry",
     "backend.app.api": "transport layer",
+    # Added after the geo agent pointed out the hole: without these two, an engine
+    # could import the model router or a service and this test would still pass --
+    # which is precisely the violation it exists to catch. `backend.app.llm` is the
+    # provider seam (an engine that can call a model is not deterministic) and
+    # `backend.app.services` is the impure orchestration layer above engines, so an
+    # engine importing one would invert the dependency direction.
+    "backend.app.llm": "model router",
+    "backend.app.services": "service layer",
 }
 
 

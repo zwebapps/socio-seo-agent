@@ -65,6 +65,10 @@ ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "A"]
+# Alembic generates these files in its own style. Linting machine-generated code
+# means hand-editing every autogenerate output forever, for no benefit -- the
+# hand-written parts (RLS policies, data fixes) are still reviewed in the diff.
+"backend/app/db/migrations/versions/*" = ["E501", "UP035", "UP007", "I001"]
 
 [tool.mypy]
 python_version = "3.13"

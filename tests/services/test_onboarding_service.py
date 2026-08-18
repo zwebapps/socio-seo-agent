@@ -6,12 +6,22 @@ degrade when the site is thin, and it must never let crawled text act as an
 instruction.
 """
 
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
 from backend.app.engines.crawl.contract import UnsafeUrlError
-from backend.app.llm import BudgetState, Completion, ToolCall, Usage
+from backend.app.llm import (
+    BudgetState,
+    Completion,
+    Message,
+    TaskClass,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
 from backend.app.services.onboarding_service import (
     OnboardingOutcome,
     ThinSiteError,
@@ -47,14 +57,21 @@ EXTRACTED = {
 class StubRouter:
     """Stands in for ModelRouter. Records what it was asked, returns a fixed result."""
 
-    def __init__(self, arguments: dict[str, object] | None = None, text: str | None = None):
+    def __init__(self, arguments: Mapping[str, Any] | None = None, text: str | None = None) -> None:
         self._arguments = arguments
         self._text = text
-        self.calls: list[dict[str, object]] = []
+        self.calls: list[dict[str, Any]] = []
 
     async def complete(
-        self, task, messages, *, tools=None, budget=None, temperature=None, max_tokens=None
-    ):
+        self,
+        task: TaskClass,
+        messages: Sequence[Message],
+        *,
+        tools: Sequence[ToolSpec] | None = None,
+        budget: BudgetState | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> Completion:
         self.calls.append(
             {"task": task, "messages": messages, "tools": tools, "temperature": temperature}
         )
@@ -70,7 +87,9 @@ class StubRouter:
             return Completion(
                 text=None,
                 tool_calls=[
-                    ToolCall(name="record_business_dna", arguments=self._arguments, call_id="c1")
+                    ToolCall(
+                        name="record_business_dna", arguments=dict(self._arguments), call_id="c1"
+                    )
                 ],
                 usage=usage,
                 is_final=False,
@@ -78,7 +97,9 @@ class StubRouter:
         return Completion(text=self._text, tool_calls=[], usage=usage, is_final=True)
 
 
-async def _fetcher(html: str = HOMEPAGE, *, raises: Exception | None = None):
+async def _fetcher(
+    html: str = HOMEPAGE, *, raises: Exception | None = None
+) -> Callable[[str], Awaitable[str]]:
     async def fetch(url: str) -> str:
         if raises is not None:
             raise raises
@@ -115,8 +136,6 @@ async def test_records_what_the_extraction_cost() -> None:
 async def test_uses_the_cheap_extract_task_not_the_strong_tier() -> None:
     """Onboarding runs on every signup. Putting it on the strong tier is how a
     free trial becomes expensive."""
-    from backend.app.llm import TaskClass
-
     router = StubRouter(arguments=EXTRACTED)
     await draft_dna_from_website("https://x.example", router=router, fetch_html=await _fetcher())
     assert router.calls[0]["task"] == TaskClass.EXTRACT
@@ -135,7 +154,7 @@ async def test_crawled_text_is_fenced_as_untrusted_data() -> None:
     router = StubRouter(arguments=EXTRACTED)
     await draft_dna_from_website("https://x.example", router=router, fetch_html=await _fetcher())
 
-    rendered = "\n".join(str(m.content) for m in router.calls[0]["messages"])  # type: ignore[union-attr]
+    rendered = "\n".join(str(m.content) for m in router.calls[0]["messages"])
     assert "UNTRUSTED" in rendered.upper(), "crawled text was not fenced"
     assert "instruction" in rendered.lower(), "no instruction-hierarchy rule was stated"
 
@@ -151,7 +170,7 @@ async def test_an_injection_in_the_page_does_not_become_an_instruction() -> None
         "https://x.example", router=router, fetch_html=await _fetcher(hostile)
     )
 
-    rendered = "\n".join(str(m.content) for m in router.calls[0]["messages"])  # type: ignore[union-attr]
+    rendered = "\n".join(str(m.content) for m in router.calls[0]["messages"])
     marker_at = rendered.upper().find("UNTRUSTED")
     injection_at = rendered.find("Ignore previous instructions")
     assert marker_at != -1 and injection_at > marker_at, "injection was not inside the fence"
