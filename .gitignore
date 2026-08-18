@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/next-env.d.ts
+frontend/tsconfig.tsbuildinfo
+.pnpm-store/
+
+# Environment and secrets -- never commit these
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Local data
+data/
+*.log
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

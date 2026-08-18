@@ -1,0 +1,14 @@
+# pnpm v10+ reads these settings here, not from .npmrc.
+#
+# nodeLinker: hoisted gives a flat, npm-style node_modules.
+#
+# Why: Next.js `output: "standalone"` traces the files the server needs and
+# copies them into .next/standalone. Under pnpm's default symlinked store layout
+# those traced paths are symlinks into node_modules/.pnpm, which do not survive
+# the copy -- the container then dies at boot with
+#   Cannot find module '.../@swc/helpers/esm/_interop_require_default.js'
+#
+# Set here rather than only in the Dockerfile so the host, CI and the image all
+# install identically. Host/container divergence already cost one broken build
+# in this project (see the packageManager pin in package.json).
+nodeLinker: hoisted

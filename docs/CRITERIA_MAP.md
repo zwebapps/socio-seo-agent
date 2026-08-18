@@ -1,0 +1,189 @@
+# Criteria Map — evidence, concepts, and the demo
+
+Three jobs: show a grader **where** each criterion is satisfied, give the **correct** framing for the concepts you'll be questioned on, and fix the **claims discipline** so nothing in the submission overstates what was built.
+
+---
+
+## 1. Requirements → implementation → demo step
+
+| Requirement | Implementation | Where | Demo step |
+|---|---|---|---|
+| Clear agent purpose | one-sentence problem statement + the 5-link lead chain | `PROBLEM.md`, `FEATURES.md` §0 | 1 |
+| Why useful | replaces a $500–850/mo tool stack or a $2–5k/mo agency; owns conversion + attribution, which content tools don't | `PROBLEM.md`, `FEATURES.md` §1 | 1 |
+| Target users | SMB owner (primary) · in-house marketer · small agency | `PROBLEM.md` | 1 |
+| Core functionality | 10-node graph: intake → harvest → opportunity → plan → generate → validate → repack → review → export → measure | `agents/graph.py` | 3–11 |
+| User interactions | onboarding, document upload, opportunity selection, edit, approve/reject, brand voice, tool toggles, model settings | `frontend/app/(app)/` | 2–12 |
+| User-friendly UI for **all** functionality | every backend capability has a screen; user mode vs `/developer` mode | `frontend/` | 2–13 |
+| Appropriate tools/libraries | LangGraph, FastAPI, Pydantic, pgvector, Next.js, Langfuse, Ragas | `pyproject.toml`, `ARCHITECTURE.md` §5 | — |
+| Error handling | typed engine errors, bounded retries, provider fallback, partial-failure degradation, reconciliation before retry, caps | `ARCHITECTURE.md` §7, `ROADMAP.md` §10 | 6, 9 |
+| Real-world usage | resumable runs, idempotent actuators, budgets, rate limits, RLS, audit log | `ARCHITECTURE.md` §3, §6, §7 | 9 |
+| Documentation | 6 documents + in-app help assistant | `docs/`, `README.md` | 13 |
+| **Agent principles** | goal → plan → tool → observe → validate → act → measure → re-plan, with the LLM deciding and engines doing | §2 below | 3–11 |
+| **Agent types** | two orthogonal axes + autonomy as policy | §3 below | — |
+| **Function calling** | Pydantic schema → tool_call → validate args → execute → tool message → re-plan; one repair turn on invalid args | §4 below, `tools/registry.py` | 4 |
+| Code organisation | Engines / Actuators / Agents, layer direction enforced by test | `ARCHITECTURE.md` §3–4 | — |
+| Edge cases | 13 named scenarios with handling | `ROADMAP.md` §10 | 6, 9 |
+| Knowledge base / RAG | pgvector over the business's own documents, retrieved agentically | `engines/kb/`, §5 below | 5 |
+| Security | injection barriers, SSRF, RLS, tool allowlists, approval policy, audit | `ARCHITECTURE.md` §9 | 9 |
+| Reflection | known limits, weaknesses volunteered, improvement backlog | `ROADMAP.md` §11, `ARCHITECTURE.md` §15 | 13 |
+| Prompt vs RAG vs agent | §6 below | — | — |
+
+---
+
+## 2. How the agent works (the answer to "explain agent principles")
+
+```
+   TRADITIONAL              TOOL-USING                   THIS SYSTEM
+   LLM CALL                 AGENT
+
+   prompt                   prompt                       GOAL + business memory
+     ↓                        ↓                            ↓
+   model                    model ──► tool               PLAN (bounded steps)
+     ↓                        ↓  ◄──  result               ↓
+   text                     text                        ENGINES gather facts
+                                                          ↓
+                                                        DECIDE (which opportunity)
+                                                          ↓
+                                                        GENERATE grounded in facts
+                                                          ↓
+                                                        VALIDATE deterministically
+                                                          ↓ fail → back to GENERATE
+                                                        HUMAN APPROVES
+                                                          ↓
+                                                        ACTUATOR executes (idempotent)
+                                                          ↓
+                                                        MEASURE → next opportunity
+```
+
+The three properties that make it an agent rather than a chain: **the plan is not fixed** (which engines run and which opportunity is chosen depend on what harvest returned), **there is a feedback loop inside the run** (`VALIDATE → GENERATE` on failure), and **it acts on the world** through actuators under policy.
+
+---
+
+## 3. Agent types — the correct framing
+
+Most lists of "agent types" mix incompatible axes. Use **two axes plus one policy**; it's accurate, and it lets you place this system precisely.
+
+**Axis 1 — control locus: who decides the next step?**
+
+| | Decider | Example | This system |
+|---|---|---|---|
+| Pipeline | code | fixed prompt chain | — |
+| Router | one classification | pick a prompt per intent | model router picks a *tier* |
+| **State machine + tools** | code owns the graph, the LLM owns the choices inside a node | LangGraph | **← here** |
+| Autonomous loop | LLM decides everything until it stops | ReAct until done | rejected: unbounded, hard to evaluate |
+
+**Axis 2 — topology: how many reasoning units?**
+
+| | Shape | This system |
+|---|---|---|
+| Single agent, many tools | one context, one prompt lineage | **← here (v1)** |
+| Supervisor / manager | a planner delegating to specialists | Track B6, once expertise, permissions, context or eval criteria genuinely diverge |
+| Peer network | agents negotiating | not planned — cost and debuggability are poor |
+
+**Autonomy is a policy, not a type.** The same graph runs at four autonomy levels purely by changing rows in the approval-policy table: `auto` (execute), `notify` (execute and tell), `approve` (wait for a token), `human` (a person does it). That's why "autonomous agent" isn't a category here — it's a configuration.
+
+**Why this design was chosen over a ReAct loop:** bounded step count, resumable at a node, human interrupt at a defined point, and each node independently evaluable. An unbounded loop is cheaper to write and much harder to make safe, cost-predictable, or testable.
+
+---
+
+## 4. Function calling — the exact mechanism
+
+```
+1. Tool defined as a Pydantic model → registry exposes model_json_schema()
+2. Only tools the node is allowed AND the business enabled are sent to the model
+3. Model returns tool_call{name, arguments}
+4. Registry validates arguments against the schema  ── invalid ──┐
+5. Execute (timeout, cost accounted, traced)                     │
+6. Result appended as a tool message                             │
+7. Model re-plans with the result                                │
+                                                                 ▼
+                        one repair turn carrying the validation
+                        error verbatim; still invalid → skip the
+                        tool, record in errors[], continue
+```
+
+Four details worth stating in the review, because they're where naive implementations break:
+
+- **Validation happens before execution, not inside the tool.** The tool never sees malformed input.
+- **The allowlist is per node.** `HARVEST` and `GENERATE` cannot call an actuator at all; only `EXPORT` can, and only with an approval token. This is a security control, not tidiness.
+- **A failed tool is not a failed run.** It degrades: the fact source is marked unavailable and the UI says which data is missing.
+- **Every call is traced** with tokens, cost and latency, which is what makes "did the agent choose well?" answerable.
+
+---
+
+## 5. Agentic RAG — why it's agentic
+
+Static RAG is `retrieve → stuff → answer`. This is a loop with a decision at each turn:
+
+```
+Does this section need business facts?  ──NO──► generate from plan only
+      YES
+      ↓
+rewrite the query for retrieval (not the user's words)
+      ↓
+kb.search() → grade each chunk: relevant / partial / irrelevant
+      ↓
+enough relevant evidence?
+   NO → rewrite differently or widen → retry (max 2)
+        still nothing → fall back to web_search
+   YES
+      ↓
+generate, citing chunk ids · unsupported claim → drop the claim, never invent a source
+```
+
+Four decisions the agent makes that a retriever cannot: **whether** to retrieve, **what** to ask, **whether the result is good enough**, and **what to do when it isn't**. The trace panel showing query → chunks → grades → decision is the evidence; build it as UI, not as a log line.
+
+---
+
+## 6. Prompt engineering vs RAG vs agents
+
+| Use | For | Here |
+|---|---|---|
+| **Prompt engineering** | style, format, tone, structure — anything with no external dependency | brand voice, per-platform social formats, outline shape |
+| **RAG** | facts the model cannot know and must not invent | the business's services, prices, case studies, policies |
+| **Agent** | tasks needing live external state and a plan that adapts to it | competitor and SERP research, AI-visibility probing, opportunity selection, validate-and-retry |
+
+The honest test: *if a better prompt would fix it, don't build RAG. If retrieval would fix it, don't build an agent.* Each layer here exists because the one below it could not do the job.
+
+---
+
+## 7. Claims discipline — what may and may not be said
+
+Overstating is the fastest way to lose credibility under questioning. These are the exact wordings.
+
+| ✗ Don't say | ✓ Say |
+|---|---|
+| "Multi-provider support" (with only OpenRouter) | "A provider-agnostic router, proven by two adapters: OpenRouter and Anthropic direct" |
+| "The agent learns / the model retrains itself" | "The agent updates persistent business preferences from explicit feedback" |
+| "We generate traffic" | "We generate the content and instrumentation that earns visibility; Google movement takes 6–12 weeks, so we report leading indicators" |
+| "We track AI citations" | "We *sample* AI answers on a fixed prompt set with pinned model versions — it's a measurement, not a census" |
+| "Fully autonomous" | "Autonomy is a per-action policy; publishing defaults to human approval" |
+| "Production-ready" | "Production-*grade* foundations: resumable, idempotent, tenant-isolated, traced, evaluated. Single-region, no DR beyond backups" |
+| "Enterprise security" | the specific controls, named |
+| "It's SEO-optimised" | "It scores ≥ 85 on a deterministic on-page audit — which gates drafts, and does not predict rankings" |
+
+---
+
+## 8. The demo — 13 steps, under 8 minutes
+
+One scenario: **"Analyse my business and create a growth plan."** Run it against the real benchmark business, three rehearsals before submission.
+
+| # | Step | Criterion proved |
+|---|---|---|
+| 1 | State the problem and the user in two sentences | problem definition, users |
+| 2 | Paste the URL → crawl + extracted Business DNA, user confirms | onboarding, interaction |
+| 3 | Upload a service PDF → ingested, chunk count shown | knowledge base |
+| 4 | Start the run → timeline streams nodes and **tool calls with live cost** | agent principles, function calling, cost tracking |
+| 5 | Open the **retrieval trace**: query → chunks → grades → fallback decision | **agentic RAG (Hard #1)** |
+| 6 | Point at a node that degraded (a source that failed) and the run continuing | error handling, edge cases |
+| 7 | Ranked opportunities with impact and effort | core functionality |
+| 8 | The draft: SEO score 87 with findings, and the retry that raised it from 79 | deterministic validation |
+| 9 | The seeded injection page: *"instruction-like content ignored"* | **security guard (Medium #8)** |
+| 10 | AI share-of-voice tile: 7.5% → 22%, competitors beside it | external data, the wedge |
+| 11 | Approve → CMS draft + 4 social posts with UTMs; press approve twice to show idempotency | approval policy, real-world usage |
+| 12 | Lead inbox: a lead attributed to the piece that produced the link | **the product's actual promise** |
+| 13 | Langfuse trace + the eval report's RAG-off vs RAG-on faithfulness chart, then name three weaknesses | **observability (H2), evaluation (H3)**, reflection |
+
+**Presentation discipline.** Do not spend the session on Redis, RLS, reconciliation or worker pools. Lead with `problem → agent → tools → RAG → memory → execution → result`. Keep the architecture document open as *evidence* that you know how it's built properly, and go there only when asked. Sophistication presented as complexity reads as complexity; the same sophistication presented as consequence reads as engineering judgement.
+
+Memory earns its own beat between steps 4 and 7: state a preference out loud, then show a later run applying it from the "What I remember about your business" panel — that's Medium #2, and it lands better spoken than diagrammed.

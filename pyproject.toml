@@ -1,0 +1,57 @@
+[project]
+name = "social-marketing-agent"
+version = "0.1.0"
+description = "Growth agent: SEO content, AI-answer visibility, social posts, and lead capture for small businesses"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.3",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "httpx>=0.28.1",
+]
+
+# Phase-gated dependencies, added when the phase that needs them lands:
+#   Phase 1  sqlalchemy, alembic, asyncpg, trafilatura, pypdf, python-docx
+#   Phase 2  redis, openai (OpenRouter-compatible), anthropic
+#   Phase 3  pgvector, langgraph, langchain-core
+#   Phase 12 langfuse, ragas
+# Installing them before they are used only adds lockfile noise and review surface.
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.3",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# Markdown is excluded so a code sample in a doc can never fail CI formatting.
+extend-exclude = ["frontend", "**/*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "A"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+exclude = ["frontend"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"

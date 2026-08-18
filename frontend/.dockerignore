@@ -1,0 +1,12 @@
+# Without this, `COPY . .` in the builder stage copies the host's node_modules
+# over the one the deps stage just installed, and the build fails with
+# "cannot copy to non-directory". It also keeps the build context small.
+node_modules
+.next
+out
+next-env.d.ts
+.env
+.env.local
+.DS_Store
+Dockerfile
+.dockerignore
