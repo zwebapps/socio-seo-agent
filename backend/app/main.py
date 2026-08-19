@@ -13,7 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api import auth, health, onboarding
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings, get_settings
 
-
 #: Below this length an HMAC key is brute-forceable, and the signature is only
 #: ever as good as the key behind it.
 MIN_SESSION_SECRET_LENGTH = 32
