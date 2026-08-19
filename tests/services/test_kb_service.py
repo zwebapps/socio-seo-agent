@@ -456,7 +456,15 @@ class TestIngestDocument:
         assert first_pass > 0
         assert len(embedder.embedded_texts) == first_pass, "re-embedded known text"
         assert second.chunks_duplicate == second.chunks_total
-        assert second.chunks_stored == 0
+        # CHANGED DELIBERATELY. This previously asserted chunks_stored == 0, which
+        # was the duplicate-citation bug written down as an expectation: the text
+        # then existed only under the FIRST document, so a retrieved passage cited
+        # a file the reader never uploaded in that context. The saving that matters
+        # is the embedding call, not the row -- so the row is stored and the
+        # embedder is still not called again.
+        assert second.chunks_stored == second.chunks_total
+        # (no re-embedding assertion here: the embedder is shared across both
+        # calls, so `len(...) == first_pass` above is what proves it.)
         assert second.note is not None
         assert "already indexed" in second.note
 
@@ -497,7 +505,10 @@ class TestIngestDocument:
 
         assert report.chunks_duplicate > 0
         assert report.chunks_stored > 0
-        assert len(embedder.embedded_texts) == report.chunks_stored
+        # CHANGED DELIBERATELY alongside the fix above: stored now counts every
+        # chunk, while only the NEW ones are embedded, so the gap between them is
+        # exactly the duplicate count.
+        assert len(embedder.embedded_texts) == report.chunks_stored - report.chunks_duplicate
 
     async def test_dedup_is_scoped_to_one_business(self) -> None:
         """One customer's uploads must never suppress another's embeddings."""
@@ -1029,3 +1040,136 @@ class TestTraceIsRenderable:
 
         assert trace.model_calls == 2
         assert trace.cost_usd == Decimal("0.0002")
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate text must still be stored, or a citation names the wrong document
+# --------------------------------------------------------------------------- #
+
+
+class RecordingStore:
+    """A ChunkStore that records exactly what upsert was asked to write.
+
+    The bug this catches is invisible at the adapter level: the adapter can copy a
+    vector by hash perfectly, and still never be asked to, because the service
+    filtered the duplicate out first.
+    """
+
+    def __init__(self, known: set[str] | None = None) -> None:
+        self.known = known or set()
+        self.written: list[tuple[UUID, list[StoredChunk]]] = []
+
+    async def upsert(
+        self, business_id: UUID, document_id: UUID, chunks: Sequence[StoredChunk]
+    ) -> int:
+        self.written.append((document_id, list(chunks)))
+        return len(chunks)
+
+    async def search(
+        self, business_id: UUID, embedding: Sequence[float], *, limit: int
+    ) -> list[RetrievedChunk]:
+        return []
+
+    async def existing_hashes(self, business_id: UUID, hashes: Sequence[str]) -> set[str]:
+        return {h for h in hashes if h in self.known}
+
+
+class CountingEmbedder:
+    """Counts how many texts were actually embedded, so the cost saving is proven."""
+
+    def __init__(self) -> None:
+        self.embedded: list[str] = []
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.embedded.extend(texts)
+        return [[float(len(t) % 7)] * 4 for t in texts]
+
+
+async def test_a_wholly_duplicate_document_still_gets_its_own_rows() -> None:
+    """Otherwise the text is only searchable through the FIRST document that had
+    it, and a citation names a file the reader never uploaded to that context."""
+    business_id, doc_two = uuid4(), uuid4()
+    text = "Unsere Anfahrtspauschale betraegt 39 Euro. " * 40
+
+    first = await ingest_document(
+        text.encode(),
+        business_id=business_id,
+        document_id=uuid4(),
+        kind="txt",
+        embedder=CountingEmbedder(),
+        store=(store := RecordingStore()),
+        filename="preise-2024.txt",
+    )
+    assert first.chunks_stored > 0
+
+    # Second document, same paragraph: every hash is now known.
+    store.known = {c.content_hash for _, chunks in store.written for c in chunks}
+    embedder = CountingEmbedder()
+    second = await ingest_document(
+        text.encode(),
+        business_id=business_id,
+        document_id=doc_two,
+        kind="txt",
+        embedder=embedder,
+        store=store,
+        filename="preise-2025.txt",
+    )
+
+    assert second.status == "indexed"
+    assert second.chunks_stored > 0, "a fully-duplicate document was stored as nothing"
+
+    written_for_second = [c for doc, chunks in store.written if doc == doc_two for c in chunks]
+    assert written_for_second, "upsert was never called for the second document"
+    assert all(c.embedding == [] for c in written_for_second), (
+        "a known chunk must be sent with an empty embedding so the adapter copies "
+        "the existing vector -- not re-embedded"
+    )
+    assert embedder.embedded == [], "no duplicate text should be embedded again"
+
+
+async def test_a_partly_duplicate_document_embeds_only_the_new_passages() -> None:
+    """Mixed document: some passages already known, some new.
+
+    `known` is set directly rather than by ingesting an overlapping document,
+    because appending text shifts every chunk boundary after the join, so no hash
+    would match and the test would prove nothing about the branch it targets.
+    """
+    business_id, doc_id = uuid4(), uuid4()
+    text = " ".join(f"Absatz {i} ueber Sanitaer und Heizung in Koblenz." * 12 for i in range(6))
+
+    # First pass with an empty store: learn what this document chunks into.
+    probe = RecordingStore()
+    await ingest_document(
+        text.encode(),
+        business_id=business_id,
+        document_id=uuid4(),
+        kind="txt",
+        embedder=CountingEmbedder(),
+        store=probe,
+        filename="probe.txt",
+    )
+    all_hashes = [c.content_hash for _, chunks in probe.written for c in chunks]
+    assert len(all_hashes) >= 2, "need at least two chunks for a partial-duplicate case"
+
+    # Mark only the first as already known.
+    store = RecordingStore(known={all_hashes[0]})
+    embedder = CountingEmbedder()
+    report = await ingest_document(
+        text.encode(),
+        business_id=business_id,
+        document_id=doc_id,
+        kind="txt",
+        embedder=embedder,
+        store=store,
+        filename="mixed.txt",
+    )
+
+    written = [c for doc, chunks in store.written if doc == doc_id for c in chunks]
+    copied = [c for c in written if c.embedding == []]
+    embedded = [c for c in written if c.embedding != []]
+
+    assert len(copied) == 1, "the known passage should be copied by hash, not re-embedded"
+    assert embedded, "the new passages should be embedded"
+    assert len(embedder.embedded) == len(embedded), "only the new passages were embedded"
+    assert report.chunks_duplicate == len(copied)
+    assert report.chunks_stored == len(written), "every passage is stored, duplicate or not"

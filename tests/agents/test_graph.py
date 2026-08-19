@@ -9,17 +9,21 @@ Nodes are injected as plain callables so the whole graph runs with no model, no
 database and no network.
 """
 
+from collections.abc import Awaitable, Callable
 from decimal import Decimal
+from typing import Any
 
 from backend.app.agents.graph import build_graph, run_graph
 from backend.app.agents.state import AgentState, RunCaps, new_state
 
-
-def _state(**kw: object) -> AgentState:
-    return new_state(business_id="22222222-2222-2222-2222-222222222222", goal="leads", **kw)
+Node = Callable[[AgentState], Awaitable[dict[str, object]]]
 
 
-def _ok(name: str, **updates: object):
+def _state(caps: RunCaps | None = None) -> AgentState:
+    return new_state(business_id="22222222-2222-2222-2222-222222222222", goal="leads", caps=caps)
+
+
+def _ok(name: str, **updates: object) -> Node:
     """A node that succeeds and optionally writes to the state."""
 
     async def node(state: AgentState) -> dict[str, object]:
@@ -71,7 +75,7 @@ async def test_the_retry_loop_is_bounded_and_returns_a_partial_not_an_infinite_r
 
 async def test_a_step_cap_ends_the_run_with_a_stated_reason() -> None:
     caps = RunCaps(max_steps=3, max_usd=Decimal("1"), max_validate_loops=2)
-    result = await run_graph(_state(caps=caps), nodes=_nodes(seo_score=91))
+    result = await run_graph(_state(caps), nodes=_nodes(seo_score=91))
 
     assert result.state["outcome"] == "partial"
     assert "max_steps" in (result.state["finished_reason"] or "")
@@ -79,7 +83,7 @@ async def test_a_step_cap_ends_the_run_with_a_stated_reason() -> None:
 
 async def test_a_budget_cap_ends_the_run_before_the_call_that_would_exceed_it() -> None:
     caps = RunCaps(max_steps=99, max_usd=Decimal("0.05"), max_validate_loops=2)
-    result = await run_graph(_state(caps=caps), nodes=_nodes(seo_score=91, cost=Decimal("0.02")))
+    result = await run_graph(_state(caps), nodes=_nodes(seo_score=91, cost=Decimal("0.02")))
 
     assert result.state["outcome"] == "partial"
     assert "max_usd" in (result.state["finished_reason"] or "")
@@ -146,12 +150,12 @@ def test_the_graph_compiles() -> None:
 
 def _nodes(
     *,
-    seo_score,
+    seo_score: int | Callable[[], int],
     cost: Decimal = Decimal("0"),
-    harvest=None,
+    harvest: Node | None = None,
     opportunity: object = ...,
     stop_after: str | None = None,
-):
+) -> dict[str, Any]:
     """A full set of injected node callables, all inert."""
     score = seo_score if callable(seo_score) else (lambda: seo_score)
     opp = {"title": "Notdienst Koblenz"} if opportunity is ... else opportunity

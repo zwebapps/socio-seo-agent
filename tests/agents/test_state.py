@@ -22,8 +22,10 @@ from backend.app.agents.state import (
 )
 
 
-def _state(**kw: object) -> AgentState:
-    return new_state(business_id="11111111-1111-1111-1111-111111111111", goal="more leads", **kw)
+def _state(caps: RunCaps | None = None) -> AgentState:
+    return new_state(
+        business_id="11111111-1111-1111-1111-111111111111", goal="more leads", caps=caps
+    )
 
 
 def test_a_new_run_starts_empty_and_unspent() -> None:
@@ -36,7 +38,7 @@ def test_a_new_run_starts_empty_and_unspent() -> None:
 
 def test_steps_are_counted_and_capped() -> None:
     caps = RunCaps(max_steps=3, max_usd=Decimal("1"), max_validate_loops=2)
-    state = _state(caps=caps)
+    state = _state(caps)
 
     for expected in (1, 2, 3):
         state = step(state, "HARVEST")
@@ -51,7 +53,7 @@ def test_steps_are_counted_and_capped() -> None:
 def test_cost_is_charged_and_capped_before_it_is_exceeded() -> None:
     """The guard refuses the call that WOULD exceed, not the one that already did."""
     caps = RunCaps(max_steps=99, max_usd=Decimal("0.10"), max_validate_loops=2)
-    state = charge(_state(caps=caps), Decimal("0.06"))
+    state = charge(_state(caps), Decimal("0.06"))
     assert state["cost_usd"] == Decimal("0.06")
 
     with pytest.raises(CapExceededError) as exc:

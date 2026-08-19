@@ -571,27 +571,29 @@ async def ingest_document(
     fresh = [chunk for chunk in chunks if chunk.content_hash not in known]
     duplicates = len(chunks) - len(fresh)
 
-    if not fresh:
-        return IngestReport(
-            business_id=business_id,
-            document_id=document_id,
-            kind=kind,
-            status="indexed",
-            note=(
-                f"All {len(chunks)} passages were already indexed for this business "
-                "(identical text), so nothing new was embedded. The content is "
-                "searchable through the document that introduced it."
-            ),
-            extraction_status=extraction.status,
-            chars_extracted=extraction.char_count,
-            chunks_total=len(chunks),
-            chunks_duplicate=duplicates,
-            chunks_stored=0,
-        )
+    # Embed only what is new -- but STORE every chunk, including the duplicates.
+    #
+    # Skipping a duplicate row entirely was the obvious optimisation and it was
+    # wrong: the text then exists only under the FIRST document that introduced
+    # it, so a retrieved passage cites a file the reader never uploaded in that
+    # context. For a product whose claim is "grounded in your own documents, with
+    # a citation", naming the wrong source is a serious defect.
+    #
+    # A chunk whose hash is already known is handed to the adapter with an EMPTY
+    # embedding, which means "copy the vector you already hold for this hash".
+    # The copy happens inside SQL, in a row the tenant can already see, so the
+    # tenant boundary is enforced by the RLS policy rather than by a WHERE clause
+    # someone could forget. No embedding call is saved or added by this.
+    vectors: list[list[float]] = []
+    if fresh:
+        embedded = await embedder.embed([chunk.text for chunk in fresh])
+        if len(embedded) != len(fresh):
+            raise EmbeddingCountMismatchError(expected=len(fresh), received=len(embedded))
+        vectors = [list(v) for v in embedded]
 
-    vectors = await embedder.embed([chunk.text for chunk in fresh])
-    if len(vectors) != len(fresh):
-        raise EmbeddingCountMismatchError(expected=len(fresh), received=len(vectors))
+    vector_by_hash = {
+        chunk.content_hash: vector for chunk, vector in zip(fresh, vectors, strict=True)
+    }
 
     stored = await store.upsert(
         business_id,
@@ -601,10 +603,10 @@ async def ingest_document(
                 ordinal=chunk.ordinal,
                 content=chunk.text,
                 content_hash=chunk.content_hash,
-                embedding=list(vector),
+                embedding=vector_by_hash.get(chunk.content_hash, []),
                 meta=_chunk_meta(chunk, kind=kind, filename=filename),
             )
-            for chunk, vector in zip(fresh, vectors, strict=True)
+            for chunk in chunks
         ],
     )
 
@@ -612,7 +614,8 @@ async def ingest_document(
     if duplicates:
         note = (
             f"{duplicates} of {len(chunks)} passages were already indexed for this "
-            "business and were not embedded again."
+            "business, so they were not embedded again. They are still stored "
+            "against this document, so a citation names the file you uploaded."
         )
 
     return IngestReport(
