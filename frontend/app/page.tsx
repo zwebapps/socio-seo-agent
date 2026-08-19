@@ -126,6 +126,26 @@ export default function Home() {
         </div>
       </section>
 
+      {/* There is no global navigation in the layout yet, so the screens that exist are
+          linked from here. Without this the memory panel would be reachable only by
+          typing its address, which is not shipped. */}
+      <nav className="mt-8 flex flex-wrap gap-3" aria-label="Screens">
+        <a
+          href="/onboard"
+          className="soft-raised soft-edge soft-press px-4 py-2 text-sm font-medium"
+          style={{ borderRadius: "var(--r-pill)", color: "var(--text)" }}
+        >
+          Onboard a business
+        </a>
+        <a
+          href="/memory"
+          className="soft-raised soft-edge soft-press px-4 py-2 text-sm font-medium"
+          style={{ borderRadius: "var(--r-pill)", color: "var(--text)" }}
+        >
+          What I remember about your business
+        </a>
+      </nav>
+
       <p className="mt-8 text-xs" style={{ color: "var(--text-muted)" }}>
         Next: Phase 1 — paste a website URL, crawl it, and generate the first
         article end to end.

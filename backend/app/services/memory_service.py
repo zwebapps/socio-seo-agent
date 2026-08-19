@@ -70,9 +70,11 @@ __all__ = [
     "MAX_RULE_LENGTH",
     "BusinessMemory",
     "BusinessNotFoundError",
+    "DuplicatePreferenceError",
     "EmptyRuleError",
     "MemoryServiceError",
     "PreferenceLimitError",
+    "PreferenceNotFoundError",
     "RuleTooLongError",
     "forget",
     "known_keys",
@@ -80,6 +82,7 @@ __all__ = [
     "memory_from_dna",
     "normalise_rule",
     "remember",
+    "revise",
     "rule_key",
     "to_prompt_lines",
 ]
@@ -129,6 +132,38 @@ class RuleTooLongError(MemoryServiceError):
             f"this one is {length}. Long guidance belongs in an uploaded document, "
             "where retrieval can surface the relevant part instead of carrying all "
             "of it in every prompt."
+        )
+
+
+class PreferenceNotFoundError(MemoryServiceError):
+    """No preference in force matches the one the caller asked to change.
+
+    Raised rather than treated as a no-op, because an edit is not idempotent the way a
+    delete is: a caller who asked to change rule A into rule B and got silence would
+    have no way to tell "done" from "A was already gone, so B was never written".
+    """
+
+    def __init__(self, rule: str) -> None:
+        self.rule = rule
+        super().__init__(
+            "That preference is not in force, so there is nothing to change. It may "
+            "have been removed in another tab."
+        )
+
+
+class DuplicatePreferenceError(MemoryServiceError):
+    """The edited text collides with a DIFFERENT preference already in force.
+
+    Refused rather than merged. Silently collapsing two rules into one would remove a
+    rule the owner never asked to remove, and the panel would show one fewer line than
+    the person just confirmed -- which reads as data loss, because it is.
+    """
+
+    def __init__(self, rule: str) -> None:
+        self.rule = rule
+        super().__init__(
+            "You already have that preference, so this edit would merge two rules into "
+            "one. Delete one of them instead."
         )
 
 
@@ -363,6 +398,52 @@ async def forget(business_id: UUID, *, rule: str, session: AsyncSession) -> None
         return
     business.dna = _with_preferences(business.dna or {}, kept)
     await session.flush()
+
+
+async def revise(business_id: UUID, *, old_rule: str, new_rule: str, session: AsyncSession) -> str:
+    """Rewrite one preference IN PLACE, keeping its position in the list.
+
+    Returns the normalised text now in force, so the caller does not have to guess how
+    the rule was cleaned up.
+
+    Position is preserved deliberately. ``forget`` followed by ``remember`` would be two
+    lines of code and would look equivalent, but it moves the edited rule to the END of
+    the list -- and the list's order is the order the owner confirmed things in, which
+    the panel renders and which prompt assembly emits verbatim. Fixing a typo must not
+    silently reorder the instructions a model receives.
+
+    Matched by :func:`rule_key`, so the caller does not have to reproduce the stored
+    capitalisation to address a rule.
+
+    Does not commit: like the rest of this module, the caller owns the transaction.
+    """
+    normalised = _validated(new_rule)
+    target = rule_key(old_rule)
+
+    business = await _load(business_id, session=session, lock=True)
+    existing = _clean_sequence((business.dna or {}).get(_PREFERENCES_KEY))
+
+    position = next(
+        (i for i, item in enumerate(existing) if item.casefold() == target),
+        None,
+    )
+    if position is None:
+        raise PreferenceNotFoundError(old_rule)
+
+    replacement = normalised.casefold()
+    if any(item.casefold() == replacement for i, item in enumerate(existing) if i != position):
+        raise DuplicatePreferenceError(normalised)
+
+    if existing[position] == normalised:
+        # Nothing changed once whitespace was collapsed. Returning early keeps this a
+        # read, so a no-op save does not take a row lock's worth of write traffic.
+        return normalised
+
+    updated = [*existing]
+    updated[position] = normalised
+    business.dna = _with_preferences(business.dna or {}, updated)
+    await session.flush()
+    return normalised
 
 
 def known_keys(rules: Iterable[str]) -> set[str]:

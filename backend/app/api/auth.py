@@ -9,17 +9,32 @@ JavaScript's reach is a token an XSS steals. ``httpOnly`` puts it out of reach;
 request while still surviving a normal top-level navigation back into the app.
 ``secure`` is on everywhere except local, where it would make the cookie
 undeliverable over plain-HTTP localhost. **No ``domain`` attribute** -- see
-:func:`_set_session_cookie`; that omission is the whole host-isolation guarantee.
+:func:`_set_session_cookie`; that omission is the whole host-isolation guarantee,
+and the ``__Host-`` prefix now has the browser enforce it rather than us. The name
+is therefore environment-dependent and this module exports no name constant:
+``core.cookies.session_cookie_name`` is the only way to obtain it, and
+``core.csrf`` reads it through the same function.
+
+``sameSite=lax`` is necessary and not sufficient -- it does nothing about a
+same-site subdomain or a browser that does not implement it -- so cookie-bearing
+writes are additionally checked against an origin allowlist. That check is
+middleware, in ``core.csrf``, because a forged request must be refused before it
+reaches a dependency, and the reasoning for choosing it over a double-submit token
+is recorded there.
 
 **One answer for every failed login.** Unknown address, wrong password, and
 deactivated account all produce the same 401 and the same body. The service makes
 them cost the same work too, which is the half a response body cannot fix.
 
-**Requests carry no field constraints, on purpose.** FastAPI's stock 422 includes
-the offending ``input`` in the response, so a constraint on ``password`` would
-echo passwords into browsers, proxies and logs. Every field therefore defaults to
-the empty string and the service raises typed errors instead -- which also keeps
-one error shape across the whole module.
+**Requests carry almost no field constraints, on purpose.** FastAPI's stock 422
+includes the offending ``input`` in the response, so a constraint on ``password``
+would once have echoed passwords into browsers, proxies and logs. Every field
+therefore defaults to the empty string and the service raises typed errors
+instead -- which also keeps one error shape across the whole module.
+
+The single exception is :data:`MAX_PASSWORD_FIELD_CHARS`, added once ``main.py``
+grew an app-wide handler that strips the submitted value out of every validation
+error. It is a hard transport ceiling, not the password policy: see the constant.
 
 **The wire is camelCase**, because a TypeScript client should not have to translate
 field names it did not choose.
@@ -44,12 +59,14 @@ from typing import Annotated, Final
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core import rate_limit
 from backend.app.core.config import Settings, get_settings
+from backend.app.core.cookies import cookie_secure, session_cookie_name
+from backend.app.core.proxy_trust import warn_once_if_misconfigured
 from backend.app.core.rate_limit import FixedWindowRateLimiter
 from backend.app.core.security import (
     session_is_revoked,
@@ -63,7 +80,31 @@ from backend.app.services import auth_service
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
-SESSION_COOKIE_NAME: Final = "sma_session"
+# There is deliberately no SESSION_COOKIE_NAME constant. The name depends on the
+# environment now (``__Host-`` requires ``Secure``, which local development cannot
+# have), so a constant would be a name that is right on a laptop and wrong in
+# production -- the one failure shape a test suite cannot catch. Every reader,
+# including ``core.csrf`` and the test suite, goes through
+# ``core.cookies.session_cookie_name``.
+
+#: Hard ceiling on the ``password`` field, in characters.
+#:
+#: NOT the password policy. ``auth_service.MAX_PASSWORD_LENGTH`` (256) is the policy,
+#: and it answers a human with a sentence they can act on -- "please use at most 256
+#: characters". This is the ceiling on what the *transport* will carry at all, and it
+#: exists because ``login`` had no length bound of any kind: ``authenticate`` handed
+#: whatever arrived to argon2, and argon2 hashes any length without complaint.
+#:
+#: 1024 rather than 256, so the two layers do not collide. At 256 the pydantic error
+#: would fire first and a human who typed a slightly-too-long passphrase would get
+#: the app-wide redacted "this field is not accepted here" instead of the service's
+#: real explanation. Four times the policy limit leaves the friendly message as the
+#: one a person actually meets, and reserves the blunt 422 for input that is not a
+#: password at all -- a 100-word diceware passphrase is about 600 characters and a
+#: password manager's output is well under 128, so nothing legitimate is near it.
+#: ``test_the_transport_ceiling_sits_above_the_password_policy`` pins the ordering so
+#: the two numbers cannot cross later.
+MAX_PASSWORD_FIELD_CHARS: Final = 1024
 
 # Thirty days. Long enough that a weekly user is not logged out between visits,
 # short enough that a cookie copied off a shared machine expires within a
@@ -126,13 +167,20 @@ class SignupRequest(CamelModel):
     # must not become a FastAPI validation error, because that error would carry
     # the rest of the body -- including the password -- back to the caller.
     email: str = ""
-    password: str = ""
+    # The one constraint, and it is a transport ceiling rather than policy: see
+    # MAX_PASSWORD_FIELD_CHARS. Safe to declare now only because `main.py` strips the
+    # submitted value out of every validation error; `test_a_rejected_signup_never_
+    # echoes_the_password` and its login twin hold that line.
+    password: str = Field(default="", max_length=MAX_PASSWORD_FIELD_CHARS)
     business_name: str = ""
 
 
 class LoginRequest(CamelModel):
     email: str = ""
-    password: str = ""
+    #: The reason this constant exists. Login is the route that had no bound at all:
+    #: `authenticate` passes the field straight to argon2, so before this a caller
+    #: could make the process hash a megabyte.
+    password: str = Field(default="", max_length=MAX_PASSWORD_FIELD_CHARS)
 
 
 class SignupResponse(CamelModel):
@@ -187,14 +235,28 @@ def _client_ip(request: Request) -> str:
     attacker put a fresh address in every request and erase the per-IP dimension
     completely -- a throttle that an attacker configures is not a throttle.
 
-    Behind a reverse proxy the correct fix is at the server, not here: run uvicorn
-    with ``--proxy-headers`` and an explicit ``--forwarded-allow-ips`` naming the
-    trusted hop, and ``request.client`` becomes the real client. Without that,
-    every caller collapses into one bucket -- which over-limits rather than
-    under-limits, so the failure direction is the safe one.
+    Behind a reverse proxy the correct fix is at the server, not here. Note the
+    detail, since it decides whether this works: uvicorn 0.52 already defaults
+    ``--proxy-headers`` ON, so the missing piece is ``--forwarded-allow-ips`` (env
+    ``FORWARDED_ALLOW_IPS``), which defaults to ``127.0.0.1``. That default is right
+    only for a proxy sharing this container's network namespace -- with the proxy as
+    its own service, ``X-Forwarded-For`` arrives and is silently discarded, and every
+    caller collapses into one bucket.
+
+    That over-limits rather than under-limits, so the failure direction is safe, but
+    it is still a total outage of per-client limiting and it announces itself nowhere.
+    Hence the warn-once check: ``core.proxy_trust`` compares the header against the
+    peer and logs what to change the first time they disagree. It is called from HERE
+    -- the code whose correctness depends on the answer -- rather than at startup,
+    because the discarded-header case is only observable on a real request.
     """
     client = request.client
-    return client.host if client is not None else "unknown"
+    host = client.host if client is not None else None
+    warn_once_if_misconfigured(
+        client_host=host,
+        forwarded_for=request.headers.get("x-forwarded-for"),
+    )
+    return host if host is not None else "unknown"
 
 
 async def _throttle(limiter: FixedWindowRateLimiter, request: Request, *, email: str) -> None:
@@ -226,16 +288,6 @@ async def _throttle(limiter: FixedWindowRateLimiter, request: Request, *, email:
 # --------------------------------------------------------------------------- #
 
 
-def _cookie_secure(settings: Settings) -> bool:
-    """``Secure`` everywhere except local development.
-
-    Local is served over plain HTTP on localhost, where a ``Secure`` cookie is
-    simply never sent -- so the flag would not harden anything, it would break
-    login. Every other environment terminates TLS.
-    """
-    return settings.environment != "local"
-
-
 def _set_session_cookie(
     response: Response, user_id: UUID, settings: Settings, *, issued_at: datetime | None = None
 ) -> None:
@@ -257,9 +309,18 @@ def _set_session_cookie(
     subdomain, which in a multi-tenant product means the session travelling to
     customer-facing hosts -- a cross-tenant session leak written as one keyword
     argument. ``tests/api/test_auth_api.py`` asserts the attribute is absent.
+
+    The name comes from :func:`~backend.app.core.cookies.session_cookie_name`, which
+    prefixes it with ``__Host-`` wherever the cookie is ``Secure``. That prefix makes
+    the paragraph above enforceable by the browser instead of by this docstring: a
+    ``__Host-`` cookie carrying a ``Domain`` is not a weaker cookie, it is a cookie
+    the browser refuses to store, and a subdomain cannot overwrite one either. The
+    three attributes it requires -- ``Secure``, ``Path=/``, no ``Domain`` -- are all
+    set below, and ``cookie_secure`` is the same predicate the name is chosen by, so
+    they cannot drift apart into a cookie no browser accepts.
     """
     response.set_cookie(
-        key=SESSION_COOKIE_NAME,
+        key=session_cookie_name(settings),
         value=sign_session(
             user_id,
             issued_at=issued_at if issued_at is not None else datetime.now(UTC),
@@ -268,7 +329,7 @@ def _set_session_cookie(
         max_age=int(SESSION_MAX_AGE.total_seconds()),
         httponly=True,
         samesite="lax",
-        secure=_cookie_secure(settings),
+        secure=cookie_secure(settings),
         path="/",
     )
 
@@ -281,11 +342,11 @@ def _clear_session_cookie(response: Response, settings: Settings) -> None:
     work while the session cookie survives.
     """
     response.delete_cookie(
-        key=SESSION_COOKIE_NAME,
+        key=session_cookie_name(settings),
         path="/",
         httponly=True,
         samesite="lax",
-        secure=_cookie_secure(settings),
+        secure=cookie_secure(settings),
     )
 
 
@@ -313,7 +374,7 @@ async def current_user(
     Refusing here rather than in ``verify_session`` also keeps ``core.security``
     free of the database, which is what lets the crypto be tested on its own.
     """
-    token = request.cookies.get(SESSION_COOKIE_NAME)
+    token = request.cookies.get(session_cookie_name(settings))
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_NOT_AUTHENTICATED)
 
@@ -483,7 +544,7 @@ async def logout(
     an unknown id updates no rows. Nothing here reveals which of those happened:
     the answer is 204 either way.
     """
-    token = request.cookies.get(SESSION_COOKIE_NAME)
+    token = request.cookies.get(session_cookie_name(settings))
     if token:
         verified = verify_session(token, secret=settings.session_secret, max_age=SESSION_MAX_AGE)
         if verified is not None:

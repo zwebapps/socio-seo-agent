@@ -11,8 +11,14 @@ path:
   by comparing the two responses to each other, not by checking each against a
   string -- that way the test still holds if the copy is reworded.
 * **A 422 never echoes the password back.** FastAPI's own validation errors
-  include the offending input, so the request models deliberately carry no field
-  constraints and the service owns validation instead.
+  include the offending input, so the request models carry almost no field
+  constraints and the service owns validation instead. The one exception is the
+  transport ceiling on ``password``, and it has its own tests below: it is safe only
+  because ``main.py`` strips the submitted value out of every validation error, so
+  "the ceiling refuses it" and "the refusal carries nothing" are asserted together.
+* **The cookie's name is resolved, never written out.** Outside local it carries the
+  ``__Host-`` prefix, which the browser will only honour on a ``Secure``, ``Path=/``,
+  ``Domain``-less cookie -- so the prefix and ``Secure`` are asserted as a pair.
 * **Logout revokes server-side.** Clearing the cookie only edits the caller's own
   browser, which is no help in the case logout exists for: somebody else has a
   copy. The test keeps the old cookie value, logs out, sends it back, and expects
@@ -48,6 +54,7 @@ from sqlalchemy.pool import NullPool
 from backend.app.api import auth as auth_api
 from backend.app.core import rate_limit, security
 from backend.app.core.config import Settings, get_settings
+from backend.app.core.cookies import session_cookie_name
 from backend.app.core.rate_limit import (
     FixedWindowRateLimiter,
     InMemoryWindowCounter,
@@ -58,6 +65,18 @@ from backend.app.main import create_app
 from backend.app.services import auth_service
 
 pytestmark = pytest.mark.db
+
+#: The cookie name, resolved the way the application resolves it -- never the
+#: literal. Outside local the name carries the ``__Host-`` prefix (see
+#: ``core.cookies``), so a hardcoded "sma_session" here would pass on a laptop and
+#: assert nothing at all in an environment that has TLS.
+COOKIE = session_cookie_name(get_settings())
+
+#: The origin every client below claims. It matches the client's own ``base_url``
+#: host, which is what a browser sends, and it is what satisfies the CSRF guard on
+#: the cookie-bearing writes in this file -- see ``core.csrf``. Before this the suite
+#: sent no ``Origin`` at all, which no browser does.
+TEST_ORIGIN = "https://test"
 
 EMAIL_PREFIX = "authapi-test-"
 PASSWORD = "correct horse battery"
@@ -155,7 +174,17 @@ def _client(
         # per-IP dimension keys off. Varying it is how the per-email tests prove
         # they are not quietly being served by the per-IP window.
         transport=httpx.ASGITransport(app=app, client=peer),
-        base_url="http://test",
+        # https, not http, and that is not cosmetic. Outside local the cookie is
+        # `Secure`, and httpx's cookie jar -- like a browser -- will not send a
+        # `Secure` cookie over a plain-HTTP request. On http these tests keep passing
+        # wherever the settings happen to say `local` and would silently stop
+        # authenticating anywhere else, which is exactly the failure the `__Host-`
+        # prefix makes possible. Over https they hold either way.
+        base_url="https://test",
+        # A browser sends `Origin` on every credentialed write. Without it the CSRF
+        # guard refuses the cookie-bearing logout and re-login calls below -- correctly,
+        # so the fix is for the test client to behave like the client it stands in for.
+        headers={"origin": TEST_ORIGIN},
     )
 
 
@@ -193,7 +222,7 @@ async def test_signup_creates_the_account_and_logs_the_caller_in(db: AsyncSessio
     # would be ceremony, not security.
     assert (
         security.verify_session(
-            response.cookies["sma_session"],
+            response.cookies[COOKIE],
             secret=get_settings().session_secret,
             max_age=timedelta(days=30),
         )
@@ -282,7 +311,7 @@ async def test_login_sets_a_session_cookie_with_the_right_flags(db: AsyncSession
 
     assert response.status_code == 200
     header = _cookie_header(response)
-    assert header.startswith("sma_session=")
+    assert header.startswith(f"{COOKIE}=")
     assert "HttpOnly" in header
     assert "samesite=lax" in header.lower()
     assert "Path=/" in header
@@ -400,13 +429,13 @@ async def test_me_is_401_for_a_tampered_cookie(db: AsyncSession) -> None:
     email = _email()
     async with _client(db) as client:
         await _signup(client, email)
-        good = client.cookies["sma_session"]
+        good = client.cookies[COOKIE]
         body, _, signature = good.rpartition(".")
         flipped = ("0" if signature[0] != "0" else "1") + signature[1:]
         # Cleared first: httpx would otherwise send BOTH the good cookie and
         # this one, and the test would pass for the wrong reason.
         client.cookies.clear()
-        client.cookies.set("sma_session", f"{body}.{flipped}")
+        client.cookies.set(COOKIE, f"{body}.{flipped}")
 
         response = await client.get("/api/v1/auth/me")
 
@@ -424,7 +453,7 @@ async def test_me_is_401_for_an_expired_cookie(db: AsyncSession) -> None:
             secret=get_settings().session_secret,
         )
         client.cookies.clear()
-        client.cookies.set("sma_session", stale)
+        client.cookies.set(COOKIE, stale)
 
         response = await client.get("/api/v1/auth/me")
 
@@ -441,7 +470,7 @@ async def test_me_is_401_for_a_cookie_signed_with_another_secret(db: AsyncSessio
             secret="an-attackers-guess",
         )
         client.cookies.clear()
-        client.cookies.set("sma_session", forged)
+        client.cookies.set(COOKIE, forged)
 
         response = await client.get("/api/v1/auth/me")
 
@@ -470,7 +499,7 @@ async def test_me_is_401_for_a_validly_signed_cookie_naming_no_one(db: AsyncSess
     async with _client(db) as client:
         client.cookies.clear()
         client.cookies.set(
-            "sma_session",
+            COOKIE,
             security.sign_session(
                 uuid4(), issued_at=datetime.now(UTC), secret=get_settings().session_secret
             ),
@@ -488,7 +517,7 @@ async def test_logout_clears_the_cookie(db: AsyncSession) -> None:
 
         assert logout.status_code == 204
         header = _cookie_header(logout)
-        assert "sma_session=" in header
+        assert f"{COOKIE}=" in header
         assert "Max-Age=0" in header or "expires=" in header.lower()
 
         after = await client.get("/api/v1/auth/me")
@@ -520,13 +549,13 @@ async def test_logout_revokes_the_session_so_a_stolen_cookie_stops_working(
     email = _email()
     async with _client(db) as client:
         await _signup(client, email)
-        stolen = client.cookies["sma_session"]
+        stolen = client.cookies[COOKIE]
         assert (await client.get("/api/v1/auth/me")).status_code == 200
 
         await client.post("/api/v1/auth/logout")
 
         client.cookies.clear()
-        client.cookies.set("sma_session", stolen)
+        client.cookies.set(COOKIE, stolen)
         replayed = await client.get("/api/v1/auth/me")
 
     assert replayed.status_code == 401
@@ -565,10 +594,10 @@ async def test_logout_revokes_every_session_for_that_user_not_only_this_one(
     email = _email()
     async with _client(db) as first_device:
         await _signup(first_device, email)
-        other_device_cookie = first_device.cookies["sma_session"]
+        other_device_cookie = first_device.cookies[COOKIE]
 
         async with _client(db) as second_device:
-            second_device.cookies.set("sma_session", other_device_cookie)
+            second_device.cookies.set(COOKIE, other_device_cookie)
             assert (await second_device.get("/api/v1/auth/me")).status_code == 200
 
             await first_device.post("/api/v1/auth/logout")
@@ -629,14 +658,14 @@ async def test_a_replacement_session_minted_in_the_same_second_survives(db: Asyn
         # What a password-change endpoint must do.
         client.cookies.clear()
         client.cookies.set(
-            "sma_session", security.sign_session(user_id, issued_at=watermark, secret=secret)
+            COOKIE, security.sign_session(user_id, issued_at=watermark, secret=secret)
         )
         replacement = await client.get("/api/v1/auth/me")
 
         # What it must NOT do: stamp the replacement with the pre-bump instant.
         client.cookies.clear()
         client.cookies.set(
-            "sma_session", security.sign_session(user_id, issued_at=revoked_at, secret=secret)
+            COOKIE, security.sign_session(user_id, issued_at=revoked_at, secret=secret)
         )
         naive_attempt = await client.get("/api/v1/auth/me")
 
@@ -677,7 +706,7 @@ async def test_logout_with_a_forged_cookie_is_still_204_and_revokes_nothing(
 
         async with _client(db) as attacker:
             attacker.cookies.set(
-                "sma_session",
+                COOKIE,
                 security.sign_session(
                     UUID(user_id), issued_at=datetime.now(UTC), secret="an-attackers-guess"
                 ),
@@ -693,7 +722,7 @@ async def test_logout_with_a_forged_cookie_is_still_204_and_revokes_nothing(
 async def test_logout_with_a_garbage_cookie_is_still_204(db: AsyncSession) -> None:
     """A double-clicked logout, or a truncated cookie, must not show an error page."""
     async with _client(db) as client:
-        client.cookies.set("sma_session", "not-even-close")
+        client.cookies.set(COOKIE, "not-even-close")
         response = await client.post("/api/v1/auth/logout")
     assert response.status_code == 204
 
@@ -944,3 +973,267 @@ async def test_a_dead_redis_still_counts_in_this_process(db: AsyncSession) -> No
         ]
 
     assert statuses == [401, 401, 429, 429], statuses
+
+
+# --------------------------------------------------------------------------- #
+# The __Host- prefix
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_cookie_name_is_unprefixed_locally_because_it_cannot_be_secure(
+    db: AsyncSession,
+) -> None:
+    """``__Host-`` requires ``Secure``, and local is plain HTTP on localhost.
+
+    A prefixed cookie there would be dropped by the browser without a word, so login
+    on a developer's machine would simply stop working. The prefix is conditional on
+    exactly the same predicate as ``Secure`` for that reason.
+    """
+    local = get_settings().model_copy(update={"environment": "local"})
+
+    async with _client(db, settings=local) as client:
+        header = _cookie_header(await _signup(client, _email()))
+
+    assert header.startswith("sma_session=")
+    assert "__Host-" not in header
+    assert "secure" not in header.lower()
+
+
+async def test_the_cookie_carries_the_host_prefix_and_its_three_requirements_outside_local(
+    db: AsyncSession,
+) -> None:
+    """The whole point of the prefix, asserted as the package it has to be.
+
+    A browser accepts a ``__Host-`` cookie ONLY if it is ``Secure``, its ``Path`` is
+    ``/``, and it has no ``Domain``. Asserting the prefix without the other three
+    would be asserting a cookie that is never stored; asserting them separately would
+    let a future change drop one and leave the name looking correct.
+
+    And this is what upgrades the existing no-``domain`` test from a promise we keep
+    to one the browser keeps: with the prefix, a ``Domain`` attribute does not weaken
+    host isolation, it makes the cookie not exist. A sibling subdomain also cannot
+    overwrite it, which the bare name never prevented.
+    """
+    email = _email()
+    production = get_settings().model_copy(update={"environment": "production"})
+
+    async with _client(db, settings=production) as client:
+        signup = _cookie_header(await _signup(client, email))
+        client.cookies.clear()
+        login = _cookie_header(
+            await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
+        )
+        logout = _cookie_header(await client.post("/api/v1/auth/logout"))
+
+    for header in (signup, login, logout):
+        assert header.startswith("__Host-sma_session=")
+        assert "Secure" in header
+        assert "Path=/" in header
+        assert "domain" not in header.lower()
+
+
+async def test_the_expired_cookie_uses_the_same_name_as_the_one_it_replaces(
+    db: AsyncSession,
+) -> None:
+    """A browser only replaces a cookie when the name matches.
+
+    The name is environment-dependent now, so a logout that cleared the un-prefixed
+    name in production would return 204 while leaving the session cookie in place --
+    logout as theatre. Both directions are checked because the bug is invisible in
+    whichever environment happens not to be tested.
+    """
+    for environment, expected in (("local", "sma_session"), ("production", "__Host-sma_session")):
+        settings = get_settings().model_copy(update={"environment": environment})
+        async with _client(db, settings=settings) as client:
+            await _signup(client, _email())
+            cleared = _cookie_header(await client.post("/api/v1/auth/logout"))
+
+        assert cleared.startswith(f"{expected}=")
+        assert "Max-Age=0" in cleared or "expires=" in cleared.lower()
+
+
+# --------------------------------------------------------------------------- #
+# The password field ceiling
+# --------------------------------------------------------------------------- #
+
+
+def test_the_transport_ceiling_sits_above_the_password_policy() -> None:
+    """Two numbers with two jobs, and the order between them is the design.
+
+    ``MAX_PASSWORD_LENGTH`` is policy and answers a human with a sentence they can
+    act on. ``MAX_PASSWORD_FIELD_CHARS`` is the ceiling on what the transport carries
+    at all, and its refusal is the app-wide redacted 422. If they ever crossed, the
+    blunt message would become the one every slightly-too-long passphrase meets.
+    """
+    assert auth_api.MAX_PASSWORD_FIELD_CHARS > auth_service.MAX_PASSWORD_LENGTH
+
+
+async def test_a_password_over_the_transport_ceiling_never_reaches_argon2_on_login(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Login was the route with no length bound at all.
+
+    ``authenticate`` passed the field straight to argon2, which hashes any length
+    without complaint -- so the cost of a login was decided by the caller. Asserted
+    the same way the rate-limit test asserts its ordering: ``authenticate`` is
+    replaced with something that fails the test if it is called, because "refused" and
+    "refused before spending the memory" are different properties.
+    """
+
+    async def _must_not_run(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("authenticate was reached with an over-long password")
+
+    monkeypatch.setattr(auth_service, "authenticate", _must_not_run)
+
+    async with _client(db) as client:
+        response = await client.post(
+            "/api/v1/auth/login",
+            json={
+                "email": _email(),
+                "password": "p" * (auth_api.MAX_PASSWORD_FIELD_CHARS + 1),
+            },
+        )
+
+    assert response.status_code == 422
+    assert not response.headers.get_list("set-cookie")
+
+
+async def test_a_password_over_the_transport_ceiling_never_reaches_argon2_on_signup(
+    db: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signup runs the same 64 MiB hash and is equally unauthenticated."""
+
+    async def _must_not_run(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("signup was reached with an over-long password")
+
+    monkeypatch.setattr(auth_service, "signup", _must_not_run)
+
+    async with _client(db) as client:
+        response = await client.post(
+            "/api/v1/auth/signup",
+            json={
+                "email": _email(),
+                "password": "p" * (auth_api.MAX_PASSWORD_FIELD_CHARS + 1),
+                "businessName": "Müller Sanitär GmbH",
+            },
+        )
+
+    assert response.status_code == 422
+
+
+async def test_the_ceilings_refusal_never_echoes_the_password(db: AsyncSession) -> None:
+    """The reason this module had no field constraints for so long.
+
+    FastAPI's stock 422 carries the offending ``input``, so a constraint on
+    ``password`` used to mean echoing passwords into browsers, proxies and logs.
+    Declaring one is only safe because ``main.py`` redacts every validation error, and
+    that dependency is what this asserts -- on both routes, because the redaction is
+    keyed on the field's location and a route that nested it differently would slip
+    through.
+    """
+    marker = "unmistakable-marker-string"
+    over_long = marker * (auth_api.MAX_PASSWORD_FIELD_CHARS // len(marker) + 1)
+
+    async with _client(db) as client:
+        login = await client.post(
+            "/api/v1/auth/login", json={"email": _email(), "password": over_long}
+        )
+        signup = await client.post(
+            "/api/v1/auth/signup",
+            json={"email": _email(), "password": over_long, "businessName": "Müller"},
+        )
+
+    for response in (login, signup):
+        assert response.status_code == 422
+        assert marker not in response.text
+
+
+async def test_a_long_but_policy_length_password_still_gets_the_readable_refusal(
+    db: AsyncSession,
+) -> None:
+    """The reason the ceiling is 1024 and not 256.
+
+    A password between the policy limit and the transport ceiling must still meet the
+    service's own message rather than the redacted one. This is what would break if
+    the two numbers were made equal "for tidiness".
+    """
+    async with _client(db) as client:
+        response = await _signup(
+            client, _email(), password="p" * (auth_service.MAX_PASSWORD_LENGTH + 1)
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "weak_password"
+
+
+async def test_a_legitimate_long_passphrase_is_still_accepted(db: AsyncSession) -> None:
+    """The ceiling must not be a password policy by the back door.
+
+    A diceware-style passphrase is the thing this project's own policy copy
+    recommends ("a short phrase you will remember"), so one has to sail through.
+    """
+    passphrase = " ".join(f"eichhorn{index}" for index in range(20))
+    assert len(passphrase) < auth_service.MAX_PASSWORD_LENGTH
+
+    email = _email()
+    async with _client(db) as client:
+        created = await _signup(client, email, password=passphrase)
+        client.cookies.clear()
+        signed_in = await client.post(
+            "/api/v1/auth/login", json={"email": email, "password": passphrase}
+        )
+
+    assert created.status_code == 201
+    assert signed_in.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# CSRF on the cookie-bearing routes of this module
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_logout_from_a_foreign_origin_is_refused_with_a_real_session(
+    db: AsyncSession,
+) -> None:
+    """The gap ``SameSite=Lax`` does not close, on a real session rather than a stub.
+
+    ``logout`` revokes every session the user has, on any device, and answers 204 to
+    almost anything -- so a cross-site forgery of it is a denial of service against
+    the account. The session here is genuine: the cookie was minted by signup, and it
+    is refused on the origin alone.
+    """
+    email = _email()
+    async with _client(db) as client:
+        await _signup(client, email)
+
+        forged = await client.post(
+            "/api/v1/auth/logout", headers={"origin": "https://evil.example"}
+        )
+        # The session survived, which is the property that matters: a refusal that
+        # still revoked would be a refusal in name only.
+        still_signed_in = await client.get("/api/v1/auth/me")
+
+    assert forged.status_code == 403
+    assert forged.json()["detail"]["code"] == "csrf_origin_refused"
+    assert still_signed_in.status_code == 200
+
+
+async def test_login_itself_is_reachable_without_an_origin(db: AsyncSession) -> None:
+    """Signing in carries no session cookie yet, so the guard must not stand in front
+    of it -- a first login has nothing to forge, and refusing it would lock out every
+    client that does not send the header.
+
+    The residual this leaves (login CSRF) is recorded in ``core.csrf``; ``SameSite=Lax``
+    is what blocks the cross-site POST that would exploit it.
+    """
+    email = _email()
+    async with _client(db) as client:
+        await _signup(client, email)
+        client.cookies.clear()
+        response = await client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": PASSWORD},
+            headers={"origin": "https://evil.example"},
+        )
+
+    assert response.status_code == 200

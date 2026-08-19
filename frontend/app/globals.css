@@ -45,9 +45,30 @@
   --warn: #a35c07;
   --err: #a52f22;
 
-  /* 3:1 against --bg. This is what makes an interactive control perceivable. */
-  --edge: #b6c2bd;
-  --edge-strong: #8d9d97;
+  /* The hairline that makes an interactive control perceivable, per SC 1.4.11.
+     MEASURED, not asserted — every value below was computed in a browser against both
+     --bg and --surface-sunken, because controls sit on either:
+
+       --edge        #74847f   3.37:1 vs --bg   ·  3.21:1 vs --surface-sunken
+       --edge-strong #586863   5.04:1 vs --bg
+
+     These replace #b6c2bd / #8d9d97, which the comment here previously claimed were
+     3:1 and which actually measured 1.57:1 and 2.43:1. That is worth spelling out
+     rather than quietly correcting: the entire documented mitigation for the
+     neumorphic contrast problem was failing, so every interactive control in the app
+     was as invisible to a low-vision user as if the hairline had never been added. The
+     shadow it supplements measures about 1.2:1, so there was nothing else carrying the
+     boundary. If either token is changed again, re-measure — do not eyeball it. */
+  --edge: #74847f;
+  --edge-strong: #586863;
+
+  /* The focus ring needs its own token, and this is the reason: the ring used to be
+     --accent, and --accent (#ef7215) measures 2.54:1 against --bg — below the 3:1 a
+     focus indicator requires. Darkening --accent itself was the wrong fix, because it
+     is a BRAND colour carrying text and pills all over the app; a ring is a different
+     job with a different requirement, so it gets its own value. This is the same orange,
+     two steps darker: #c2560a measures 3.89 vs --bg, 4.07 vs raised, 3.71 vs sunken. */
+  --focus-ring: #c2560a;
 
   --r-sm: 12px;
   --r-md: 18px;
@@ -81,8 +102,17 @@
     --warn: #d9a24a;
     --err: #e0796b;
 
-    --edge: #46514d;
-    --edge-strong: #66746f;
+    /* Same measurement, dark palette. The binding surface here is --surface-raised
+       (#262c29), not --bg, because it is the LIGHTEST thing a hairline sits on in this
+       theme — so it is the number to check:
+         --edge        #6f7d78   3.57 vs --bg  ·  3.31 vs raised  ·  3.79 vs sunken
+         --edge-strong #849490   4.84 vs --bg
+       Replaces #46514d / #66746f, which measured 1.86:1 and 3.14:1 — so the dark
+       theme's hairline was failing 1.4.11 too. */
+    --edge: #6f7d78;
+    --edge-strong: #849490;
+    /* Dark keeps the brand accent: #f4863a measures 6.08:1 here. */
+    --focus-ring: #f4863a;
   }
 }
 
@@ -104,8 +134,9 @@
   --ok: #5cbb9c;
   --warn: #d9a24a;
   --err: #e0796b;
-  --edge: #46514d;
-  --edge-strong: #66746f;
+  --edge: #6f7d78;
+  --edge-strong: #849490;
+  --focus-ring: #f4863a;
 }
 
 body {
@@ -170,7 +201,9 @@ body {
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent);
+  /* --focus-ring, never --accent: see the token's note. 2px at a 3px offset so the ring
+     sits clear of the control's own hairline instead of merging with it. */
+  outline: 2px solid var(--focus-ring);
   outline-offset: 3px;
   border-radius: 4px;
 }

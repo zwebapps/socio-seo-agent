@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from backend.app.core.proxy_trust import WILDCARD, forwarded_trust_warning
+import inspect
+import logging
+
+import pytest
+
+from backend.app.core.proxy_trust import (
+    WILDCARD,
+    forwarded_trust_warning,
+    reset_warning_state,
+    warn_once_if_misconfigured,
+)
 
 
 def test_a_forwarded_header_that_was_discarded_is_reported() -> None:
@@ -105,3 +115,75 @@ def test_an_empty_forwarded_header_is_not_a_claim() -> None:
         )
         is None
     )
+
+
+# --------------------------------------------------------------------------- #
+# warn-once, and the fact that it is wired at all
+# --------------------------------------------------------------------------- #
+
+
+def test_the_warning_is_emitted_once_not_per_request() -> None:
+    """A per-request warning on a busy deployment buries the rest of the log.
+
+    Which is how a real signal ends up filtered out and ignored -- the same reasoning
+    the reconciliation sweep uses for suppressing repeat exception capture.
+    """
+    reset_warning_state()
+    args = {
+        "client_host": "172.18.0.5",
+        "forwarded_for": "203.0.113.9",
+        "forwarded_allow_ips": "127.0.0.1",
+    }
+
+    first = warn_once_if_misconfigured(**args)
+    second = warn_once_if_misconfigured(**args)
+
+    # Both CALLS report the misconfiguration -- a caller asking twice gets the truth
+    # twice -- but only the first one logs it.
+    assert first is not None
+    assert second == first
+
+
+def test_the_warning_actually_reaches_the_log_the_first_time(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Otherwise the whole detection is a function nobody hears."""
+    reset_warning_state()
+
+    with caplog.at_level(logging.WARNING):
+        warn_once_if_misconfigured(
+            client_host="172.18.0.5",
+            forwarded_for="203.0.113.9",
+            forwarded_allow_ips="127.0.0.1",
+        )
+
+    assert any("rate-limit bucket" in record.message for record in caplog.records)
+
+
+def test_a_correct_configuration_logs_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    """A warning that fires when nothing is wrong is a warning people learn to ignore."""
+    reset_warning_state()
+
+    with caplog.at_level(logging.WARNING):
+        warn_once_if_misconfigured(
+            client_host="203.0.113.9",
+            forwarded_for="203.0.113.9",
+            forwarded_allow_ips="172.18.0.5",
+        )
+
+    assert caplog.records == []
+
+
+def test_the_check_is_wired_into_the_rate_limit_key_derivation() -> None:
+    """The detection has to live where the client address is DERIVED.
+
+    Asserted by reading the call site rather than by mocking, because the property
+    being protected is "these two cannot drift apart" -- a warning emitted somewhere
+    else could go stale while `_client_ip` kept returning the proxy's address.
+    """
+    from backend.app.api import auth as auth_api
+
+    source = inspect.getsource(auth_api._client_ip)
+
+    assert "warn_once_if_misconfigured" in source
+    assert "x-forwarded-for" in source.lower()

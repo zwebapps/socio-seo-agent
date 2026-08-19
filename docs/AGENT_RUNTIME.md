@@ -88,16 +88,35 @@ makes a partial result a first-class outcome rather than a crash.
 
 | Node | Kind | Model tier | Reads | Emits | Tools allowed | Fails how |
 |---|---|---|---|---|---|---|
-| `INTAKE` | engine + LLM | cheap | request, `dna`, documents status | normalised goal, surfaces | none | no DNA → stop and ask, never guess |
-| `HARVEST` | **engines only** | — | `dna` | `facts`, `fact_gaps` | `crawl` `kb` `serp` `geo` `seo.nap` | partial → continue, record the gap |
-| `OPPORTUNITY` | agent | mid | `facts` | ranked `Opportunity[]`, one chosen | `kb.search` | none found → return the audit instead |
-| `PLAN` | agent | mid | opportunity, `facts`, `dna` | `Outline` — H-tree, keywords, answer blocks, CTA | `kb.search` | no target keyword → reject, retry once |
-| `GENERATE` | agent | **strong** | outline, `kb`, `exemplars`, `remembered` | `Draft` with citations | `kb.search` `web_search` | section retry ×2 → shorter piece |
-| `VALIDATE` | **engines only** | — | draft | `seo_report`, `claim_check` | `seo` `kb.verify` | < 85 → back to GENERATE with `fix_hint`s |
-| `REPACK` | agent | cheap | `spine`, `channel_specs` | `renderings` per channel | `social.validate` | over-length → trim + regenerate one channel |
+| `INTAKE` | engine + LLM | cheap | request, `dna`, documents status | normalised goal, surfaces | `memory.load` | no DNA → stop and ask, never guess |
+| `HARVEST` | **engines only** | — | `dna` | `facts`, `fact_gaps` | `crawl.site` `serp.search` `kb.search` `geo.probe` `nap.audit` | partial → continue, record the gap |
+| `OPPORTUNITY` | agent | mid | `facts` | ranked `Opportunity[]`, one chosen | `kb.search` `record_opportunities` | none found → return the audit instead |
+| `PLAN` | agent | mid | opportunity, `facts`, `dna` | `Outline` — H-tree, keywords, answer blocks, CTA | `kb.search` `record_outline` | no target keyword → reject, retry once |
+| `GENERATE` | agent | **strong** | outline, `kb`, `exemplars`, `remembered` | `Draft` with citations | `kb.search` `web_search` `record_page` | section retry ×2 → shorter piece |
+| `VALIDATE` | **engines only** | — | draft | `seo_report`, `claim_check` | `seo.score` `claims.check` `kb.verify` | < 85 → back to GENERATE with `fix_hint`s |
+| `REPACK` | agent | cheap | `spine`, `channel_specs` | `renderings` per channel | `channel.validate` `claims.check` `record_posts` | over-length → trim + regenerate one channel |
 | `REVIEW` | **interrupt** | — | everything | `approval` | none | reject reason feeds the feedback loop |
 | `EXPORT` | **actuator** | — | approval token | published refs | `publish` `notify` | idempotent; refuses without a token |
-| `MEASURE` | engine, scheduled | — | published refs | metrics, lead attribution | `geo` `analytics` | provider down → skip the cycle, never corrupt the series |
+| `MEASURE` | engine, scheduled | — | published refs | metrics, lead attribution | `geo.probe` `analytics.fetch` | provider down → skip the cycle, never corrupt the series |
+
+**The "Tools allowed" column is enforced, and this table is not its source of
+truth.** `backend/app/agents/tools.py:NODE_TOOLS` is, and
+`backend/tests/agents/test_tool_allowlist.py` PARSES this column out of this file and
+fails the build if the two disagree — so the doc cannot drift from the runtime in
+either direction. Every tool call, ours or the model's, goes through
+`NodeToolbox`: our code asking for an ungranted tool raises, and a model asking for
+one is refused, logged, and recorded in `state["errors"]` with the code
+`tool_not_allowed`. A grant is a *permission*, not a promise that the tool is wired:
+`kb.search` is granted to OPPORTUNITY, PLAN and GENERATE by design and is not
+implemented in those nodes yet, which `NodeToolbox.available()` reports as
+unavailable rather than as a violation.
+
+Three names in this column changed when it became executable, and the old ones were
+wrong rather than merely informal: `INTAKE` was documented as holding no tools while
+the shipped node reads business memory (section 6 says it does, so section 3 was the
+error); `seo.nap` named the `nap` engine as if it lived inside `seo`; and `REPACK`'s
+`social.validate` names a module that does not exist — the shipped engine is
+`channel`. `claims.check` is new: see section 7.
 
 **Two nodes contain no LLM at all** — `HARVEST` and `VALIDATE` — and they are the
 two that decide whether the output is factually grounded and technically correct.
@@ -244,6 +263,35 @@ internal_links   0                  → "Add at least one internal link to the
 The model is never asked "is this good SEO?" — it is told precisely what failed
 and by how much. After two loops the draft is returned with an explicit
 "needs human edit" list rather than looped forever.
+
+### The regulated-claim gate
+
+`VALIDATE` returns a second verdict, and it is a different KIND of verdict. The SEO
+score is a quality measure with a threshold, so a weak page is publishable after a
+retry. `claim_check` — from the deterministic `claims` engine, over the business's
+own `dna.banned_claims` — is a compliance gate, and a draft carrying a forbidden
+claim is not publishable at any score.
+
+```
+VALIDATE
+  ├─ seo_report.passed  and  claim_check.passed ──► REPACK ──► REVIEW
+  ├─ either fails, retries left ─────────────────► GENERATE with the exact phrase named
+  └─ claim_check still fails after 2 loops ──────► partial, publication_blocked=True
+                                                    (REVIEW is NOT reached)
+```
+
+That last line is the whole point: `REVIEW` is where a human can approve, and
+`EXPORT` publishes what was approved, so a run that cannot produce compliant copy
+must stop before the approval, not at it. `REPACK` runs the same check per channel
+and WITHHOLDS an offending post — a social rendering is separate content, so it can
+carry a claim the page it came from does not.
+
+The claim list is also in the system prompt (`BRAND`, section 5), and that is not
+redundant: the prompt reduces how often a forbidden claim is written, and the engine
+decides whether one is ever published. A prompt is a request that untrusted page text
+can argue a model out of; a matcher downstream of the model cannot be argued with.
+Its limits are stated in `backend/app/engines/claims/match.py`, and the important one
+is that it matches configured phrases and their inflections, **not** paraphrases.
 
 ---
 

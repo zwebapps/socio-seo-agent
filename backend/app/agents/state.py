@@ -111,6 +111,17 @@ class AgentState(TypedDict):
 
     # Deterministic verdicts.
     seo_report: NotRequired[dict[str, Any] | None]
+    #: The regulated-claim verdict from the `claims` engine, written by VALIDATE.
+    #: `None` means VALIDATE has not run yet, which is NOT the same as "clean" --
+    #: the graph treats an absent verdict as "nothing checked" and a present
+    #: failing one as a publication block.
+    claim_check: NotRequired[dict[str, Any] | None]
+    #: True when the run ended because content could not be made publishable, as
+    #: opposed to ending because the budget or the step count ran out. Kept
+    #: separate from `outcome` on purpose: "partial" is the persisted run state
+    #: vocabulary (see run_service.RunState), and adding a value to it would be a
+    #: schema change, while the REASON a run is partial belongs on the state.
+    publication_blocked: NotRequired[bool]
 
     # Control.
     caps: RunCaps
@@ -146,6 +157,8 @@ def new_state(
         draft=None,
         renderings={},
         seo_report=None,
+        claim_check=None,
+        publication_blocked=False,
         caps=caps or RunCaps(),
         step_count=0,
         cost_usd=Decimal("0"),

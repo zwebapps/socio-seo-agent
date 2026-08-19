@@ -39,6 +39,21 @@ export type Catalogue = {
   message: string | null;
 };
 
+/**
+ * One admin request.
+ *
+ * `credentials: "include"` sends the session cookie cross-origin (Next on :3100, the
+ * API on :8100), which is what makes every call here a state-changing request the API
+ * checks for CSRF. Nothing has to be added for that: the browser sets `Origin` itself,
+ * and page script cannot — it is a forbidden header name — which is exactly why the API
+ * validates it instead of asking us to echo a token back. See `backend/app/core/csrf.py`.
+ *
+ * Two consequences worth knowing before changing this file. The API's allowlist is
+ * `CORS_ORIGINS`, so a new frontend origin needs a server-side change and not just a
+ * different `NEXT_PUBLIC_API_URL`. And these calls must stay in the browser: moved into
+ * a server component or a route handler, `fetch` sends no `Origin`, and a cookie-bearing
+ * write with no `Origin` is refused with 403 by design.
+ */
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {

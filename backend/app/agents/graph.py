@@ -11,6 +11,12 @@ LLM-decides-everything loop gives you (docs/ARCHITECTURE.md section 14).
                               v
                         end, honestly
 
+VALIDATE returns two verdicts and they are gated differently. A low SEO score is a
+quality problem: after the retries run out the draft is returned as a partial for a
+human to finish. A banned claim is a compliance problem: the run ends as a partial
+with `publication_blocked` set and NEVER reaches REVIEW, because REVIEW is the point
+at which a human can approve, and EXPORT publishes what was approved.
+
 Nodes are injected rather than imported. A node is just
 ``async (AgentState) -> dict`` of state updates, so the entire machine is testable
 with no model, no database and no network -- and so a node can be swapped or stubbed
@@ -155,10 +161,38 @@ async def run_graph(
 
             if name == "VALIDATE":
                 report = state.get("seo_report") or {}
-                if not report.get("passed", False):
+                claims = state.get("claim_check") or {}
+                # A regulated claim is a HARD gate, not a score. The draft goes back
+                # to GENERATE with the offending phrase named, exactly as a failing
+                # score does -- but when the retries run out the two outcomes differ:
+                # a weak page is returned for a human to edit and publish, while a
+                # page making a forbidden claim must not reach REVIEW at all, because
+                # REVIEW is where a human can approve it and EXPORT publishes what
+                # was approved.
+                blocked = bool(claims) and claims.get("passed") is False
+                if blocked or not report.get("passed", False):
                     try:
                         state = enter_validate_loop(state)
                     except CapExceededError:
+                        if blocked:
+                            found = ", ".join(
+                                sorted({str(hit.get("claim")) for hit in claims.get("hits", [])})
+                            )
+                            return GraphResult(
+                                state={
+                                    **state,
+                                    "outcome": "partial",
+                                    "publication_blocked": True,
+                                    "finished_reason": (
+                                        "Publication blocked: after "
+                                        f"{state['validate_loops']} revisions the draft "
+                                        f"still makes the forbidden claim(s) {found}. "
+                                        "The draft is returned for a human to rewrite "
+                                        "and was NOT sent for approval."
+                                    ),
+                                },
+                                interrupted=False,
+                            )
                         return GraphResult(
                             state={
                                 **state,

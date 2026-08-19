@@ -3,7 +3,7 @@
 Read alongside docs/AGENT_RUNTIME.md section 3, which tabulates every node with its
 model tier, its tools and its failure mode.
 
-Two invariants this package exists to hold:
+Four invariants this package exists to hold:
 
 * **HARVEST and VALIDATE call no model.** They are the trustworthy half of the
   pipeline precisely because they are deterministic — one gathers evidence, the other
@@ -11,6 +11,16 @@ Two invariants this package exists to hold:
 * **A failed fact source degrades the run and is NAMED.** `fact_gaps` is what lets the
   UI say "generated without live research" instead of quietly implying research
   happened.
+* **Every tool call goes through the node's allowlist.** No node reaches an engine
+  or accepts a model's tool call directly: both go through a
+  :class:`~backend.app.agents.tools.NodeToolbox` built from `tools.NODE_TOOLS`, so
+  the capability table in docs/AGENT_RUNTIME.md section 3 is enforced rather than
+  merely described. A refusal is logged and lands in `state["errors"]`.
+* **A banned claim stops publication, deterministically.** The claim list is in the
+  system prompt too, but a prompt is a request: untrusted page text can argue a
+  model out of it, and a model can simply forget. VALIDATE re-checks the finished
+  draft with the `claims` engine, and the graph will not carry a failing verdict
+  to REVIEW.
 
 Every dependency is injected through :class:`NodeDeps`, so the whole set runs with no
 network, no database and no model in tests. Nodes RECEIVE a router; they never build
@@ -33,7 +43,19 @@ from backend.app.agents.nodes.prompts import (
     fence,
     system,
 )
-from backend.app.agents.state import AgentState
+from backend.app.agents.state import AgentState, NodeError
+from backend.app.agents.tools import (
+    CLAIMS_CHECK,
+    CRAWL_SITE,
+    KB_SEARCH,
+    MEMORY_LOAD,
+    SEO_SCORE,
+    SERP_SEARCH,
+    NodeToolbox,
+    ToolImpl,
+    ToolNotAllowedError,
+)
+from backend.app.engines.claims import ClaimCheckRequest, check_claims
 from backend.app.engines.seo import SeoScoreRequest, score_page
 from backend.app.engines.serp import (
     SerpPage,
@@ -89,14 +111,67 @@ class NodeDeps:
     channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
 
 
-def _tool_arguments(completion: Any, name: str) -> dict[str, Any] | None:
+def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
+    """Map tool NAMES to the callables that implement them.
+
+    The indirection is what makes the allowlist enforceable: a node asks for
+    `crawl.site` and cannot reach `deps.crawl_site` any other way, so there is
+    exactly one place where "may this node do this" is decided. Unconfigured
+    dependencies are omitted rather than mapped to None, so `available()` answers
+    "granted and wired" in one call.
+    """
+    candidates: dict[str, ToolImpl | None] = {
+        CRAWL_SITE: deps.crawl_site,
+        SERP_SEARCH: deps.serp_search,
+        KB_SEARCH: deps.retrieve,
+        MEMORY_LOAD: deps.load_memory,
+        SEO_SCORE: deps.score_page or score_page,
+        # Deterministic and always available: the guard must not be able to be
+        # "not configured", or a business could be published unchecked by omission.
+        CLAIMS_CHECK: check_claims,
+    }
+    return {name: impl for name, impl in candidates.items() if impl is not None}
+
+
+def _toolbox(node: str, deps: NodeDeps) -> NodeToolbox:
+    """The gate this node's tool calls pass through."""
+    return NodeToolbox(node=node, implementations=_implementations(deps))
+
+
+def _with_refusals(state: AgentState, box: NodeToolbox, updates: dict[str, Any]) -> dict[str, Any]:
+    """Surface any refused tool call on the run state.
+
+    Appended to the existing list rather than assigned, because the graph MERGES a
+    node's updates into the state: assigning `errors` would silently discard every
+    degradation recorded by earlier nodes.
+    """
+    refused = box.node_errors()
+    if refused:
+        existing: list[NodeError] = list(updates.get("errors") or state["errors"])
+        updates["errors"] = [*existing, *refused]
+    return updates
+
+
+def _tool_arguments(completion: Any, name: str, box: NodeToolbox) -> dict[str, Any] | None:
     """Pull one tool call's arguments, or None if the model answered in prose.
+
+    Every returned call is run past the node's allowlist first. That is the
+    backstop against an induced tool call: text inside the untrusted envelope can
+    ask the model to call `publish`, and the model may comply, but a node that does
+    not hold `publish` drops the call and records the refusal instead of executing
+    it. Dropping rather than raising is deliberate — the run should continue with
+    the legitimate output, and an attacker must not be able to end a run by
+    smuggling one instruction into a competitor's page.
 
     None is returned rather than raised because each caller has a different correct
     response: OPPORTUNITY treats it as "nothing found", PLAN treats it as a failure.
     """
     for call in completion.tool_calls:
-        if isinstance(call, ToolCall) and call.name == name:
+        if not isinstance(call, ToolCall):
+            continue
+        if not box.accept(call.name):
+            continue
+        if call.name == name:
             return dict(call.arguments)
     return None
 
@@ -109,8 +184,20 @@ async def _ask(
     state: AgentState,
     body: str,
     tool: ToolSpec,
+    box: NodeToolbox,
 ) -> tuple[dict[str, Any] | None, Decimal]:
-    """One model call: assemble, call, return the structured arguments and the cost."""
+    """One model call: assemble, call, return the structured arguments and the cost.
+
+    The tool list handed to the model is filtered through the node's allowlist
+    (docs/AGENT_RUNTIME.md section 4: a tool the node cannot have is REMOVED, not
+    refused on call, so the model never plans around a capability it will not get).
+    A node whose own output tool is not in its allowlist is a wiring bug, and it
+    raises rather than silently calling the model with no tools at all.
+    """
+    offered = box.offer([tool])
+    if not offered:
+        raise ToolNotAllowedError(box.node, tool.name, box.allowed)
+
     messages = [
         system(role, state["dna"], state["remembered"]),
         Message(role=Role.USER, content=body),
@@ -118,12 +205,12 @@ async def _ask(
     completion = await deps.router.complete(
         task,
         messages,
-        tools=[tool],
+        tools=offered,
         # Current Claude models reject `temperature` outright, and every node here
         # wants the provider default anyway.
         temperature=None,
     )
-    return _tool_arguments(completion, tool.name), Decimal(str(completion.usage.usd))
+    return _tool_arguments(completion, tool.name, box), Decimal(str(completion.usage.usd))
 
 
 def _evidence(state: AgentState) -> str:
@@ -145,6 +232,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
 
     async def intake(state: AgentState) -> dict[str, Any]:
         """Normalise the request. No model: there is nothing here to decide."""
+        box = _toolbox("INTAKE", deps)
         dna = state["dna"]
         if not dna.get("name"):
             return {
@@ -157,14 +245,18 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         # threaded into the system prompt correctly but nothing ever populated it, so a
         # remembered preference reached no model — the feature existed on both sides of a
         # gap with nothing across it.
-        if deps.load_memory:
+        if box.available(MEMORY_LOAD):
             try:
-                updates["remembered"] = await deps.load_memory()
+                updates["remembered"] = await box.call(MEMORY_LOAD)
+            except ToolNotAllowedError:
+                # Never swallowed into a fact gap: an allowlist refusal is a wiring
+                # fault or an attack, and either way it must be loud.
+                raise
             except Exception as exc:  # broad on purpose: memory is an enhancement
                 logger.warning("intake: could not load memory: %s", exc)
                 updates["fact_gaps"] = [*state["fact_gaps"], "remembered preferences"]
 
-        return updates
+        return _with_refusals(state, box, updates)
 
     async def harvest(state: AgentState) -> dict[str, Any]:
         """Gather evidence from the engines. Engines only — no model, ever.
@@ -172,27 +264,34 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         Each source is independent and failure is per-source: one dead provider must
         not cost the run the evidence the others returned.
         """
+        box = _toolbox("HARVEST", deps)
         dna = state["dna"]
         facts: dict[str, Any] = {}
         gaps: list[str] = []
 
-        if deps.crawl_site and dna.get("website"):
+        if box.available(CRAWL_SITE) and dna.get("website"):
             try:
-                facts["site"] = await deps.crawl_site(str(dna["website"]))
+                facts["site"] = await box.call(CRAWL_SITE, str(dna["website"]))
+            except ToolNotAllowedError:
+                # A refusal is NOT a dead source. Degrading it into a fact gap would
+                # hide the one failure mode this allowlist exists to make visible.
+                raise
             except Exception as exc:  # broad on purpose: one dead source must not end the run
                 logger.warning("harvest: site crawl failed: %s", exc)
                 gaps.append("website crawl")
         elif not dna.get("website"):
             gaps.append("website (none on record)")
 
-        if deps.serp_search:
+        if box.available(SERP_SEARCH):
             seeds = _seed_queries(dna)
             pages: list[SerpPage] = []
             try:
                 for seed in seeds[:MAX_SEED_SEARCHES]:
                     pages.append(
-                        await deps.serp_search(seed, locale=dna.get("locale", "de"), limit=10)
+                        await box.call(SERP_SEARCH, seed, locale=dna.get("locale", "de"), limit=10)
                     )
+            except ToolNotAllowedError:
+                raise
             except Exception as exc:  # broad on purpose, per-source degradation
                 logger.warning("harvest: search failed: %s", exc)
                 gaps.append("search results (keywords, competitors)")
@@ -209,18 +308,22 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         else:
             gaps.append("search results (no provider configured)")
 
-        if deps.retrieve:
+        if box.available(KB_SEARCH):
             try:
-                trace = await deps.retrieve(state["goal"])
+                trace = await box.call(KB_SEARCH, state["goal"])
                 facts["knowledge"] = {
                     "outcome": getattr(trace, "outcome", None),
                     "chunks": len(getattr(trace, "chunks", []) or []),
                 }
+            except ToolNotAllowedError:
+                raise
             except Exception as exc:  # broad on purpose, per-source degradation
                 logger.warning("harvest: retrieval failed: %s", exc)
                 gaps.append("uploaded documents")
 
-        return {"facts": facts, "fact_gaps": [*state["fact_gaps"], *gaps]}
+        return _with_refusals(
+            state, box, {"facts": facts, "fact_gaps": [*state["fact_gaps"], *gaps]}
+        )
 
     async def opportunity(state: AgentState) -> dict[str, Any]:
         """Rank the evidence into opportunities and take the best.
@@ -228,8 +331,10 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         An empty list is a legitimate answer, and the graph ends the run honestly on
         it. Inventing a topic to fill the slot is the failure mode here.
         """
+        box = _toolbox("OPPORTUNITY", deps)
         args, cost = await _ask(
             deps,
+            box=box,
             task=TaskClass.PRIORITISE,
             role=(
                 "You choose what this business should publish next. You rank only what "
@@ -245,19 +350,23 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             tool=OPPORTUNITY_TOOL,
         )
         if not args:
-            return {"opportunity": None, "_cost": cost}
+            return _with_refusals(state, box, {"opportunity": None, "_cost": cost})
 
         ranked = sorted(
             (o for o in args.get("opportunities", []) if o.get("title")),
             key=lambda o: -int(o.get("score", 0)),
         )
-        return {"opportunity": ranked[0] if ranked else None, "_cost": cost}
+        return _with_refusals(
+            state, box, {"opportunity": ranked[0] if ranked else None, "_cost": cost}
+        )
 
     async def plan(state: AgentState) -> dict[str, Any]:
         """Outline the page. A target keyword is mandatory."""
+        box = _toolbox("PLAN", deps)
         opp = state.get("opportunity") or {}
         args, cost = await _ask(
             deps,
+            box=box,
             task=TaskClass.PLAN,
             role=(
                 "You outline one page. Every section must serve the search intent "
@@ -275,7 +384,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 "the outline has no target keyword; a page without one cannot be "
                 "scored, and generating it would waste the run's budget"
             )
-        return {"outline": args, "_cost": cost}
+        return _with_refusals(state, box, {"outline": args, "_cost": cost})
 
     async def generate(state: AgentState) -> dict[str, Any]:
         """Write the page, grounded in the evidence.
@@ -284,6 +393,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         validation loop is theatre: the model would be asked to try again with no idea
         what failed.
         """
+        box = _toolbox("GENERATE", deps)
         outline = state.get("outline") or {}
         report = state.get("seo_report") or {}
         retry = ""
@@ -296,8 +406,18 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 "REACH 85. Fix exactly these, and change nothing else:\n" + "\n".join(hints)
             )
 
+        # A failed claim check is passed through verbatim for the same reason the SEO
+        # hints are: the model is told exactly which phrase is forbidden, so the retry
+        # is a correction rather than a guess. It is appended AFTER the SEO block and
+        # phrased as non-negotiable, because a low score is a quality problem and a
+        # banned claim is a legal one.
+        claims = state.get("claim_check") or {}
+        if claims and not claims.get("passed", True) and claims.get("fix_hint"):
+            retry += "\n\n" + str(claims["fix_hint"])
+
         args, cost = await _ask(
             deps,
+            box=box,
             task=TaskClass.GENERATE,
             role=(
                 "You write the page. Every factual claim comes from the evidence or "
@@ -313,55 +433,87 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         )
         if not args:
             raise ValueError("the model did not return a page; expected a record_page tool call")
-        return {"draft": args, "_cost": cost}
+        return _with_refusals(state, box, {"draft": args, "_cost": cost})
 
     async def validate(state: AgentState) -> dict[str, Any]:
-        """Score the draft. Deterministic arithmetic, never a model.
+        """Score the draft and check it for forbidden claims. No model, ever.
 
-        An absent draft scores as failed rather than raising: the graph's retry path
-        is the right response, and a crash here would lose the run.
+        Two deterministic verdicts, and they are different KINDS of verdict. The SEO
+        score is a quality measure with a threshold: a weak page is publishable after
+        a retry. The claim check is a compliance gate: a draft carrying a claim the
+        business is not allowed to make cannot be published at any score, so the
+        graph refuses to carry it to REVIEW (see `graph.run_graph`).
+
+        An absent draft fails both rather than raising: the graph's retry path is the
+        right response, and a crash here would lose the run.
         """
-        scorer = deps.score_page or score_page
+        box = _toolbox("VALIDATE", deps)
         draft = state.get("draft") or {}
         outline = state.get("outline") or {}
         html = str(draft.get("html") or "")
-
-        if not html:
-            return {
-                "seo_report": {
-                    "score": 0,
-                    "passed": False,
-                    "findings": [],
-                    "note": "No draft HTML was produced, so there was nothing to score.",
-                }
-            }
-
         title = str(draft.get("title") or "")
         meta = str(draft.get("meta_description") or "")
+
+        # Title and meta are checked alongside the body. They are NOT folded into the
+        # assembled HTML document for this: the meta description lives in an
+        # attribute, and stripping markup would drop it, so a forbidden claim in the
+        # meta description would have gone unnoticed on the one line Google shows.
+        claim_result = await box.call(
+            CLAIMS_CHECK,
+            ClaimCheckRequest(
+                content="\n".join([title, meta, html]),
+                banned_claims=[str(c) for c in (state["dna"].get("banned_claims") or [])],
+                contains_markup=True,
+            ),
+        )
+        claim_check = claim_result.model_dump(mode="json")
+
+        if not html:
+            return _with_refusals(
+                state,
+                box,
+                {
+                    "claim_check": claim_check,
+                    "seo_report": {
+                        "score": 0,
+                        "passed": False,
+                        "findings": [],
+                        "note": "No draft HTML was produced, so there was nothing to score.",
+                    },
+                },
+            )
+
         # The engine scores a document, and GENERATE returns title and meta separately.
         document = (
             f"<html><head><title>{title}</title>"
             f'<meta name="description" content="{meta}">'
             f"</head><body>{html}</body></html>"
         )
-        result = scorer(
+        result = await box.call(
+            SEO_SCORE,
             SeoScoreRequest(
                 html=document,
                 target_keyword=str(outline.get("target_keyword") or ""),
                 secondary_keywords=list(outline.get("secondary_keywords") or []),
                 locale=str(state["dna"].get("locale") or "de"),
-            )
+            ),
         )
-        return {"seo_report": result.model_dump(mode="json")}
+        return _with_refusals(
+            state,
+            box,
+            {"seo_report": result.model_dump(mode="json"), "claim_check": claim_check},
+        )
 
     async def repack(state: AgentState) -> dict[str, Any]:
         """Render the approved message per channel, then enforce the limits in code."""
+        box = _toolbox("REPACK", deps)
         draft = state.get("draft") or {}
         outline = state.get("outline") or {}
         wanted = ", ".join(deps.channels)
 
         args, cost = await _ask(
             deps,
+            box=box,
             task=TaskClass.REPACK,
             role=(
                 "You adapt one message for each channel. The claim stays identical "
@@ -376,7 +528,9 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             ),
             tool=REPACK_TOOL,
         )
+        banned = [str(c) for c in (state["dna"].get("banned_claims") or [])]
         renderings: dict[str, str] = {}
+        blocked: list[NodeError] = []
         for post in (args or {}).get("posts", []):
             channel = str(post.get("channel", "")).lower().strip()
             body = str(post.get("body", "")).strip()
@@ -387,9 +541,35 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 # Trim on a word boundary. The platform would reject the post
                 # outright, so shipping it over-length is not an option.
                 body = body[: limit - 1].rsplit(" ", 1)[0] + "…"
+
+            # Checked AFTER trimming, because the trimmed text is what would be
+            # published. A rendering is separate content from the page: the page can
+            # pass VALIDATE and a post derived from it can still carry a forbidden
+            # claim, and there is no per-channel retry in the graph -- so the post is
+            # DROPPED and the loss is named, rather than published or silently lost.
+            verdict = await box.call(
+                CLAIMS_CHECK,
+                ClaimCheckRequest(content=body, banned_claims=banned, contains_markup=False),
+            )
+            if not verdict.passed:
+                blocked.append(
+                    NodeError(
+                        node="REPACK",
+                        code="banned_claim",
+                        message=(
+                            f"The {channel} post was withheld: it makes the forbidden "
+                            f"claim(s) {', '.join(verdict.claims_found)}. "
+                            "Nothing was published for that channel."
+                        ),
+                    )
+                )
+                continue
             renderings[channel] = body
 
-        return {"renderings": renderings, "_cost": cost}
+        updates: dict[str, Any] = {"renderings": renderings, "_cost": cost}
+        if blocked:
+            updates["errors"] = [*state["errors"], *blocked]
+        return _with_refusals(state, box, updates)
 
     async def review(state: AgentState) -> dict[str, Any]:
         """The interrupt point. Nothing to do: the graph pauses here for a human."""

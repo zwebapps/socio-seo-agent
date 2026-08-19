@@ -31,6 +31,8 @@ sending a different ``X-Forwarded-For`` each time. Name the proxy.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Final
 
 #: The wildcard nobody should deploy. Checked as a value, not as advice in a
@@ -91,3 +93,47 @@ def forwarded_trust_warning(
     # The forwarded address and the peer agree, which is what it looks like when the
     # header WAS applied: the server has already rewritten the peer to the client.
     return None
+
+
+#: Set once a warning has been emitted, so a misconfiguration costs one log line
+#: rather than one per request. A per-request warning on a busy deployment buries the
+#: rest of the log, which is how a real signal gets filtered out and ignored.
+_warned = False
+
+
+def warn_once_if_misconfigured(
+    *,
+    client_host: str | None,
+    forwarded_for: str | None,
+    forwarded_allow_ips: str | None = None,
+) -> str | None:
+    """Log the misconfiguration the first time it is observed. Returns what it logged.
+
+    Called from wherever the client address is derived for rate limiting, because
+    that is the code whose correctness depends on the answer -- a warning emitted
+    somewhere else could drift out of step with the thing it warns about.
+
+    The return value exists so a test can assert the message without capturing logs,
+    and so a caller can surface it in a health endpoint later.
+    """
+    global _warned
+    warning = forwarded_trust_warning(
+        client_host=client_host,
+        forwarded_for=forwarded_for,
+        forwarded_allow_ips=(
+            os.environ.get("FORWARDED_ALLOW_IPS")
+            if forwarded_allow_ips is None
+            else forwarded_allow_ips
+        ),
+    )
+    if warning is None or _warned:
+        return warning
+    _warned = True
+    logging.getLogger(__name__).warning("%s", warning)
+    return warning
+
+
+def reset_warning_state() -> None:
+    """Forget that a warning was emitted. For tests only."""
+    global _warned
+    _warned = False

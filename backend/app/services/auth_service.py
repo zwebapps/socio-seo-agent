@@ -54,6 +54,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.pwned import BREACH_THRESHOLD, PwnedChecker
+from backend.app.core.pwned import get_checker as get_pwned_checker
 from backend.app.core.security import (
     hash_password,
     hash_password_bounded,
@@ -233,8 +235,37 @@ class SignupResult:
     email: str
 
 
+async def _reject_breached_password(password: str, *, checker: PwnedChecker | None) -> None:
+    """Refuse a password that appears in a known breach corpus.
+
+    Separate from :func:`validate_password`, and deliberately not folded into it. That
+    function is PURE and synchronous -- it is the policy, it is trivially testable, and
+    every caller can rely on it never doing I/O. This is a network question, so it gets
+    its own await and its own failure mode.
+
+    Runs AFTER the offline policy, which matters for cost and for privacy: a password
+    that is already too short never leaves the process at all.
+
+    Never a hard failure. `breach_count` returns 0 when it could not reach the service
+    (see `core.pwned` on why it fails open), so an outage costs this check and nothing
+    else -- length, distinct characters and the offline denylist still apply.
+    """
+    resolved = checker if checker is not None else get_pwned_checker()
+    if await resolved.breach_count(password) >= BREACH_THRESHOLD:
+        raise WeakPasswordError(
+            "That password has appeared in a known data breach, so attackers already "
+            "have it on a list. Please choose a different one -- it does not have to be "
+            "more complicated, just not one that has leaked."
+        )
+
+
 async def signup(
-    email: str, password: str, business_name: str, *, session: AsyncSession
+    email: str,
+    password: str,
+    business_name: str,
+    *,
+    session: AsyncSession,
+    pwned_checker: PwnedChecker | None = None,
 ) -> SignupResult:
     """Create a user and their first business in one transaction.
 
@@ -248,6 +279,7 @@ async def signup(
     """
     normalised = normalise_email(email)
     validate_password(password)
+    await _reject_breached_password(password, checker=pwned_checker)
     name = _clean_business_name(business_name)
 
     # Bounded: hashing costs the same 64 MiB as verifying, so an unthrottled

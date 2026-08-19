@@ -46,14 +46,27 @@ jobs:
 
       - run: uv sync --frozen
 
+      # `create_app()` refuses to start outside `local` without a real
+      # SESSION_SECRET (main.py::_assert_secure), and it is constructed at test
+      # COLLECTION time -- so without this every test in the suite errored before it
+      # ran, and this job was green only because ruff and mypy pass on code nobody
+      # executed. Generated per run rather than stored as a repository secret: it
+      # signs nothing that outlives the job, there is no production value to leak,
+      # and it means a fresh clone's CI needs no manual setup to be honest.
+      - name: Generate an ephemeral session secret
+        run: echo "SESSION_SECRET=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+
       - name: Ruff lint
         run: uv run ruff check .
 
       - name: Ruff format check
         run: uv run ruff format --check .
 
+      # `backend` alone leaves `evals/` unchecked -- and the eval harness is the
+      # thing that decides whether the product works, so it is the last place to
+      # accept untyped code. `backend` already includes `backend/tests`.
       - name: Mypy (strict)
-        run: uv run mypy backend
+        run: uv run mypy backend evals
 
       # Creates the schema, the RLS policies, and the restricted sma_app role.
       - name: Migrate

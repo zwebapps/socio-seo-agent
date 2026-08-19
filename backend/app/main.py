@@ -25,7 +25,10 @@ from backend.app.api import (
     onboarding,
     runs,
 )
+from backend.app.core.body_limit import BodySizeLimitMiddleware
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings, get_settings
+from backend.app.core.cookies import session_cookie_name
+from backend.app.core.csrf import OriginCsrfMiddleware
 
 #: Below this length an HMAC key is brute-forceable, and the signature is only
 #: ever as good as the key behind it.
@@ -135,8 +138,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(leads.public_router)
     app.include_router(leads.router)
 
+    # Middleware order is the reverse of the order it is added in: Starlette puts each
+    # new one on the OUTSIDE, so the last call here is the outermost layer. The stack
+    # this produces, outermost first, is
+    #
+    #     CORS  ->  Origin CSRF  ->  body-size limit  ->  routes
+    #
+    # and each position is a decision.
+    #
+    # CORS outermost so that a refusal from either guard still gets its
+    # `Access-Control-Allow-Origin` header and the browser can read the status
+    # instead of reporting a generic network error -- and so a preflight OPTIONS is
+    # answered by CORS and never reaches the guards at all.
+    #
+    # CSRF outside the size limit because a forged request should be refused on its
+    # headers, before a single byte of its body is counted.
+    #
+    # Both outside the routes, which is the whole point: an oversized login body must
+    # not reach argon2, and a forged write must not reach a database session.
+    app.add_middleware(BodySizeLimitMiddleware)
+    app.add_middleware(
+        OriginCsrfMiddleware,
+        allowed_origins=settings.cors_origins,
+        # Resolved once, here, from the same predicate that decides `Secure` -- the
+        # cookie's name is environment-dependent now (see core.cookies), so a
+        # hardcoded name in the guard would leave every authenticated write
+        # unprotected in exactly the environments that need protecting.
+        session_cookie_name=session_cookie_name(settings),
+    )
     app.add_middleware(
         CORSMiddleware,
+        # The same tuple the CSRF guard above is built from. One list: an origin
+        # permitted to make a credentialed call and an origin permitted to make a
+        # state-changing one are the same question, and two lists would answer it
+        # differently within a release.
         allow_origins=list(settings.cors_origins),
         allow_credentials=True,
         # Every method the API serves. A missing entry breaks that endpoint from a

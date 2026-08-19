@@ -61,6 +61,7 @@ export function SoftButton({
   variant = "plain",
   disabled = false,
   className = "",
+  ariaLabel,
 }: {
   children: ReactNode;
   onClick?: () => void;
@@ -68,6 +69,12 @@ export function SoftButton({
   variant?: "plain" | "primary" | "quiet";
   disabled?: boolean;
   className?: string;
+  /**
+   * An accessible name that replaces the visible label. Needed wherever the same words
+   * appear on several buttons — five "Copy" buttons on one screen are five identically
+   * named controls to a screen-reader user unless each says what it copies.
+   */
+  ariaLabel?: string;
 }) {
   const primary = variant === "primary";
   return (
@@ -75,6 +82,7 @@ export function SoftButton({
       type={type}
       onClick={onClick}
       disabled={disabled}
+      aria-label={ariaLabel}
       className={`soft-press ${primary ? "" : "soft-raised soft-edge"} px-4 py-2 text-sm font-medium disabled:opacity-45 ${className}`}
       style={{
         borderRadius: R.pill,
@@ -176,18 +184,31 @@ export function SoftInput({
   label,
   placeholder,
   className = "",
+  autoFocus = false,
+  describedBy,
 }: {
   value: string;
   onChange: (next: string) => void;
   label: string;
   placeholder?: string;
   className?: string;
+  /**
+   * For a field that APPEARS in response to a click — an inline edit, say. Focus has to
+   * follow the thing the user just asked for, or a keyboard user is left at the button
+   * that opened a field they cannot reach without hunting for it.
+   */
+  autoFocus?: boolean;
+  /** Id of the element describing this field, e.g. a live character counter. */
+  describedBy?: string;
 }) {
   return (
     <input
       aria-label={label}
+      aria-describedby={describedBy}
       value={value}
       placeholder={placeholder}
+      // eslint-disable-next-line jsx-a11y/no-autofocus -- see the prop's docstring
+      autoFocus={autoFocus}
       onChange={(e) => onChange(e.target.value)}
       className={`soft-sunken soft-edge px-3 py-2 text-sm ${className}`}
       style={{ borderRadius: R.sm, color: "var(--text)" }}

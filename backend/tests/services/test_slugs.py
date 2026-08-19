@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
 from uuid import UUID
 
 import pytest
 
+from backend.app.services import auth_service
 from backend.app.services.slugs import (
     MAX_SLUG_LENGTH,
     business_slug,
@@ -98,3 +100,80 @@ def test_the_suffixed_form_also_respects_the_column_width() -> None:
 
     assert len(slug) <= MAX_SLUG_LENGTH
     assert slug.endswith("bc0e9c9c"), "the uniqueness half must survive the truncation"
+
+
+# --------------------------------------------------------------------------- #
+# The breach check, wired into signup
+# --------------------------------------------------------------------------- #
+
+
+class _BreachedChecker:
+    """Reports every password as breached. Satisfies `PwnedChecker` structurally."""
+
+    async def breach_count(self, password: str) -> int:
+        return 24_230_577
+
+
+class _CleanChecker:
+    async def breach_count(self, password: str) -> int:
+        return 0
+
+
+class _ExplodingChecker:
+    """Stands in for the service being unreachable in a way `core.pwned` did not catch."""
+
+    async def breach_count(self, password: str) -> int:
+        raise AssertionError("the offline policy should have rejected this first")
+
+
+async def test_signup_refuses_a_password_found_in_a_breach() -> None:
+    """The point of the whole module: a leaked password is already on an attacker's list.
+
+    No database is touched, because the refusal must happen before anything is
+    written -- so passing `session=None` is safe here and also proves it.
+    """
+    with pytest.raises(auth_service.WeakPasswordError) as caught:
+        await auth_service.signup(
+            "owner@example.test",
+            "correct horse battery staple",
+            "Müller Sanitär",
+            session=cast("Any", None),
+            pwned_checker=_BreachedChecker(),
+        )
+
+    assert "known data breach" in str(caught.value)
+
+
+async def test_the_breach_check_runs_after_the_offline_policy() -> None:
+    """Order matters for cost AND for privacy.
+
+    A password already too short must never leave the process to be asked about. The
+    exploding checker proves the order rather than assuming it: if the network check
+    ran first, this would raise AssertionError instead of WeakPasswordError.
+    """
+    with pytest.raises(auth_service.WeakPasswordError) as caught:
+        await auth_service.signup(
+            "owner@example.test",
+            "short",
+            "Müller Sanitär",
+            session=cast("Any", None),
+            pwned_checker=_ExplodingChecker(),
+        )
+
+    assert "at least" in str(caught.value), "the length rule should be what refused this"
+
+
+async def test_a_clean_password_passes_the_breach_check() -> None:
+    """It must not become a blanket refusal.
+
+    Reaching the database is the SUCCESS signal here: `session=None` means the next
+    thing after the check raises AttributeError, which proves the check let it past.
+    """
+    with pytest.raises(AttributeError):
+        await auth_service.signup(
+            "owner@example.test",
+            "eine ziemlich lange passphrase hier",
+            "Müller Sanitär",
+            session=cast("Any", None),
+            pwned_checker=_CleanChecker(),
+        )

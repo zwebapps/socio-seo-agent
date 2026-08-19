@@ -231,7 +231,11 @@ async def business(app_engine: AsyncEngine) -> AsyncIterator[UUID]:
             {"id": user_id, "email": f"{EMAIL_PREFIX}{user_id.hex}@example.test"},
         )
         await s.execute(
-            text("INSERT INTO businesses (id, owner_id, name, locale) VALUES (:id, :o, :n, 'de')"),
+            text(
+                "INSERT INTO businesses (id, owner_id, name, slug, locale) VALUES "
+                "(:id, :o, :n, 'fixture-' || "
+                "left(replace(cast(gen_random_uuid() AS text), '-', ''), 12), 'de')"
+            ),
             {"id": business_id, "o": user_id, "n": "memsvc business"},
         )
         await s.commit()

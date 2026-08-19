@@ -30,7 +30,8 @@ from pydantic.alias_generators import to_camel
 
 from backend.app.api.auth import CurrentUser
 from backend.app.db.adapters.run_store import PostgresRunStore
-from backend.app.services.run_service import RunService
+from backend.app.services.review_service import RunReview, project_review
+from backend.app.services.run_service import RunRecord, RunService
 
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
 
@@ -110,6 +111,23 @@ class RunOut(CamelModel):
     events: list[EventOut]
 
 
+async def _require_own_run(run_id: UUID, business_id: UUID, service: RunService) -> RunRecord:
+    """The run, or 404.
+
+    One definition rather than one per route: "may this caller see this run" is an
+    authorisation decision, and three copies of it is three chances for one to drift.
+    404 for both "absent" and "another business's", on purpose — whether a run exists is
+    itself information, and a caller has no legitimate way to hold an id from elsewhere.
+    """
+    run = await service.get(run_id)
+    if run is None or run.business_id != business_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "run_not_found", "message": "No such run."},
+        )
+    return run
+
+
 @router.post("", response_model=StartRunResponse, response_model_by_alias=True, status_code=202)
 async def start_run(
     payload: StartRunRequest,
@@ -126,14 +144,7 @@ async def get_run(
     business_id: Annotated[UUID, Depends(current_business)],
     service: Annotated[RunService, Depends(get_run_service)],
 ) -> RunOut:
-    run = await service.get(run_id)
-    if run is None or run.business_id != business_id:
-        # 404 for both cases on purpose: whether a run exists is information, and a
-        # caller has no legitimate way to hold an id from another business.
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "run_not_found", "message": "No such run."},
-        )
+    run = await _require_own_run(run_id, business_id, service)
 
     events = await service.events(run_id)
     return RunOut(
@@ -152,6 +163,31 @@ async def get_run(
     )
 
 
+@router.get(
+    "/{run_id}/review",
+    response_model=RunReview,
+    response_model_by_alias=True,
+    summary="One run's output, as the four review tabs render it",
+)
+async def get_review(
+    run_id: UUID,
+    business_id: Annotated[UUID, Depends(current_business)],
+    service: Annotated[RunService, Depends(get_run_service)],
+) -> RunReview:
+    """The draft, the SEO findings, the social posts and the AI answer blocks.
+
+    Separate from ``GET /{run_id}`` on purpose. The timeline is polled every couple of
+    seconds while a run is live, and the draft HTML is the largest thing the run
+    produces — putting it in the polled payload would re-send the whole page on every
+    tick. The timeline answers "where is it up to"; this answers "what came out".
+
+    A run with nothing to show still returns 200 with populated notes rather than 404:
+    the run exists, and "GENERATE has not run yet" is the answer, not an error.
+    """
+    run = await _require_own_run(run_id, business_id, service)
+    return project_review(run.checkpoint)
+
+
 @router.get("/{run_id}/events")
 async def stream_events(
     run_id: UUID,
@@ -160,12 +196,9 @@ async def stream_events(
     after: int = 0,
 ) -> StreamingResponse:
     """Server-sent events for one run, resumable from `after`."""
-    run = await service.get(run_id)
-    if run is None or run.business_id != business_id:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "run_not_found", "message": "No such run."},
-        )
+    # Checked before the stream opens: a 404 must be an HTTP status, not the first
+    # frame of a 200 response body.
+    await _require_own_run(run_id, business_id, service)
 
     async def generate() -> AsyncIterator[str]:
         seen = after

@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pill, SoftCard, SoftWell } from "../../components/soft";
+import { RunReviewTabs } from "./review";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
@@ -238,6 +239,13 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
           </p>
         </SoftCard>
       )}
+
+      {/* The review surface. Mounted once the run itself has loaded, and keyed on the
+          run's state so it re-reads as the graph advances — output appears node by node,
+          and a review fetched at HARVEST would otherwise stay empty for the whole run.
+          It is NOT gated on a terminal state: a partial run has partial output, and
+          hiding it until the end would withhold work the owner has already paid for. */}
+      {runId && run && <RunReviewTabs runId={runId} runState={run.state} />}
     </main>
   );
 }

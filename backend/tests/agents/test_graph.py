@@ -155,8 +155,14 @@ def _nodes(
     harvest: Node | None = None,
     opportunity: object = ...,
     stop_after: str | None = None,
+    claim_check: Callable[[], dict[str, object]] | None = None,
 ) -> dict[str, Any]:
-    """A full set of injected node callables, all inert."""
+    """A full set of injected node callables, all inert.
+
+    `claim_check` defaults to None, i.e. VALIDATE writes no claim verdict -- which is
+    what every test written before the gate existed expects, and is also the honest
+    representation of a business with no banned claims configured.
+    """
     score = seo_score if callable(seo_score) else (lambda: seo_score)
     opp = {"title": "Notdienst Koblenz"} if opportunity is ... else opportunity
 
@@ -166,9 +172,13 @@ def _nodes(
     async def validate(state: AgentState) -> dict[str, object]:
         # Call score() ONCE. Calling it twice consumed two values from the
         # iterator, so `passed` was computed from the NEXT score and the retry
-        # never fired -- the test would have silently proved nothing.
+        # never fired -- the test would have silently proved nothing. The same
+        # applies to claim_check, which is also often an iterator.
         value = score()
-        return {"seo_report": {"score": value, "passed": value >= 85}}
+        updates: dict[str, object] = {"seo_report": {"score": value, "passed": value >= 85}}
+        if claim_check is not None:
+            updates["claim_check"] = claim_check()
+        return updates
 
     return {
         "INTAKE": _ok("INTAKE", dna={"name": "Test"}, _cost=cost),
@@ -181,3 +191,97 @@ def _nodes(
         "REVIEW": _ok("REVIEW"),
         "_stop_after": stop_after,
     }
+
+
+# --------------------------------------------------------------------------- #
+# The regulated-claim gate: a compliance failure is not a quality failure
+# --------------------------------------------------------------------------- #
+
+
+def _claim_verdict(passed: bool, claim: str = "schmerzfrei") -> dict[str, object]:
+    if passed:
+        return {"passed": True, "exercised": True, "checked": 1, "hits": [], "fix_hint": ""}
+    return {
+        "passed": False,
+        "exercised": True,
+        "checked": 1,
+        "hits": [{"claim": claim, "matched": claim, "start": 0, "end": 1, "context": "c"}],
+        "fix_hint": f'Remove the forbidden claim "{claim}".',
+    }
+
+
+async def test_a_banned_claim_sends_the_draft_back_to_generate_first() -> None:
+    """The gate is not a hair trigger: the model gets the same two chances it gets on a
+    low score, with the offending phrase named."""
+    verdicts = iter([_claim_verdict(False), _claim_verdict(True)])
+
+    result = await run_graph(
+        _state(), nodes=_nodes(seo_score=91, claim_check=lambda: next(verdicts))
+    )
+
+    assert result.state["visited"].count("GENERATE") == 2, "the draft was rewritten once"
+    assert result.state["outcome"] == "awaiting_approval", "the rewrite fixed it"
+    assert result.state.get("publication_blocked") is not True
+
+
+async def test_a_draft_that_keeps_the_banned_claim_never_reaches_review() -> None:
+    """The load-bearing assertion of the whole guard. REVIEW is where a human can
+    approve, and EXPORT publishes what was approved -- so a run that cannot produce
+    compliant copy has to stop BEFORE the approval, not at it."""
+    result = await run_graph(
+        _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(False))
+    )
+
+    assert result.state["outcome"] == "partial"
+    assert result.state["publication_blocked"] is True
+    assert "REVIEW" not in result.state["visited"]
+    assert result.interrupted is False, "an interrupt is an invitation to approve"
+    assert "schmerzfrei" in (result.state["finished_reason"] or "")
+    assert "NOT sent for approval" in (result.state["finished_reason"] or "")
+
+
+async def test_a_compliance_block_is_distinguishable_from_a_quality_partial() -> None:
+    """Both end as `partial`, and they mean opposite things to whoever reads the run: a
+    weak page is publishable after a human edit, a blocked one is not publishable as
+    written. `publication_blocked` is what separates them."""
+    weak = await run_graph(_state(), nodes=_nodes(seo_score=40))
+    blocked = await run_graph(
+        _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(False))
+    )
+
+    assert weak.state["outcome"] == blocked.state["outcome"] == "partial"
+    assert weak.state.get("publication_blocked") is not True
+    assert blocked.state["publication_blocked"] is True
+    assert "needs human edit" in (weak.state["finished_reason"] or "").lower()
+    assert "publication blocked" in (blocked.state["finished_reason"] or "").lower()
+
+
+async def test_a_run_with_no_claim_verdict_behaves_exactly_as_before() -> None:
+    """An absent verdict means VALIDATE has not written one, which must not be read as
+    a failure -- that would block every run whose node set predates the gate."""
+    result = await run_graph(_state(), nodes=_nodes(seo_score=91, claim_check=None))
+
+    assert result.state["outcome"] == "awaiting_approval"
+    assert result.interrupted is True
+
+
+async def test_a_clean_claim_check_does_not_consume_a_validate_loop() -> None:
+    result = await run_graph(
+        _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(True))
+    )
+
+    assert result.state["validate_loops"] == 0
+    assert result.state["outcome"] == "awaiting_approval"
+
+
+async def test_a_banned_claim_blocks_even_when_the_seo_score_passes() -> None:
+    """The two verdicts are independent. A perfect score must not carry a forbidden
+    claim past the gate."""
+    result = await run_graph(
+        _state(), nodes=_nodes(seo_score=100, claim_check=lambda: _claim_verdict(False))
+    )
+
+    report = result.state["seo_report"] or {}
+    assert report["passed"] is True
+    assert result.state["publication_blocked"] is True
+    assert result.state["outcome"] == "partial"

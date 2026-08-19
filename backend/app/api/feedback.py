@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.api import memory
 from backend.app.api.auth import CurrentUser
 from backend.app.api.runs import current_business
 from backend.app.db.session import business_session
@@ -56,6 +57,19 @@ from backend.app.services.feedback_service import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["feedback"])
+
+# The business-memory panel's routes, mounted here rather than in `main.py`.
+#
+# Two reasons, one structural and one practical. Structurally they belong to the same
+# path family: `/businesses/{id}/proposals` below is where a distilled rule WAITS, and
+# `/businesses/{id}/memory` is where it lands once approved, so they read as one surface
+# and share `current_business`. Practically, `main.py` is the one file that lists what is
+# mounted, and adding a line to it was not this change's to make -- if that file is ever
+# free, moving this include there is a two-line, behaviour-neutral tidy-up.
+#
+# `memory.router` deliberately carries no prefix of its own so that the `/api/v1` above
+# is applied exactly once.
+router.include_router(memory.router)
 
 #: ``{"onBrand": 4}`` from a TypeScript client means ``on_brand``. The rest of the
 #: wire is camelCase (the field names are aliased), and a dict KEY is the one place

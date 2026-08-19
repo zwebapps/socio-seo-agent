@@ -442,3 +442,264 @@ async def test_memory_that_fails_to_load_degrades_the_run_rather_than_ending_it(
 
     assert "remembered" not in updates
     assert any("remembered" in gap for gap in updates["fact_gaps"])
+
+
+# --------------------------------------------------------------------------- #
+# The tool allowlist, at the node level
+#
+# `test_tool_allowlist.py` tests the gate; these test that the nodes actually go
+# THROUGH it. A perfectly correct allowlist nothing calls is worth nothing.
+# --------------------------------------------------------------------------- #
+
+
+async def test_harvest_reaches_its_engines_only_through_the_allowlist() -> None:
+    """Every source HARVEST uses is one of its granted tools, so the grant list is the
+    complete description of what the node can touch."""
+    from backend.app.agents.tools import CRAWL_SITE, KB_SEARCH, NODE_TOOLS, SERP_SEARCH
+
+    granted = NODE_TOOLS["HARVEST"]
+    assert {CRAWL_SITE, SERP_SEARCH, KB_SEARCH} <= granted
+
+
+async def test_a_node_asking_for_a_tool_it_does_not_hold_fails_loudly() -> None:
+    """The refusal must not be degraded into a fact gap. HARVEST swallows a dead
+    provider on purpose, and an allowlist violation must not ride out on that path:
+    a dead provider is ordinary, a capability nobody granted is not."""
+    from backend.app.agents.tools import PUBLISH, NodeToolbox, ToolNotAllowedError
+
+    box = NodeToolbox(node="HARVEST", implementations={PUBLISH: lambda: None})
+    with pytest.raises(ToolNotAllowedError):
+        await box.call(PUBLISH)
+
+
+async def test_a_model_tool_call_outside_the_allowlist_is_dropped_and_recorded() -> None:
+    """The node keeps the legitimate output and records the refusal, rather than
+    executing the call or failing the run."""
+
+    class Rogue(StubRouter):
+        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+            self.calls.append(task)
+            return Completion(
+                text=None,
+                tool_calls=[
+                    ToolCall(name="publish", arguments={}, call_id="c0"),
+                    ToolCall(
+                        name="record_outline",
+                        arguments={"target_keyword": "notdienst", "headings": ["h"]},
+                        call_id="c1",
+                    ),
+                ],
+                usage=_usage(),
+                is_final=False,
+            )
+
+    updates = await build_nodes(_deps(Rogue()))["PLAN"](_state(opportunity={"title": "t"}))
+
+    assert updates["outline"]["target_keyword"] == "notdienst"
+    codes = [e.code for e in updates["errors"]]
+    assert codes == ["tool_not_allowed"]
+    assert "publish" in updates["errors"][0].message
+
+
+async def test_a_refusal_appends_to_the_existing_errors_rather_than_replacing_them() -> None:
+    """The graph MERGES a node's updates into the state, so returning `errors` as a
+    fresh list would silently delete every earlier degradation."""
+    from backend.app.agents.state import NodeError
+
+    class Rogue(StubRouter):
+        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+            self.calls.append(task)
+            return Completion(
+                text=None,
+                tool_calls=[
+                    ToolCall(name="notify", arguments={}, call_id="c0"),
+                    ToolCall(
+                        name="record_outline",
+                        arguments={"target_keyword": "k", "headings": ["h"]},
+                        call_id="c1",
+                    ),
+                ],
+                usage=_usage(),
+                is_final=False,
+            )
+
+    earlier = NodeError(node="HARVEST", code="node_failed", message="serp down")
+    updates = await build_nodes(_deps(Rogue()))["PLAN"](
+        _state(opportunity={"title": "t"}, errors=[earlier])
+    )
+
+    assert [e.code for e in updates["errors"]] == ["node_failed", "tool_not_allowed"]
+
+
+# --------------------------------------------------------------------------- #
+# VALIDATE's second verdict: the regulated-claim gate
+# --------------------------------------------------------------------------- #
+
+BANNED_DNA = {
+    "name": "Zahnarztpraxis Koblenz",
+    "city": "Koblenz",
+    "locale": "de",
+    "services": ["Prophylaxe"],
+    "website": "https://praxis.de",
+    "tone": "professional",
+    "banned_claims": ["schmerzfrei", "beste Zahnarztpraxis"],
+}
+
+
+async def test_validate_blocks_a_draft_that_makes_a_banned_claim_and_calls_no_model() -> None:
+    """The claim list is in the system prompt as well, but a prompt is a request.
+    This is the control: arithmetic over the list, downstream of the model."""
+    router = StubRouter()
+    updates = await build_nodes(_deps(router))["VALIDATE"](
+        _state(
+            dna=BANNED_DNA,
+            outline={"target_keyword": "zahnarzt", "headings": []},
+            draft={
+                "title": "Zahnarzt Koblenz",
+                "meta_description": "d" * 150,
+                "html": "<h1>Praxis</h1><p>Eine schmerzfreie Behandlung.</p>",
+            },
+        )
+    )
+
+    assert updates["claim_check"]["passed"] is False
+    assert updates["claim_check"]["hits"][0]["claim"] == "schmerzfrei"
+    assert router.calls == [], "a compliance gate must not depend on a model call"
+
+
+async def test_validate_checks_the_meta_description_not_only_the_body() -> None:
+    """The meta description lives in an ATTRIBUTE of the assembled document, so a
+    markup-stripping matcher would drop it -- and it is the one line Google shows."""
+    updates = await build_nodes(_deps())["VALIDATE"](
+        _state(
+            dna=BANNED_DNA,
+            outline={"target_keyword": "zahnarzt", "headings": []},
+            draft={
+                "title": "Zahnarzt Koblenz",
+                "meta_description": "Die beste Zahnarztpraxis in Koblenz, jetzt Termin buchen.",
+                "html": "<h1>Praxis</h1><p>Sanfte Behandlung.</p>",
+            },
+        )
+    )
+
+    assert updates["claim_check"]["passed"] is False
+    assert updates["claim_check"]["hits"][0]["claim"] == "beste Zahnarztpraxis"
+
+
+async def test_validate_reports_a_clean_draft_as_checked_rather_than_unexercised() -> None:
+    updates = await build_nodes(_deps())["VALIDATE"](
+        _state(
+            dna=BANNED_DNA,
+            outline={"target_keyword": "zahnarzt", "headings": []},
+            draft={"title": "t", "meta_description": "d" * 150, "html": "<h1>Sanft</h1>"},
+        )
+    )
+
+    assert updates["claim_check"]["passed"] is True
+    assert updates["claim_check"]["exercised"] is True
+
+
+async def test_a_business_with_no_banned_claims_is_reported_as_not_exercised() -> None:
+    """A vacuous pass must not render as a compliance tick on the review screen."""
+    updates = await build_nodes(_deps())["VALIDATE"](
+        _state(
+            outline={"target_keyword": "k", "headings": []},
+            draft={"title": "t", "meta_description": "d" * 150, "html": "<h1>x</h1>"},
+        )
+    )
+
+    assert updates["claim_check"]["passed"] is True
+    assert updates["claim_check"]["exercised"] is False
+
+
+async def test_an_empty_draft_still_produces_a_claim_verdict() -> None:
+    """Otherwise the graph would see `claim_check is None` and read "nothing checked"
+    on a path where nothing was checked for a different reason."""
+    updates = await build_nodes(_deps())["VALIDATE"](
+        _state(dna=BANNED_DNA, outline={"target_keyword": "k", "headings": []}, draft=None)
+    )
+
+    assert updates["seo_report"]["passed"] is False
+    assert updates["claim_check"]["passed"] is True
+    assert updates["claim_check"]["exercised"] is True
+
+
+async def test_generate_receives_the_banned_claim_verbatim_on_a_retry() -> None:
+    """Same reasoning as the SEO fix hints: without the phrase, the retry is a guess.
+    The hint must also forbid paraphrasing, or the model produces copy that passes the
+    matcher while making the same forbidden promise."""
+    captured: list[str] = []
+
+    class Capturing(StubRouter):
+        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+            captured.append("\n".join(str(m.content) for m in messages))
+            return await super().complete(task, messages, **kw)
+
+    router = Capturing(
+        {TaskClass.GENERATE: {"title": "t", "meta_description": "d" * 150, "html": "<h1>x</h1>"}}
+    )
+    await build_nodes(_deps(router))["GENERATE"](
+        _state(
+            dna=BANNED_DNA,
+            outline={"target_keyword": "k", "headings": []},
+            claim_check={
+                "passed": False,
+                "exercised": True,
+                "checked": 2,
+                "hits": [
+                    {
+                        "claim": "schmerzfrei",
+                        "matched": "schmerzfreie",
+                        "start": 0,
+                        "end": 12,
+                        "context": "c",
+                    }
+                ],
+                "detail": "d",
+                "fix_hint": (
+                    'Remove the forbidden claim "schmerzfrei" (it appears as '
+                    '"schmerzfreie"). Do not paraphrase it.'
+                ),
+            },
+            validate_loops=1,
+        )
+    )
+
+    prompt = captured[0]
+    assert "schmerzfreie" in prompt, "the model must be shown the words it wrote"
+    assert "do not paraphrase" in prompt.lower()
+
+
+# --------------------------------------------------------------------------- #
+# REPACK: a social post is separate content, and gets its own check
+# --------------------------------------------------------------------------- #
+
+
+async def test_repack_withholds_a_post_that_makes_a_banned_claim() -> None:
+    """A page can pass VALIDATE and a post derived from it can still carry a forbidden
+    claim. There is no per-channel retry in the graph, so the post is dropped rather
+    than published."""
+    router = StubRouter(
+        {
+            TaskClass.REPACK: {
+                "posts": [
+                    {"channel": "linkedin", "body": "Unsere Praxis behandelt sanft. " * 5},
+                    {"channel": "facebook", "body": "Eine schmerzfreie Behandlung, versprochen."},
+                ]
+            }
+        }
+    )
+    updates = await build_nodes(_deps(router))["REPACK"](
+        _state(
+            dna=BANNED_DNA,
+            draft={"html": "<h1>x</h1>", "title": "t"},
+            outline={"target_keyword": "k", "headings": []},
+        )
+    )
+
+    assert "linkedin" in updates["renderings"]
+    assert "facebook" not in updates["renderings"], "the offending post must not be published"
+    blocked = [e for e in updates["errors"] if e.code == "banned_claim"]
+    assert len(blocked) == 1
+    assert "facebook" in blocked[0].message, "the withheld channel must be named"
+    assert "schmerzfrei" in blocked[0].message

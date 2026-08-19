@@ -172,4 +172,35 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] `analytics` engine — GSC/GA4 cut from Track A: two OAuth flows for a metric that cannot move inside a project timeline
 - [x] Verified the OpenRouter slugs — a real call returned and the catalogue lists 415 models — `5162efa`
 - [x] `geo_results.run_id` column — migration `b5e73c1a8f42`. `save_outcomes(run_id=...)` makes a retry-vs-new-run explicit instead of inferred from a 6-hour window, which got the operator re-probe case wrong (a deliberate second measurement silently folded into the first). Nullable with NO synthetic backfill, and the timestamp fallback stays for pre-migration rows; not an FK to `runs`, because probing is not driven from an agent run and an FK would refuse a standalone probe
-- [ ] Password denylist is 26 entries; a HIBP k-anonymity range check is the real answer
+- [x] Password denylist is 26 entries; a HIBP k-anonymity range check is the real answer — `core/pwned.py`: SHA-1, first FIVE hex characters on the wire, comparison local, so the password and even its full hash never leave the process. Network is OFF unless `PWNED_PASSWORD_CHECK` is set (same posture as every other provider here), fails OPEN on an outage (a third party's downtime must not stop signups; the offline rules stay the floor), 2s timeout because this sits in front of a 64 MiB argon2 hash. Runs AFTER the offline policy so a too-short password is never transmitted. Hermeticity proven by re-running the suite with sockets hard-blocked
+
+## Found while completing the implementation (2026-08-19)
+
+- [x] **CI never ran a single test.** `.github/workflows/ci.yml` set `ENVIRONMENT: ci` with no
+  `SESSION_SECRET`, and `create_app()` refuses to start outside `local` without one — at test
+  COLLECTION time. So the Python job was green because ruff and mypy pass on code nobody executed.
+  Fixed by generating an ephemeral secret per run (`openssl rand -hex 32` into `$GITHUB_ENV`) rather
+  than storing a repository secret: it signs nothing that outlives the job, so there is no production
+  value to leak and a fresh clone needs no manual setup to be honest. Also widened CI's mypy from
+  `backend` to `backend evals` — the eval harness decides whether the product works and was unchecked.
+  Verified by running the full suite under CI's exact environment.
+- [ ] **The test suite is not safe against two concurrent runs on one database.**
+  `test_auth_api`'s teardown does `DELETE FROM users WHERE email LIKE 'authapi-test-%'`, so parallel
+  runs delete each other's rows mid-test. It cost two false failure reports during this session's
+  parallel work. Harmless in CI (each job gets its own Postgres service) and would flake immediately
+  in any parallel CI. Fix: per-run unique prefixes, or a schema/transaction per test.
+- [ ] **`docs/AGENT_RUNTIME.md` documents four tools that are granted but not wired**
+  (`geo.probe`, `nap.audit` on HARVEST; `kb.search` on OPPORTUNITY/PLAN/GENERATE; `web_search` on
+  GENERATE). `NodeToolbox.available()` now distinguishes "not granted" (design) from "not wired"
+  (build state) instead of narrowing the doc to today's code.
+- [ ] **Text extraction is NOT a security boundary, and is now measured rather than assumed.**
+  `display:none`, `visibility:hidden` and HTML comments are dropped by trafilatura, but
+  `font-size:0` and off-screen text survive into `main_text`, and instruction text in `img alt`
+  survives into `facts`. Tests assert both the drops AND the survivals, so this cannot be upgraded
+  into "hidden instructions never reach the model".
+- [ ] **Login CSRF is not closed** (a pre-login request carries no cookie to check). `SameSite=Lax`
+  blocks the cross-site POST; closing it properly needs a pre-session synchronizer token, which the
+  Origin-validation design deliberately avoids.
+- [ ] **A cookie-bearing request from a non-browser client is now refused** (no `Origin`/`Referer`).
+  Intended — the cookie is a browser credential and there is no machine-to-machine mode — but it is a
+  behaviour change for anyone curling with a session cookie.
