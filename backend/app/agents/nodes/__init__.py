@@ -33,10 +33,11 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final, get_args
 
 from backend.app.agents.nodes.prompts import (
     GENERATE_TOOL,
+    LANDING_TOOL,
     OPPORTUNITY_TOOL,
     PLAN_TOOL,
     REPACK_TOOL,
@@ -48,6 +49,7 @@ from backend.app.agents.tools import (
     CLAIMS_CHECK,
     CRAWL_SITE,
     KB_SEARCH,
+    LANDING_CHECK,
     MEMORY_LOAD,
     SEO_SCORE,
     SERP_SEARCH,
@@ -56,6 +58,15 @@ from backend.app.agents.tools import (
     ToolNotAllowedError,
 )
 from backend.app.engines.claims import ClaimCheckRequest, check_claims
+from backend.app.engines.landing import (
+    ChannelCta,
+    FormField,
+    FormFieldName,
+    LandingCheckRequest,
+    LandingPageSpec,
+    ProofPoint,
+    check_landing_page,
+)
 from backend.app.engines.seo import SeoScoreRequest, score_page
 from backend.app.engines.serp import (
     SerpPage,
@@ -63,6 +74,7 @@ from backend.app.engines.serp import (
     expand_keywords,
 )
 from backend.app.llm import Message, Role, TaskClass, ToolCall, ToolSpec
+from backend.app.services.link_service import KNOWN_CHANNELS
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +91,20 @@ CHANNEL_LIMITS: Mapping[str, int] = {
 }
 
 DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
+
+#: The bio-link hub always gets its own CTA, whatever channels a run renders posts
+#: for. docs/CHANNELS.md section 1: an Instagram feed caption and a TikTok caption
+#: cannot carry a clickable link at all, so ``/go/{slug}`` is the ENTIRE conversion
+#: path for those surfaces -- and a hub with no CTA on it is an empty page in
+#: somebody's bio.
+HUB_CHANNEL: str = "link_hub"
+
+#: The form field names a generated form may use, derived from the `landing` engine's
+#: own contract rather than repeated here. A second copy of this list is exactly how a
+#: generated form and the endpoint that receives it would drift apart -- and the
+#: failure mode is silent: the visitor fills the field in and the submission is
+#: refused.
+_LEGAL_FORM_FIELDS: Final[frozenset[str]] = frozenset(get_args(FormFieldName.__value__))
 
 #: How many keyword seeds HARVEST searches. Each is a provider call, so this is the
 #: main lever on harvest cost.
@@ -129,6 +155,9 @@ def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
         # Deterministic and always available: the guard must not be able to be
         # "not configured", or a business could be published unchecked by omission.
         CLAIMS_CHECK: check_claims,
+        # Same reasoning: a landing page whose conversion audit was skipped because
+        # nobody wired it would look like a page that passed.
+        LANDING_CHECK: check_landing_page,
     }
     return {name: impl for name, impl in candidates.items() if impl is not None}
 
@@ -435,6 +464,95 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             raise ValueError("the model did not return a page; expected a record_page tool call")
         return _with_refusals(state, box, {"draft": args, "_cost": cost})
 
+    async def convert(state: AgentState) -> dict[str, Any]:
+        """Write the landing page the content converts on, and the ask per channel.
+
+        This is CONVERSION -- link three of the lead chain in docs/FEATURES.md
+        section 0, and the link competitors skip. A tracked short link pointing at a
+        page that does not exist earns nothing, so this node produces the page the
+        click lands on and the copy that earns the click.
+
+        It sits BETWEEN GENERATE and VALIDATE deliberately. VALIDATE is where the
+        deterministic verdicts are taken, and the regulated-claim gate must see the
+        landing page before REVIEW: a landing page is the most claim-dangerous
+        artifact in the product ("garantierte Heilung" on a page with a form under
+        it), and REVIEW is where a human can approve. A node placed after VALIDATE
+        would produce copy nothing had checked.
+
+        Only the WRITING happens here. Whether the result can convert, and what
+        markup it becomes, are computable and live in ``engines/landing``.
+        """
+        box = _toolbox("CONVERT", deps)
+        outline = state.get("outline") or {}
+        draft = state.get("draft") or {}
+        channels = _cta_channels(deps.channels)
+
+        # Proof points must come from the business's own material, so the node reads
+        # that material rather than trusting the model to remember it. A missing
+        # knowledge base is a normal state: the page is then written from the DNA and
+        # the harvested facts, and the deterministic check will report however many
+        # sourced proof points actually exist.
+        passages = ""
+        if box.available(KB_SEARCH):
+            try:
+                trace = await box.call(KB_SEARCH, _proof_question(state))
+            except ToolNotAllowedError:
+                raise
+            except Exception as exc:  # broad on purpose: proof is an enhancement
+                logger.warning("convert: retrieval failed: %s", exc)
+            else:
+                passages = _passages(trace)
+
+        report = state.get("landing_report") or {}
+        retry = ""
+        if report and not report.get("passed", True):
+            hints = [
+                f"- {f.get('fix_hint')}" for f in report.get("findings", []) if f.get("fix_hint")
+            ]
+            retry = (
+                f"\n\nYOUR PREVIOUS LANDING PAGE SCORED {report.get('score')} / 100 AND MUST "
+                "REACH 85. Fix exactly these, and change nothing else:\n" + "\n".join(hints)
+            )
+        # The claim verdict covers the page AND the landing copy as one check, so a
+        # forbidden phrase written HERE is named here too. Without this, only GENERATE
+        # would hear about it and the retry could never fix the offending artifact.
+        claims = state.get("claim_check") or {}
+        if claims and not claims.get("passed", True) and claims.get("fix_hint"):
+            retry += "\n\n" + str(claims["fix_hint"])
+
+        args, cost = await _ask(
+            deps,
+            box=box,
+            task=TaskClass.REPACK,
+            role=(
+                "You write the landing page this content converts on: one offer, one "
+                "form, one ask. Every proof point comes from the business's own "
+                "documents or profile and names where it came from; if the evidence "
+                "supports none, you return none rather than inventing one."
+            ),
+            state=state,
+            body=(
+                f"Page title: {draft.get('title')}\n"
+                f"Target keyword: {outline.get('target_keyword')}\n"
+                f"Outline CTA: {outline.get('cta')}\n"
+                f"Page: {str(draft.get('html'))[:1500]}\n\n"
+                f"Channels needing a CTA: {', '.join(channels)}\n\n"
+                f"Business evidence:\n{_evidence(state)}\n"
+                f"{passages}{retry}\n\nCall record_landing_page."
+            ),
+            tool=LANDING_TOOL,
+        )
+        if not args:
+            raise ValueError(
+                "the model did not return a landing page; expected a "
+                "record_landing_page tool call. Without one the tracked links have "
+                "nowhere to point, so the run has reach and no conversion path."
+            )
+        spec = _landing_spec(args)
+        return _with_refusals(
+            state, box, {"landing_page": spec.model_dump(mode="json"), "_cost": cost}
+        )
+
     async def validate(state: AgentState) -> dict[str, Any]:
         """Score the draft and check it for forbidden claims. No model, ever.
 
@@ -454,14 +572,34 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         title = str(draft.get("title") or "")
         meta = str(draft.get("meta_description") or "")
 
+        # The landing page is audited and claim-checked here too, not in CONVERT.
+        # CONVERT writes; this node judges. Keeping both verdicts in one place is what
+        # makes "the deterministic half of the pipeline" a place rather than a habit.
+        landing_spec = _stored_landing_spec(state)
+        landing_report: dict[str, Any] | None = None
+        if landing_spec is not None:
+            verdict = await box.call(
+                LANDING_CHECK,
+                LandingCheckRequest(spec=landing_spec, known_channels=sorted(KNOWN_CHANNELS)),
+            )
+            landing_report = verdict.model_dump(mode="json")
+
         # Title and meta are checked alongside the body. They are NOT folded into the
         # assembled HTML document for this: the meta description lives in an
         # attribute, and stripping markup would drop it, so a forbidden claim in the
         # meta description would have gone unnoticed on the one line Google shows.
+        #
+        # The landing page's text joins the same check rather than getting its own
+        # verdict, because "may this run be published" has one answer. A landing page
+        # is the most claim-dangerous artifact here -- it makes a promise directly
+        # above a form -- and the graph refuses to carry a failing verdict to REVIEW,
+        # so a banned claim in the conversion copy cannot be approved either.
         claim_result = await box.call(
             CLAIMS_CHECK,
             ClaimCheckRequest(
-                content="\n".join([title, meta, html]),
+                content="\n".join(
+                    [title, meta, html, landing_spec.claim_text() if landing_spec else ""]
+                ),
                 banned_claims=[str(c) for c in (state["dna"].get("banned_claims") or [])],
                 contains_markup=True,
             ),
@@ -474,6 +612,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 box,
                 {
                     "claim_check": claim_check,
+                    "landing_report": landing_report,
                     "seo_report": {
                         "score": 0,
                         "passed": False,
@@ -501,7 +640,11 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         return _with_refusals(
             state,
             box,
-            {"seo_report": result.model_dump(mode="json"), "claim_check": claim_check},
+            {
+                "seo_report": result.model_dump(mode="json"),
+                "claim_check": claim_check,
+                "landing_report": landing_report,
+            },
         )
 
     async def repack(state: AgentState) -> dict[str, Any]:
@@ -581,10 +724,127 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         "OPPORTUNITY": opportunity,
         "PLAN": plan,
         "GENERATE": generate,
+        "CONVERT": convert,
         "VALIDATE": validate,
         "REPACK": repack,
         "REVIEW": review,
     }
+
+
+def _cta_channels(channels: tuple[str, ...]) -> tuple[str, ...]:
+    """The channels CONVERT writes an ask for: the run's own, plus the bio-link hub.
+
+    Order-preserving de-duplication, so a run already rendering for ``link_hub`` does
+    not get two CTAs for it -- which the deterministic check would (correctly) refuse
+    as splitting one channel's clicks across two links.
+    """
+    return tuple(dict.fromkeys([*channels, HUB_CHANNEL]))
+
+
+def _proof_question(state: AgentState) -> str:
+    """What to ask the knowledge base for, when looking for proof rather than prose.
+
+    Deliberately not the run's goal: the goal is "more local leads", and retrieving
+    against it returns whatever is most on-topic. Proof points need evidence about the
+    business's track record on the thing being offered, so the question is built from
+    the offer's own subject.
+    """
+    outline = state.get("outline") or {}
+    keyword = str(outline.get("target_keyword") or "").strip()
+    name = str(state["dna"].get("name") or "").strip()
+    subject = keyword or str((state.get("draft") or {}).get("title") or "").strip()
+    return f"Belege, Referenzen und Zahlen zu {subject} bei {name}".strip()
+
+
+def _passages(trace: Any) -> str:
+    """Retrieved passages, fenced as untrusted, each labelled so it can be cited.
+
+    The label is the document id and the passage ordinal, which is what the retrieval
+    trace actually knows. The model is asked for a human-readable source, so the label
+    is a fallback rather than the expected output -- and the engine can only enforce
+    that a source is NAMED, never that it is true. That limit is stated in the
+    landing contract and is not papered over here.
+    """
+    chunks = list(getattr(trace, "chunks", []) or [])
+    if not chunks:
+        return ""
+    lines = [
+        f"[{getattr(chunk, 'document_id', '?')}#{getattr(chunk, 'ordinal', 0)}] "
+        f"{str(getattr(chunk, 'content', ''))[:600]}"
+        for chunk in chunks[:6]
+    ]
+    return "\nOwn documents (cite these as sources):\n" + fence("\n\n".join(lines))
+
+
+def _landing_spec(args: Mapping[str, Any]) -> LandingPageSpec:
+    """Build a spec from a model's tool arguments, dropping only what is unusable.
+
+    Lenient on purpose, and the leniency is bounded. A form field named something the
+    lead endpoint does not accept, or a CTA with no text, is DROPPED -- the same
+    treatment REPACK gives a malformed post. Rejecting the whole call instead would
+    lose a good page over one bad field, and silently keeping the bad field would
+    produce a form the visitor fills in and the server refuses.
+
+    What is dropped is not swallowed: the deterministic check then reports the
+    consequence ("there is no form", "the form asks for no email address") with a fix
+    hint, so the retry is a correction rather than a guess.
+    """
+    proof = [
+        ProofPoint(text=str(item.get("text", "")), source=str(item.get("source", "")))
+        for item in args.get("proof_points") or []
+        if isinstance(item, Mapping)
+    ]
+    fields: list[FormField] = []
+    for item in args.get("form_fields") or []:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(item.get("name", "")).strip().lower()
+        if name not in _LEGAL_FORM_FIELDS:
+            logger.warning("convert: dropped form field %r, which the lead form refuses", name)
+            continue
+        fields.append(
+            FormField(
+                name=name,  # type: ignore[arg-type]  # narrowed by the membership test above
+                label=str(item.get("label", "")) or name,
+                required=bool(item.get("required", False)),
+            )
+        )
+    ctas = [
+        ChannelCta(
+            channel=str(item.get("channel", "")).strip().lower(),
+            text=str(item.get("text", "")).strip(),
+        )
+        for item in args.get("ctas") or []
+        if isinstance(item, Mapping) and str(item.get("text", "")).strip()
+    ]
+    return LandingPageSpec(
+        headline=str(args.get("headline", "")),
+        subhead=str(args.get("subhead", "")),
+        offer=str(args.get("offer", "")),
+        proof_points=proof,
+        form_fields=fields,
+        primary_cta=str(args.get("primary_cta", "")),
+        consent_text=str(args.get("consent_text", "")),
+        ctas=ctas,
+    )
+
+
+def _stored_landing_spec(state: AgentState) -> LandingPageSpec | None:
+    """The landing page CONVERT stored, or None.
+
+    Read defensively: the state may have come back from a JSONB checkpoint written by
+    an earlier version of this code, and a run whose review screen cannot load is a
+    run nobody can finish. A malformed spec degrades to "there was nothing to audit",
+    which the graph treats as an absent verdict rather than as a pass.
+    """
+    stored = state.get("landing_page")
+    if not isinstance(stored, Mapping):
+        return None
+    try:
+        return LandingPageSpec.model_validate(dict(stored))
+    except Exception as exc:  # broad: any malformed checkpoint, not one shape of it
+        logger.warning("validate: stored landing page could not be read: %s", exc)
+        return None
 
 
 def _seed_queries(dna: Mapping[str, Any]) -> list[str]:

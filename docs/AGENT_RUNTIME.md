@@ -62,12 +62,14 @@ class AgentState(TypedDict):
     opportunity: Opportunity | None
     outline: Outline | None
     draft: Draft | None
+    landing_page: LandingPageSpec | None   # the page a tracked link lands on
     spine: MessageSpine | None
     renderings: dict[Channel, str]
 
     # deterministic verdicts
     seo_report: SeoScoreResult | None
     claim_check: ClaimCheckResult | None
+    landing_report: LandingCheckResult | None
 
     # control
     step_count: int                    # hard cap 14
@@ -84,7 +86,7 @@ makes a partial result a first-class outcome rather than a crash.
 
 ---
 
-## 3. The ten nodes
+## 3. The eleven nodes
 
 | Node | Kind | Model tier | Reads | Emits | Tools allowed | Fails how |
 |---|---|---|---|---|---|---|
@@ -93,7 +95,8 @@ makes a partial result a first-class outcome rather than a crash.
 | `OPPORTUNITY` | agent | mid | `facts` | ranked `Opportunity[]`, one chosen | `kb.search` `record_opportunities` | none found → return the audit instead |
 | `PLAN` | agent | mid | opportunity, `facts`, `dna` | `Outline` — H-tree, keywords, answer blocks, CTA | `kb.search` `record_outline` | no target keyword → reject, retry once |
 | `GENERATE` | agent | **strong** | outline, `kb`, `exemplars`, `remembered` | `Draft` with citations | `kb.search` `web_search` `record_page` | section retry ×2 → shorter piece |
-| `VALIDATE` | **engines only** | — | draft | `seo_report`, `claim_check` | `seo.score` `claims.check` `kb.verify` | < 85 → back to GENERATE with `fix_hint`s |
+| `CONVERT` | agent | cheap | outline, draft, `kb`, `dna` | `LandingPageSpec` — offer, sourced proof, form, primary CTA, one CTA per channel | `kb.search` `record_landing_page` | no landing page → the run keeps its article and records the loss |
+| `VALIDATE` | **engines only** | — | draft, landing page | `seo_report`, `claim_check`, `landing_report` | `seo.score` `claims.check` `landing.check` `kb.verify` | < 85 → back to the node that produced the failing artifact, with `fix_hint`s |
 | `REPACK` | agent | cheap | `spine`, `channel_specs` | `renderings` per channel | `channel.validate` `claims.check` `record_posts` | over-length → trim + regenerate one channel |
 | `REVIEW` | **interrupt** | — | everything | `approval` | none | reject reason feeds the feedback loop |
 | `EXPORT` | **actuator** | — | approval token | published refs | `publish` `notify` | idempotent; refuses without a token |
@@ -117,6 +120,13 @@ the shipped node reads business memory (section 6 says it does, so section 3 was
 error); `seo.nap` named the `nap` engine as if it lived inside `seo`; and `REPACK`'s
 `social.validate` names a module that does not exist — the shipped engine is
 `channel`. `claims.check` is new: see section 7.
+
+`CONVERT` is the CONVERSION link of the lead chain (docs/FEATURES.md section 0), and
+it sits between `GENERATE` and `VALIDATE` rather than after them for one reason: a
+landing page makes a promise directly above a form, so it is the most
+claim-dangerous artifact the product produces, and `VALIDATE` is where the
+regulated-claim gate runs. A node placed after `VALIDATE` would emit copy that
+nothing had checked, on the one surface where an unchecked promise is worst.
 
 **Two nodes contain no LLM at all** — `HARVEST` and `VALIDATE` — and they are the
 two that decide whether the output is factually grounded and technically correct.
@@ -239,12 +249,20 @@ not a feature, it is drift.
 ## 7. The validation loop — the agent argues with a deterministic critic
 
 ```
-GENERATE ──► VALIDATE (pure Python, no LLM)
+GENERATE ──► CONVERT ──► VALIDATE (pure Python, no LLM)
                  │
                  ├─ score >= 85 and no error findings ──► REPACK
                  │
-                 └─ otherwise: fix_hints ──► GENERATE  (max 2 loops)
+                 └─ otherwise: fix_hints ──► GENERATE, or ──► CONVERT  (max 2 loops)
 ```
+
+The retry goes back to the **earliest node whose own output failed**, not always to
+the start. A failing SEO score or claim check means the draft has to change, so the
+edge is to `GENERATE`; a failing landing-page audit on its own means the article is
+fine and only the conversion surface is wrong, so the edge is to `CONVERT`.
+`GENERATE` is the strong tier and 86% of a run's cost, so rewriting a page that
+already passed in order to fix a headline on the landing page would be paying the
+most expensive node in the graph for nothing.
 
 `VALIDATE` returns itemised findings, and the `fix_hint` fields are fed back
 **verbatim**:
@@ -270,7 +288,10 @@ and by how much. After two loops the draft is returned with an explicit
 score is a quality measure with a threshold, so a weak page is publishable after a
 retry. `claim_check` — from the deterministic `claims` engine, over the business's
 own `dna.banned_claims` — is a compliance gate, and a draft carrying a forbidden
-claim is not publishable at any score.
+claim is not publishable at any score. It covers the article **and** the landing
+page as one verdict, because "may this run be published" has one answer; the
+landing page's own conversion audit (`landing_report`, from the `landing` engine)
+is a quality verdict and is gated like the SEO score.
 
 ```
 VALIDATE
@@ -359,7 +380,8 @@ Benchmark business: a plumbing firm in Koblenz. Goal: more local leads.
 | `OPPORTUNITY` | that dataset | 12 ranked; chosen: "Notdienst Klempner Koblenz" — 9 winnable keywords, competitors cited in AI answers, no page exists | $0.004 |
 | `PLAN` | opportunity + facts | H-tree, target + 6 secondaries, 3 answer blocks, CTA = call | $0.006 |
 | `GENERATE` | outline + 4 kb chunks + 2 exemplars + 4 remembered preferences | 1,400-word page, 6 citations | $0.09 |
-| `VALIDATE` | draft | score 79 — meta short, density low, no internal link | $0.00 |
+| `CONVERT` | outline + draft + 4 kb chunks | landing page: Notdienst-Checkliste, 2 sourced proof points, name+email form, 4 CTAs | $0.003 |
+| `VALIDATE` | draft, landing page | score 79 — meta short, density low, no internal link; landing 100 | $0.00 |
 | `GENERATE` | draft + 3 `fix_hint`s | revised | $0.03 |
 | `VALIDATE` | revised | **score 91, passed** | $0.00 |
 | `REPACK` | spine + channel_specs | LinkedIn, Facebook, Instagram caption + carousel, TikTok script | $0.008 |
@@ -367,6 +389,6 @@ Benchmark business: a plumbing firm in Koblenz. Goal: more local leads.
 | `EXPORT` | approval token | WordPress draft + 5 exports, all UTM'd | $0.00 |
 | `MEASURE` | published refs | SoV re-probe in 7 days; leads attributed on arrival | $0.002 |
 
-**Total ≈ $0.14**, against a $0.50 cap and a target of under $0.15 per piece.
+**Total ≈ $0.15**, against a $0.50 cap and a target of under $0.15 per piece.
 Note where the money goes: `GENERATE` is 86% of it, which is exactly why only
 that node uses the strong tier.

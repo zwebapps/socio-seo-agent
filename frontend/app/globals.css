@@ -219,3 +219,89 @@ body {
 .tabular {
   font-variant-numeric: tabular-nums;
 }
+
+/* --- the range control ---------------------------------------------------- */
+
+/*
+   A slider is the one soft-UI control where the shadow trick genuinely conflicts with
+   1.4.11, because it has TWO boundaries to make perceivable: the track and the thumb.
+   Both therefore carry a hairline in --edge as well as their shadow, exactly like every
+   other interactive control here — and the thumb also has to be distinguishable from the
+   track it sits in, which is what --edge-strong is for.
+
+   This styles a real <input type="range">. Vendor pseudo-elements cannot be combined in
+   one selector list: if any selector in a group is unknown to a browser, that browser
+   drops the WHOLE rule, so the WebKit and Firefox thumbs are written out separately even
+   though the declarations are identical.
+*/
+
+.soft-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 22px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.soft-range:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.soft-range::-webkit-slider-runnable-track {
+  height: 10px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunken);
+  border: 1px solid var(--edge);
+  box-shadow:
+    inset 2px 2px 5px var(--shadow-dark),
+    inset -2px -2px 5px var(--shadow-light);
+}
+
+.soft-range::-moz-range-track {
+  height: 10px;
+  border-radius: var(--r-pill);
+  background: var(--surface-sunken);
+  border: 1px solid var(--edge);
+  box-shadow:
+    inset 2px 2px 5px var(--shadow-dark),
+    inset -2px -2px 5px var(--shadow-light);
+}
+
+.soft-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 22px;
+  width: 22px;
+  /* The track is 10px tall and the thumb 22px, so it needs lifting by half the
+     difference plus the track's own border to sit centred. */
+  margin-top: -7px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: 1px solid var(--edge-strong);
+  box-shadow:
+    -2px -2px 5px var(--shadow-light),
+    3px 3px 7px var(--shadow-dark);
+}
+
+.soft-range::-moz-range-thumb {
+  height: 22px;
+  width: 22px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: 1px solid var(--edge-strong);
+  box-shadow:
+    -2px -2px 5px var(--shadow-light),
+    3px 3px 7px var(--shadow-dark);
+}
+
+/* The focus ring is drawn by the global :focus-visible rule, but a range keeps focus
+   while it is being dragged with the mouse in some browsers and :focus-visible does not
+   always apply — so the ring is also attached to plain :focus here. A slider whose
+   focus is invisible is unusable from the keyboard. */
+.soft-range:focus {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+  border-radius: var(--r-pill);
+}

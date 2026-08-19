@@ -159,9 +159,11 @@ stateDiagram-v2
     PLAN --> GENERATE: outline has a target keyword
     PLAN --> PLAN: outline rejected, retry once
 
-    GENERATE --> VALIDATE
+    GENERATE --> CONVERT: the article is written
+    CONVERT --> VALIDATE: landing page + one CTA per channel
 
-    VALIDATE --> GENERATE: score below 85, fix_hints fed back, max 2 loops
+    VALIDATE --> GENERATE: draft failed — score below 85 or a banned claim, max 2 loops
+    VALIDATE --> CONVERT: only the landing page failed — the article is fine
     VALIDATE --> REPACK: passed
 
     REPACK --> REVIEW
@@ -175,6 +177,8 @@ stateDiagram-v2
 
     GENERATE --> PARTIAL: step or cost cap hit
     VALIDATE --> PARTIAL: still failing after 2 loops
+    VALIDATE --> BLOCKED: a banned claim survived 2 loops
+    BLOCKED --> [*]: publication_blocked — REVIEW is never reached, so it cannot be approved
     PARTIAL --> [*]: returned with a stated reason, never an infinite loop
 ```
 

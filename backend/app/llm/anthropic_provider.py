@@ -57,6 +57,9 @@ from backend.app.llm.contract import (
     Usage,
 )
 from backend.app.llm.pricing import compute_usd, conservative_token_estimate
+from backend.app.llm.sampling import (
+    MODELS_REJECTING_SAMPLING as _MODELS_REJECTING_SAMPLING,
+)
 
 #: Bounded wait, matching the OpenRouter adapter (docs/ARCHITECTURE.md section 9).
 DEFAULT_TIMEOUT_S: Final = 60.0
@@ -69,16 +72,14 @@ DEFAULT_MAX_TOKENS: Final = 2048
 #: to steer them. `complete()` refuses such a request locally rather than
 #: shipping a 400 -- and rather than silently dropping the parameter, which
 #: would change a GENERATE call's character with nobody told.
-MODELS_REJECTING_SAMPLING: Final[frozenset[str]] = frozenset(
-    {
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-sonnet-5",
-        "claude-fable-5",
-        "claude-mythos-5",
-    }
-)
+#:
+#: The set MOVED to `llm/sampling.py` and is re-exported here so this module's
+#: readers and importers still find it under this name. It moved because the admin
+#: sampling screen needs the same fact in order to warn an operator BEFORE they save
+#: a temperature onto a route that cannot accept one -- and reading that fact must not
+#: cost an `import anthropic`, which is the whole reason every SDK import in this
+#: package is either lazy or confined to an adapter.
+MODELS_REJECTING_SAMPLING: Final[frozenset[str]] = _MODELS_REJECTING_SAMPLING
 
 
 def _to_tool_param(tool: ToolSpec) -> ToolUnionParam:

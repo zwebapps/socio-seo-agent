@@ -272,3 +272,93 @@ export function SoftTile({
     </div>
   );
 }
+
+/**
+ * A slider. A REAL `<input type="range">`, not a draggable div.
+ *
+ * That distinction is the whole reason this component exists rather than a styled
+ * `<div onPointerDown>`: the native element already is a `role="slider"` with
+ * `aria-valuemin`, `aria-valuemax` and `aria-valuenow` maintained by the browser,
+ * arrow-key and Home/End handling, Page Up/Down stepping, and touch behaviour that
+ * matches the platform. Every one of those has to be hand-written and hand-tested on a
+ * div, and the usual result is a control a keyboard user cannot move at all.
+ *
+ * What is added on top:
+ *
+ * - `aria-valuetext`, because the raw number is often not the information. "4096" is
+ *   meaningless next to "4096 tokens — about a 10,000-character article", and a screen
+ *   reader announces `aria-valuetext` in preference to the bare value.
+ * - `aria-describedby` wiring to a consequence line, so what the number COSTS is part of
+ *   the control's accessible description rather than nearby text a screen-reader user
+ *   reaches separately, or never.
+ * - the hairline border on both track and thumb (see `.soft-range` in globals.css): a
+ *   neumorphic slider has two boundaries to make perceivable, and shadow carries neither.
+ */
+export function SoftRange({
+  value,
+  onChange,
+  min,
+  max,
+  step,
+  label,
+  valueText,
+  describedBy,
+  disabled = false,
+  className = "",
+}: {
+  value: number;
+  onChange: (next: number) => void;
+  min: number;
+  max: number;
+  step: number;
+  /** Visible label text. Rendered, and also the control's accessible name. */
+  label: string;
+  /** Human-readable form of the current value, announced instead of the bare number. */
+  valueText: string;
+  /** Id of the element stating the consequence of this value. */
+  describedBy?: string;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const id = `range-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
+
+  return (
+    <div className={className}>
+      <div className="mb-1.5 flex items-baseline justify-between gap-3">
+        <label
+          htmlFor={id}
+          className="text-[11px] font-semibold uppercase tracking-wider"
+          style={{ color: "var(--text-muted)" }}
+        >
+          {label}
+        </label>
+        {/* aria-hidden: the value is already announced via aria-valuetext, and a screen
+            reader reading it twice makes the control harder to use, not easier. */}
+        <span aria-hidden className="tabular text-sm font-semibold" style={{ color: "var(--text)" }}>
+          {valueText}
+        </span>
+      </div>
+      <input
+        id={id}
+        type="range"
+        className="soft-range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={disabled}
+        aria-valuetext={valueText}
+        aria-describedby={describedBy}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      <div
+        aria-hidden
+        className="tabular mt-1 flex justify-between text-[10px]"
+        style={{ color: "var(--text-faint)" }}
+      >
+        <span>{min}</span>
+        <span>{max}</span>
+      </div>
+    </div>
+  );
+}

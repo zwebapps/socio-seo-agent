@@ -50,6 +50,7 @@ __all__ = [
     "is_bot",
     "new_code",
     "require_http_url",
+    "with_ref",
 ]
 
 #: Base 56: digits and letters, minus the pairs a human misreads (``0``/``O``,
@@ -203,6 +204,28 @@ def apply_utm(url: str, utm: Mapping[str, str]) -> str:
             written.add(key)
 
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(merged), parts.fragment))
+
+
+def with_ref(url: str, code: str) -> str:
+    """Add ``?ref=<code>`` to ``url``, so a landing page knows which link brought the
+    visitor.
+
+    The code cannot be baked into the target when the link is CREATED, because the
+    insert is what mints it (the unique index on ``short_links.code`` is the only real
+    uniqueness guarantee). So the target is completed in a second write, and this is
+    the pure part of that.
+
+    Merged through :func:`apply_utm` rather than by string concatenation: the target
+    already carries UTM parameters at this point, and appending a second query string
+    to a URL that has one produces something no analytics tool reads the same way
+    twice. ``ref`` is not a UTM parameter, but "merge these keys into this query
+    string, replacing rather than appending" is exactly the operation, and a second
+    implementation of it would be a second set of edge cases.
+    """
+    cleaned = code.strip()
+    if not cleaned:
+        raise ValueError("code must not be empty: an empty ref attributes a lead to nothing")
+    return apply_utm(url, {"ref": cleaned})
 
 
 def require_http_url(url: str) -> str:

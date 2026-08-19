@@ -268,6 +268,10 @@ _INSERT_LINK = text(
 )
 
 _LINK_VISIBLE = text("SELECT 1 FROM short_links WHERE id = :link_id")
+
+_RETARGET_LINK = text(
+    "UPDATE short_links SET target_url = :target_url, updated_at = now() WHERE id = :link_id"
+)
 _PIECE_VISIBLE = text("SELECT 1 FROM content_pieces WHERE id = :piece_id")
 
 _INSERT_CLICK = text(
@@ -421,6 +425,32 @@ class PostgresLeadStore:
                 click_count=0,
             )
         raise CodeExhaustionError(MAX_CODE_ATTEMPTS)
+
+    async def retarget_link(self, business_id: UUID, link_id: UUID, *, target_url: str) -> None:
+        """Point an existing link somewhere else, under this business's own scope.
+
+        It exists for exactly one case, and it is not "the owner changed their mind":
+        a landing page needs to know WHICH link brought the visitor, and the code is
+        minted by the insert -- the unique index on ``short_links.code`` is the only
+        real uniqueness guarantee, so it cannot be known before the row exists. The
+        publish path therefore creates the link and then completes its target with
+        ``?ref=<code>`` (see ``link_service.with_ref``).
+
+        The target is re-validated here rather than trusted from the caller. It
+        becomes the ``Location`` header of a public, unauthenticated 302, so
+        ``javascript:`` in it would be stored XSS served from our own domain -- and a
+        guard that only runs on the CREATE path is a guard with a second door next to
+        it.
+
+        Visibility is checked first, under this business's own RLS scope: an
+        RLS-blocked update is zero rows rather than an error, so a mismatched business
+        id would otherwise repoint nothing and report success.
+        """
+        clean_target = require_http_url(target_url)
+        async with business_session(business_id) as db:
+            if (await db.execute(_LINK_VISIBLE, {"link_id": link_id})).first() is None:
+                raise UnknownShortLinkError(link_id, business_id)
+            await db.execute(_RETARGET_LINK, {"link_id": link_id, "target_url": clean_target})
 
     async def resolve(self, code: str) -> ShortLinkRecord | None:
         """Find a link by its code, with no tenant context. See the module docstring.

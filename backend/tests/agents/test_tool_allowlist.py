@@ -104,8 +104,18 @@ def test_an_unknown_node_is_granted_nothing_rather_than_everything() -> None:
 def test_no_node_holds_another_nodes_output_tool() -> None:
     """The structured-output tools are in the same allowlist as the engine tools on
     purpose: a model asked to `record_page` inside PLAN is as wrong as one asked to
-    `publish`, and only one node writes each artefact."""
-    outputs = {"record_opportunities", "record_outline", "record_page", "record_posts"}
+    `publish`, and only one node writes each artefact.
+
+    The set is derived from `KNOWN_TOOLS` rather than listed, so a new output tool is
+    covered by this rule the moment it exists. It was a hand-written list of four, and
+    `record_landing_page` was added without it noticing -- which is exactly the drift
+    the file's own docstring is about.
+    """
+    outputs = {tool for tool in KNOWN_TOOLS if tool.startswith("record_")}
+    assert len(outputs) >= 5, (
+        "the derivation found fewer output tools than exist; if the naming convention "
+        f"changed, fix this derivation rather than deleting the rule (found {outputs})"
+    )
     holders: dict[str, list[str]] = {tool: [] for tool in outputs}
     for node, tools in NODE_TOOLS.items():
         for tool in tools & outputs:
@@ -303,3 +313,23 @@ def test_a_toolbox_is_per_node_so_refusals_do_not_leak_between_nodes() -> None:
     harvest.accept(PUBLISH)
 
     assert generate.refusals == (), "one node's refusal must not appear in another's errors"
+
+
+def test_the_conversion_node_cannot_reach_the_open_web() -> None:
+    """CONVERT writes the page a public URL will serve, and its proof points are claims
+    about the BUSINESS. `web_search` would let it source one from a page the business
+    does not control, which is not proof of anything about the business -- and it is a
+    second untrusted-text intake on the node whose output carries a form."""
+    tools = NODE_TOOLS["CONVERT"]
+
+    assert "web_search" not in tools
+    assert tools & ACTUATOR_TOOLS == frozenset()
+    assert "kb.search" in tools, "proof has to come from the business's own material"
+
+
+def test_the_landing_audit_belongs_to_the_node_with_no_model_in_it() -> None:
+    """ "Is there a form, and can it be answered" is set membership. Granting
+    `landing.check` to CONVERT instead would let the node that WROTE the page be the one
+    that grades it."""
+    assert "landing.check" in NODE_TOOLS["VALIDATE"]
+    assert "landing.check" not in NODE_TOOLS["CONVERT"]

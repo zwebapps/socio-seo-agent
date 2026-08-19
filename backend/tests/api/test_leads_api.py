@@ -650,3 +650,246 @@ def test_the_public_router_and_the_authed_router_are_separate() -> None:
 
 def _paths(routes: Iterable[Any]) -> list[Any]:
     return [route for route in routes if hasattr(route, "path")]
+
+
+# --------------------------------------------------------------------------- #
+# The no-JavaScript path: a plain HTML form post
+#
+# The generated landing page carries no script (see api/pages.py), so a real
+# visitor's lead arrives as `application/x-www-form-urlencoded`. A JSON-only
+# endpoint would refuse every one of them AFTER the visitor had typed it in, which
+# is the most expensive way to lose a lead. Every protection above still applies:
+# the same schema, the same honeypot, the same size cap, the same rate limit.
+# --------------------------------------------------------------------------- #
+
+
+FORM_BODY: dict[str, str] = {
+    "name": "Petra Klein",
+    "email": "petra@example.test",
+    # What a checked checkbox actually sends. An unchecked one sends nothing at all.
+    "consent": "on",
+    "utm_source": "instagram",
+    "utm_campaign": "notdienst",
+    "homepage2": "",
+}
+
+
+async def test_a_plain_html_form_post_becomes_a_lead() -> None:
+    """The path a visitor with JavaScript off actually takes."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}", data=FORM_BODY, follow_redirects=False
+        )
+
+    assert response.status_code == 303, "a form post is answered with a redirect, not JSON"
+    assert len(store.created) == 1, "a form post must produce a lead, not a 422"
+    created = store.created[0]
+    assert created["fields"]["email"] == "petra@example.test"
+    assert created["fields"]["consent"] is True
+    assert created["content_piece_id"] == FORM_ID
+
+
+async def test_the_flat_utm_inputs_are_folded_back_into_the_utm_map() -> None:
+    """A form cannot send a nested object, so the page renders `utm_source` and
+    `utm_campaign` as hidden inputs. Without folding them the campaign that produced
+    the lead would be lost -- which is link four of the chain."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        await client.post(f"/public/forms/{FORM_ID}", data=FORM_BODY)
+
+    assert store.created[0]["utm"] == {
+        "utm_source": "instagram",
+        "utm_campaign": "notdienst",
+    }
+
+
+async def test_a_form_post_is_answered_with_a_redirect_back_to_the_page() -> None:
+    """A JSON body is not an answer a person in a browser can act on. 303 rather than
+    302 because the request was a POST and the next thing to fetch is a GET."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}", data=FORM_BODY, follow_redirects=False
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/p/{FORM_ID}?sent=1"
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_the_redirect_target_is_built_from_the_form_and_never_from_the_request() -> None:
+    """A redirect target taken from a parameter is an open redirect, and this endpoint
+    is public."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}",
+            data={**FORM_BODY, "utm_next": "https://evil.example"},
+            follow_redirects=False,
+        )
+
+    assert response.headers["location"] == f"/p/{FORM_ID}?sent=1"
+    assert "evil.example" not in response.headers["location"]
+
+
+async def test_a_form_post_with_no_consent_is_sent_back_with_an_error_flag() -> None:
+    """An unchecked checkbox sends nothing at all, so this is the ordinary mistake --
+    and the visitor has to be told, on the page, in their own language."""
+    store = FakeStore(form=a_form())
+    body = {key: value for key, value in FORM_BODY.items() if key != "consent"}
+
+    async with _client(store) as client:
+        response = await client.post(f"/public/forms/{FORM_ID}", data=body, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/p/{FORM_ID}?error=1"
+    assert store.created == [], "nothing may be stored without evidence of consent"
+
+
+async def test_a_form_post_with_no_way_to_reply_is_sent_back_with_an_error_flag() -> None:
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}",
+            data={"name": "Petra", "consent": "on"},
+            follow_redirects=False,
+        )
+
+    assert response.headers["location"] == f"/p/{FORM_ID}?error=1"
+    assert store.created == []
+
+
+async def test_a_form_post_error_reflects_nothing_that_was_submitted() -> None:
+    """One bit -- `error=1` -- and the page's own copy says what is required."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}",
+            data={"email": "petra@example.test", "name": "Petra Klein"},
+            follow_redirects=False,
+        )
+
+    assert "petra@example.test" not in response.text
+    assert "petra@example.test" not in response.headers["location"]
+    assert "Petra" not in response.text
+
+
+async def test_a_filled_honeypot_on_a_form_post_is_answered_exactly_like_a_success() -> None:
+    """Byte-identical to the success answer, including the redirect target: a bot must
+    not be able to tell that the field it filled in is the one that gave it away."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        success = await client.post(
+            f"/public/forms/{FORM_ID}", data=FORM_BODY, follow_redirects=False
+        )
+        trapped = await client.post(
+            f"/public/forms/{FORM_ID}",
+            data={**FORM_BODY, "homepage2": "https://spam.example"},
+            follow_redirects=False,
+        )
+
+    assert trapped.status_code == success.status_code == 303
+    assert trapped.headers["location"] == success.headers["location"]
+    assert len(store.created) == 1, "the honeypot submission must not be stored"
+
+
+async def test_an_unexpected_field_on_a_form_post_is_still_refused() -> None:
+    """`extra="forbid"` is one schema, shared by both encodings: `leads.fields` is
+    JSONB, and an open schema on a public endpoint is a free key-value store with our
+    name on the bill."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}",
+            data={**FORM_BODY, "budget": "10000"},
+            follow_redirects=False,
+        )
+
+    assert response.headers["location"] == f"/p/{FORM_ID}?error=1"
+    assert store.created == []
+
+
+async def test_a_form_post_to_a_draft_page_is_still_a_404() -> None:
+    """The page route refuses to serve a draft, and this refuses to take its leads --
+    and neither admits which of the two reasons applies."""
+    store = FakeStore(form=a_form(status="draft"))
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}", data=FORM_BODY, follow_redirects=False
+        )
+
+    assert response.status_code == 404
+    assert store.created == []
+
+
+async def test_a_form_post_over_the_size_cap_is_still_refused() -> None:
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}",
+            data={**FORM_BODY, "message": "x" * (leads_api.MAX_FORM_BODY_BYTES + 1)},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 413
+    assert store.created == []
+
+
+async def test_the_rate_limit_applies_to_form_posts_too() -> None:
+    store = FakeStore(form=a_form())
+    limiter = a_limiter(limit=1)
+
+    async with _client(store, limiter=limiter) as client:
+        first = await client.post(
+            f"/public/forms/{FORM_ID}", data=FORM_BODY, follow_redirects=False
+        )
+        second = await client.post(
+            f"/public/forms/{FORM_ID}", data=FORM_BODY, follow_redirects=False
+        )
+
+    assert first.status_code == 303
+    assert second.status_code == 429
+
+
+async def test_a_charset_parameter_on_the_content_type_still_routes_as_a_form() -> None:
+    """A browser sends `application/x-www-form-urlencoded; charset=UTF-8`, so an exact
+    string comparison would send every real submission down the JSON path and refuse
+    it."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}",
+            content=b"email=petra%40example.test&consent=on",
+            headers={"content-type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert len(store.created) == 1
+
+
+async def test_a_json_caller_still_gets_the_constant_202_and_no_redirect() -> None:
+    """The existing contract is unchanged: adding an encoding must not move the answer
+    the API's own clients already depend on."""
+    store = FakeStore(form=a_form())
+
+    async with _client(store) as client:
+        response = await client.post(
+            f"/public/forms/{FORM_ID}", json=VALID_BODY, follow_redirects=False
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {"status": "received"}
+    assert "location" not in response.headers

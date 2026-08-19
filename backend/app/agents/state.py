@@ -37,6 +37,7 @@ NodeName = Literal[
     "OPPORTUNITY",
     "PLAN",
     "GENERATE",
+    "CONVERT",
     "VALIDATE",
     "REPACK",
     "REVIEW",
@@ -107,6 +108,11 @@ class AgentState(TypedDict):
     opportunity: NotRequired[dict[str, Any] | None]
     outline: NotRequired[dict[str, Any] | None]
     draft: NotRequired[dict[str, Any] | None]
+    #: The landing page CONVERT wrote: headline, offer, sourced proof points, the
+    #: form spec, the primary CTA and one CTA per channel. A `LandingPageSpec`
+    #: dumped to primitives, because this is checkpointed to a JSONB column and a
+    #: state that cannot serialise cannot resume.
+    landing_page: NotRequired[dict[str, Any] | None]
     renderings: dict[str, str]
 
     # Deterministic verdicts.
@@ -116,6 +122,10 @@ class AgentState(TypedDict):
     #: the graph treats an absent verdict as "nothing checked" and a present
     #: failing one as a publication block.
     claim_check: NotRequired[dict[str, Any] | None]
+    #: The deterministic conversion verdict on `landing_page`, written by VALIDATE.
+    #: `None` means there was nothing to audit, which is NOT the same as a pass --
+    #: the graph gates on a present, failing verdict and leaves an absent one alone.
+    landing_report: NotRequired[dict[str, Any] | None]
     #: True when the run ended because content could not be made publishable, as
     #: opposed to ending because the budget or the step count ran out. Kept
     #: separate from `outcome` on purpose: "partial" is the persisted run state
@@ -155,9 +165,11 @@ def new_state(
         opportunity=None,
         outline=None,
         draft=None,
+        landing_page=None,
         renderings={},
         seo_report=None,
         claim_check=None,
+        landing_report=None,
         publication_blocked=False,
         caps=caps or RunCaps(),
         step_count=0,

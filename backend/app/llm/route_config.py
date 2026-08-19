@@ -17,6 +17,13 @@ configuration change made weeks earlier by someone else.
 **No API key is ever stored here.** ``base_url`` exists for Ollama, whose availability
 is a reachability question rather than a credential one. A key in a database row is a
 key in every backup, replica and screenshot of that table.
+
+The resolver also carries the per-task SAMPLING policy (temperature, output ceiling)
+under exactly the same rule: nothing configured means nothing sent, which is what every
+call site does today, so an empty table changes no behaviour. See
+:meth:`RouteResolver.temperature_for` for the one place that rule is not enough --
+several Anthropic models reject ``temperature`` outright, and a stored default must
+yield to that rather than take the task offline.
 """
 
 import logging
@@ -27,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.llm.contract import ModelTier, TaskClass
 from backend.app.llm.router import TASK_TIERS, TIER_CHAINS, RouteEntry
+from backend.app.llm.sampling import SamplingRecord, rejects_sampling
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +78,7 @@ class RouteSummary(BaseModel):
 
 
 class RouteStore(Protocol):
-    """Where configuration is read from. Two methods, no writes.
+    """Where configuration is read from. Reads only, no writes.
 
     Reads and writes are separated on purpose: the resolver sits on the hot path of
     every model call and has no business being able to mutate configuration.
@@ -80,6 +88,8 @@ class RouteStore(Protocol):
 
     async def load_providers(self) -> Sequence[ProviderSettingRecord]: ...
 
+    async def load_sampling(self) -> Sequence[SamplingRecord]: ...
+
 
 class InMemoryRouteStore:
     """A store for tests and for a process with no database."""
@@ -88,15 +98,20 @@ class InMemoryRouteStore:
         self,
         routes: Iterable[RouteRecord] | None = None,
         providers: Iterable[ProviderSettingRecord] | None = None,
+        sampling: Iterable[SamplingRecord] | None = None,
     ) -> None:
         self._routes = list(routes or [])
         self._providers = list(providers or [])
+        self._sampling = list(sampling or [])
 
     async def load_routes(self) -> Sequence[RouteRecord]:
         return list(self._routes)
 
     async def load_providers(self) -> Sequence[ProviderSettingRecord]:
         return list(self._providers)
+
+    async def load_sampling(self) -> Sequence[SamplingRecord]:
+        return list(self._sampling)
 
 
 def _valid_entries(chain: Sequence[Mapping[str, str]]) -> tuple[RouteEntry, ...]:
@@ -130,11 +145,13 @@ class RouteResolver:
         self._store = store
         self._routes: dict[TaskClass, RouteRecord] = {}
         self._providers: dict[str, ProviderSettingRecord] = {}
+        self._sampling: dict[TaskClass, SamplingRecord] = {}
 
     async def refresh(self) -> None:
         """Reload configuration. Safe to call at any time."""
         self._routes = {r.task_class: r for r in await self._store.load_routes()}
         self._providers = {p.provider: p for p in await self._store.load_providers()}
+        self._sampling = {s.task_class: s for s in await self._store.load_sampling()}
 
     # -- routing ---------------------------------------------------------- #
 
@@ -158,6 +175,58 @@ class RouteResolver:
 
     def chain_for_tier(self, tier: ModelTier) -> tuple[RouteEntry, ...]:
         return TIER_CHAINS[tier]
+
+    # -- sampling --------------------------------------------------------- #
+
+    def sampling_for(self, task: TaskClass) -> SamplingRecord | None:
+        """The stored sampling policy for `task`, or None if nothing is configured."""
+        return self._sampling.get(task)
+
+    def temperature_for(self, task: TaskClass, model: str) -> float | None:
+        """The configured temperature for `task`, or None to send nothing.
+
+        `model` is required, and it is what makes this safe. Several Anthropic models
+        return a 400 if `temperature` is sent AT ALL (`sampling.MODELS_REJECTING_SAMPLING`),
+        and the STRONG chain's first entry is one of them -- so blindly applying a stored
+        temperature would take GENERATE offline the moment an operator moved a slider.
+        A configured value is a DEFAULT, and a default that would break the call yields;
+        that is a different case from a call site passing `temperature=` explicitly,
+        which the adapter still refuses loudly, because there the parameter is an
+        intention rather than a preference.
+
+        Returned as `float` because that is what the `Provider` protocol takes; it is
+        stored as `Decimal` only so a settings screen can render it exactly.
+        """
+        record = self._sampling.get(task)
+        if record is None or record.temperature is None:
+            return None
+        if rejects_sampling(model):
+            logger.warning(
+                "not sending configured temperature %s to %s: the model rejects the "
+                "parameter outright, so the configured value is skipped for this entry "
+                "rather than failing the call",
+                record.temperature,
+                model,
+            )
+            return None
+        return float(record.temperature)
+
+    def max_tokens_for(self, task: TaskClass) -> int | None:
+        """The configured output ceiling for `task`, or None to take the adapter default.
+
+        No per-model exception here: every adapter accepts `max_tokens`, and two of the
+        three require it.
+        """
+        record = self._sampling.get(task)
+        return record.max_output_tokens if record else None
+
+    def describe_sampling(self) -> list[SamplingRecord]:
+        """Every task class with its sampling policy, configured or empty.
+
+        Includes unconfigured tasks -- same reasoning as :meth:`describe`: a screen
+        listing only the rows somebody already touched cannot show the whole picture.
+        """
+        return [self._sampling.get(task) or SamplingRecord(task_class=task) for task in TaskClass]
 
     # -- providers -------------------------------------------------------- #
 
@@ -218,4 +287,5 @@ __all__ = [
     "RouteSource",
     "RouteStore",
     "RouteSummary",
+    "SamplingRecord",
 ]

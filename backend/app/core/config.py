@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     # Browser origins allowed to call the API.
     cors_origins: tuple[str, ...] = ("http://localhost:3100",)
 
+    # Where this API is reachable from the public internet. It is CONFIGURATION and
+    # never derived from a request: `Host` is caller-controlled, so building a
+    # campaign's absolute URLs from it would let a poisoned header point every
+    # tracked link in a business's Instagram bio at somebody else's domain (the same
+    # reasoning `api/links.py` documents for returning relative paths).
+    #
+    # Used to build the `target_url` of a short link, which must be absolute because
+    # it becomes the `Location` of a public 302.
+    public_base_url: str = "http://localhost:8100"
+
     # HMAC key for session cookies. The default below is deliberately obvious
     # rubbish so that a machine which forgot to set it is caught by reading the
     # value, not by a subtle failure later: anyone holding this string can mint a

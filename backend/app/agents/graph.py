@@ -5,17 +5,31 @@ design, and it is what buys bounded steps, a human interrupt at a defined point,
 resumption after a crash, and per-node evaluation -- none of which an
 LLM-decides-everything loop gives you (docs/ARCHITECTURE.md section 14).
 
-    INTAKE -> HARVEST -> OPPORTUNITY -> PLAN -> GENERATE -> VALIDATE -> REPACK -> REVIEW
-                              |                    ^            |
-                        no opportunity             +-- fails ---+  (max 2)
-                              v
+    INTAKE -> HARVEST -> OPPORTUNITY -> PLAN -> GENERATE -> CONVERT -> VALIDATE -> REPACK -> REVIEW
+                              |                    ^           ^           |
+                        no opportunity             |           +- fails ---+  (max 2)
+                              v                   +-- draft failed --------+
                         end, honestly
 
-VALIDATE returns two verdicts and they are gated differently. A low SEO score is a
-quality problem: after the retries run out the draft is returned as a partial for a
-human to finish. A banned claim is a compliance problem: the run ends as a partial
-with `publication_blocked` set and NEVER reaches REVIEW, because REVIEW is the point
-at which a human can approve, and EXPORT publishes what was approved.
+VALIDATE returns three verdicts and they are gated differently.
+
+* A low SEO score is a **quality** problem: after the retries run out the draft is
+  returned as a partial for a human to finish.
+* A failing landing-page audit is also a quality problem, but it is attributable to
+  a different node, so the backward edge is shorter -- see below.
+* A banned claim is a **compliance** problem: the run ends as a partial with
+  `publication_blocked` set and NEVER reaches REVIEW, because REVIEW is the point at
+  which a human can approve, and EXPORT publishes what was approved.
+
+**The retry goes back to the earliest node whose output actually failed.** A failing
+score or claim check means the draft has to change, so the edge is to GENERATE (and
+CONVERT re-runs after it, because it sits downstream). A failing landing-page audit
+alone means the article is fine and only the conversion surface is wrong, so the edge
+is to CONVERT: sending it to GENERATE would pay for a strong-tier rewrite of a page
+that passed. The claim check deliberately covers the draft AND the landing page as
+one verdict, and a compliance failure therefore always takes the longer edge -- that
+is conservative rather than precise, and it is the right direction to be imprecise
+in.
 
 Nodes are injected rather than imported. A node is just
 ``async (AgentState) -> dict`` of state updates, so the entire machine is testable
@@ -57,6 +71,7 @@ ORDER: tuple[str, ...] = (
     "OPPORTUNITY",
     "PLAN",
     "GENERATE",
+    "CONVERT",
     "VALIDATE",
     "REPACK",
     "REVIEW",
@@ -115,6 +130,52 @@ async def _run_node(
     return state
 
 
+def _node_failure(state: AgentState, node: str) -> str | None:
+    """The message from this node's own crash, if it crashed.
+
+    `_run_node` converts a raise into a `NodeError(code="node_failed")` so one dead
+    fact source cannot end a run. That is right for HARVEST, where carrying on with
+    less evidence is the correct answer -- but it means a caller cannot tell "produced
+    nothing" from "never ran" by looking at the output alone. This reads the record.
+
+    Matched on `code`, not on the message: `record_error` is also used for ordinary
+    degradations, and treating "one page 500'd" as "the node failed" would send a run
+    down the failure path for something it handled correctly.
+    """
+    for error in reversed(state.get("errors") or []):
+        if error.node == node and error.code == "node_failed":
+            return error.message
+    return None
+
+
+def _quality_reason(
+    *,
+    report: Mapping[str, Any],
+    landing: Mapping[str, Any],
+    loops: int,
+    weak_draft: bool,
+    weak_landing: bool,
+) -> str:
+    """Why a run ran out of retries, naming each artifact that is still short.
+
+    Two artifacts can fail independently now, so one sentence about "the draft"
+    would be wrong half the time -- and this string is what the owner reads to
+    decide what to edit.
+    """
+    parts: list[str] = []
+    if weak_draft:
+        parts.append(f"the draft scored {report.get('score')} of 100")
+    if weak_landing:
+        parts.append(f"the landing page scored {landing.get('score')} of 100")
+    subject = "they are" if len(parts) > 1 else "it is"
+    return (
+        f"After {loops} revisions "
+        + " and ".join(parts)
+        + f", and still needs human edit. Returned with its findings, so {subject} "
+        "editable rather than lost. Nothing was blocked from publication."
+    )
+
+
 async def run_graph(
     state: AgentState,
     *,
@@ -145,6 +206,41 @@ async def run_graph(
             state = await _run_node(name, nodes[name], state, on_event)
 
             if name == "OPPORTUNITY" and not state.get("opportunity"):
+                # An empty `opportunity` has TWO causes and they mean opposite things:
+                # the node ran and judged that nothing was worth writing about, or the
+                # node could not run at all. Reporting the second as the first tells a
+                # customer their business has no story in it, on the strength of a
+                # provider outage.
+                #
+                # Observed in production, which is why this branch exists: OPPORTUNITY
+                # failed with `AllProvidersFailedError` (the credential's data policy
+                # refused every mid-tier model) and the run finished `done` saying "No
+                # opportunity met the bar for this business."
+                #
+                # This is the same rule the project already applies to share of voice,
+                # where `no_answer` is excluded from the denominator because "a model
+                # outage must never be recorded as the brand being absent -- that is the
+                # difference between a measurement and a fabrication". A judgement the
+                # agent never made is exactly that kind of fabrication.
+                failure = _node_failure(state, name)
+                if failure is not None:
+                    return GraphResult(
+                        state={
+                            **state,
+                            # `partial`, not `failed`: HARVEST's audit findings are real
+                            # work and are returned. Not `done` either -- nothing was
+                            # decided, so the run did not do what it set out to do.
+                            "outcome": "partial",
+                            "finished_reason": (
+                                "Opportunity selection could not run, so no topic was "
+                                f"chosen: {failure}. This is a failure to look, NOT a "
+                                "finding that nothing was worth writing about. The audit "
+                                "findings gathered before it are returned."
+                            ),
+                        },
+                        interrupted=False,
+                    )
+
                 # Nothing worth writing about. Returning the audit is the honest
                 # outcome; inventing a topic to fill the slot is not.
                 return GraphResult(
@@ -162,6 +258,7 @@ async def run_graph(
             if name == "VALIDATE":
                 report = state.get("seo_report") or {}
                 claims = state.get("claim_check") or {}
+                landing = state.get("landing_report") or {}
                 # A regulated claim is a HARD gate, not a score. The draft goes back
                 # to GENERATE with the offending phrase named, exactly as a failing
                 # score does -- but when the retries run out the two outcomes differ:
@@ -170,7 +267,13 @@ async def run_graph(
                 # REVIEW is where a human can approve it and EXPORT publishes what
                 # was approved.
                 blocked = bool(claims) and claims.get("passed") is False
-                if blocked or not report.get("passed", False):
+                # An ABSENT landing report is not a failure: a run whose CONVERT node
+                # produced nothing has already recorded that as an error, and there
+                # is no verdict to gate on. A present, failing one is a quality
+                # failure attributable to CONVERT alone.
+                weak_landing = bool(landing) and landing.get("passed") is False
+                weak_draft = blocked or not report.get("passed", False)
+                if weak_draft or weak_landing:
                     try:
                         state = enter_validate_loop(state)
                     except CapExceededError:
@@ -197,15 +300,20 @@ async def run_graph(
                             state={
                                 **state,
                                 "outcome": "partial",
-                                "finished_reason": (
-                                    f"The draft scored {report.get('score')} after "
-                                    f"{state['validate_loops']} revisions and still needs "
-                                    "human edit. Returned with its findings."
+                                "finished_reason": _quality_reason(
+                                    report=report,
+                                    landing=landing,
+                                    loops=state["validate_loops"],
+                                    weak_draft=weak_draft,
+                                    weak_landing=weak_landing,
                                 ),
                             },
                             interrupted=False,
                         )
-                    index = ORDER.index("GENERATE")
+                    # The shortest edge that can fix what failed. See the module
+                    # docstring: a landing page that failed on its own does not need
+                    # the article rewritten, and GENERATE is the strong-tier node.
+                    index = ORDER.index("GENERATE" if weak_draft else "CONVERT")
                     continue
 
             if name == "REVIEW":

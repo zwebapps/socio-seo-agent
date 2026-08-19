@@ -6,8 +6,8 @@ speculative.
 
 Present here: users, businesses, documents, kb_chunks, crawl_pages, runs,
 run_events, model_usage, actions, opportunities, content_pieces, geo_prompts,
-geo_results, model_routes, provider_settings, short_links, link_clicks, leads,
-feedback, learned_style.
+geo_results, model_routes, provider_settings, sampling_policies, node_tool_policies,
+short_links, link_clicks, leads, feedback, learned_style.
 Still to come: keywords, competitors, social_posts, approvals.
 """
 
@@ -552,6 +552,88 @@ class ProviderSetting(Base, UuidPkMixin, TimestampMixin):
             "provider in ('openrouter','anthropic','ollama','fake')", name="provider_valid"
         ),
     )
+
+
+class SamplingPolicy(Base, UuidPkMixin, TimestampMixin):
+    """Temperature and output ceiling for one task class.
+
+    A separate table from ``model_routes`` rather than two more columns on it, and the
+    reason is a real bug that shape would have: ``RouteConfigWriter.set_route`` DELETES
+    the row when the chain is empty, because "use the default chain" and "use nothing"
+    are different intentions. Sampling settings living on that row would be discarded
+    the moment an operator reverted a route to its default chain -- silently, and with
+    no way to notice except by watching output change.
+
+    Both value columns are nullable and NULL means "send nothing, take the provider
+    default", which is exactly what every call site does today. So an empty table
+    behaves precisely as the code does -- the same property that makes ``model_routes``
+    safe to ship ahead of its screen.
+
+    The CHECK constraints duplicate the bounds in ``llm/sampling.py``. That duplication
+    is deliberate: the Python bounds refuse a bad request, and these refuse a bad row,
+    including one written by a migration, a fixture or a psql session.
+    """
+
+    __tablename__ = "sampling_policies"
+
+    task_class: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+
+    #: ``Numeric``, not ``float``, so a stored 0.7 reads back as ``0.7`` on a settings
+    #: screen instead of ``0.7000000000000001``. Not because it is money -- it is not,
+    #: and unlike ``usd`` it is serialised as a JSON number rather than a string.
+    temperature: Mapped[Decimal | None] = mapped_column(Numeric(3, 2))
+    max_output_tokens: Mapped[int | None] = mapped_column(Integer)
+
+    updated_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "temperature is null or (temperature >= 0 and temperature <= 1)",
+            name="temperature_in_range",
+        ),
+        CheckConstraint(
+            "max_output_tokens is null or "
+            "(max_output_tokens >= 1024 and max_output_tokens <= 8192)",
+            name="max_output_tokens_in_range",
+        ),
+    )
+
+
+class NodeToolPolicy(Base, UuidPkMixin, TimestampMixin):
+    """Tools an operator has switched OFF for one graph node.
+
+    **There is deliberately no ``granted`` column, and that absence is the security
+    property.** ``agents/tools.NODE_TOOLS`` is a prompt-injection barrier
+    (docs/AGENT_RUNTIME.md section 3), so this table may only ever narrow it: the
+    effective set is ``NODE_TOOLS[node] - revoked``, a set difference, which cannot
+    return a tool the code did not already grant whatever is stored here. A ``granted``
+    column would make widening expressible from a browser, and a stolen admin cookie
+    would then be enough to hand ``publish`` to the node that reads competitor HTML.
+
+    See ``services/tool_policy.py`` for the full argument and
+    ``backend/tests/services/test_tool_policy.py`` for the proof, which includes a test
+    asserting this model has no column that could express a grant.
+    """
+
+    __tablename__ = "node_tool_policies"
+
+    node: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+
+    #: Tool names to remove from this node's allowlist. A name the node never held is
+    #: inert rather than an error, because set difference ignores it -- but the API
+    #: refuses an unknown name anyway, so an operator is never left believing they have
+    #: switched off something they have not.
+    revoked: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+
+    updated_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    note: Mapped[str | None] = mapped_column(Text)
 
 
 # --------------------------------------------------------------------------- #

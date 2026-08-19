@@ -313,17 +313,19 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   refuses a finished run (re-running would overwrite approved work) and one awaiting approval (that
   is a person, not a stall). What is missing is a sweeper that finds stalled runs automatically,
   which is a worker's job; `ROADMAP` names ARQ/Redis and it is not installed.
-- [ ] **A provider outage is reported to the customer as a business judgement.** In `graph.py`,
-  `if name == "OPPORTUNITY" and not state.get("opportunity")` returns "No opportunity met the bar
-  for this business" — but `opportunity` is ALSO None when the node could not run at all. Observed
-  live: OPPORTUNITY failed with `AllProvidersFailedError` (the MID tier is refused by this
-  credential's data policy) and the run finished `done`, telling the customer nothing about their
-  business was worth writing about. This is the same fabrication the project forbids elsewhere —
-  `no_answer` is excluded from the share-of-voice denominator precisely because "a model outage must
-  never be recorded as the brand being absent". The fix is to distinguish "ran and chose nothing"
-  (`done`, current message) from "could not run" (`partial`/`failed`, naming the failure), which
-  `state["errors"]` already carries. NOT fixed here only because `graph.py` was held by another
-  agent at the time.
+- [x] **A provider outage was reported to the customer as a business judgement.** In `graph.py`,
+  `if name == "OPPORTUNITY" and not state.get("opportunity")` returned "No opportunity met the bar
+  for this business" — but `opportunity` is ALSO None when the node could not run. Observed live:
+  OPPORTUNITY failed with `AllProvidersFailedError` (the credential's data policy refuses every
+  mid-tier model) and the run finished `done`, telling the owner nothing about their business was
+  worth writing about. Same fabrication the project forbids elsewhere: `no_answer` is excluded from
+  the share-of-voice denominator precisely because "a model outage must never be recorded as the
+  brand being absent". Now `_node_failure()` reads the `node_failed` record `_run_node` already
+  writes, and a crash returns `partial` with the real cause named ("a failure to look, NOT a finding
+  that nothing was worth writing about"), while a clean run that chose nothing keeps the original
+  message. Matched on the error CODE, not on any error being present — `record_error` also carries
+  ordinary degradations, so keying on "are there errors" would report a good judgement as a failure
+  whenever a crawl lost a page. Three tests, including that one.
 - [ ] `/api/v1/onboarding` has only `/preview` — nothing persists the drafted Business DNA, so
   `tone`/`audience`/`banned_claims` are empty for every business (created at signup with `dna = {}`).
   Consequence: the regulated-claim guard has no claims to enforce for a real tenant.

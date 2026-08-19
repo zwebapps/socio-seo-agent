@@ -35,6 +35,20 @@ protections are layered, in this order, and the order is part of the design:
 4. **A honeypot, answered exactly like a success.** A 400 would tell the bot which
    field to leave alone next time. The refusal is that nothing is written.
 
+It accepts **two body encodings**, and the second one is not a convenience. A
+generated landing page has to work with JavaScript off (see ``api/pages.py``), and a
+plain HTML form posts ``application/x-www-form-urlencoded`` -- so a JSON-only endpoint
+would mean every no-script visitor's lead is refused after they had already typed it
+in. The urlencoded path is folded into the SAME schema, the same honeypot, the same
+size cap and the same rate limit rather than getting its own: two implementations of
+one set of protections is how one of them ends up weaker.
+
+The only difference is what comes back. A JSON caller gets the constant 202; a form
+POST gets a **303 back to the page it came from**, with ``?sent=1`` or ``?error=1``,
+so the browser lands on a confirmation instead of on a JSON body. The target is built
+from the resolved content piece, never from anything in the request -- a redirect
+target taken from a parameter is an open redirect.
+
 And two rules about what comes back out:
 
 **Nothing is reflected.** Not in the 202, not in the 422 -- the validation error
@@ -58,9 +72,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import TYPE_CHECKING, Annotated, Any, Final, Protocol
+from urllib.parse import parse_qsl
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import RedirectResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -88,6 +104,7 @@ from backend.app.db.adapters.lead_store import (
     PostgresLeadStore,
     ShortLinkRecord,
 )
+from backend.app.services.landing_service import landing_page_path
 from backend.app.services.link_service import MAX_CODE_LENGTH
 
 public_router = APIRouter(tags=["leads"])
@@ -96,6 +113,10 @@ router = APIRouter(tags=["leads"])
 #: 8 KiB. A name, an email, a phone number and a two-thousand-character message fit
 #: several times over, and an anonymous caller has no business sending more.
 MAX_FORM_BODY_BYTES: Final = 8 * 1024
+
+#: What a browser sends when a plain HTML form is submitted. The generated landing page
+#: has no JavaScript, so this is the encoding a real visitor's lead arrives in.
+FORM_CONTENT_TYPE: Final = "application/x-www-form-urlencoded"
 
 #: The statuses whose landing page may accept a submission. A draft page's form must
 #: not take leads -- it has not been approved, and its copy may promise something the
@@ -341,6 +362,68 @@ async def _enforce_rate_limit(request: Request, limiter: FixedWindowRateLimiter)
     )
 
 
+def _is_form_encoded(request: Request) -> bool:
+    """Whether this is a browser form post rather than a JSON call.
+
+    The media type only -- parameters such as ``; charset=utf-8`` are stripped, since a
+    browser sends them and an exact string comparison would quietly route every real
+    form submission down the JSON path.
+    """
+    declared = request.headers.get("content-type", "")
+    return declared.split(";")[0].strip().lower() == FORM_CONTENT_TYPE
+
+
+def _submission_from_form(body: bytes) -> LeadSubmission:
+    """Parse a urlencoded body into the same closed schema the JSON path uses.
+
+    Two shape differences between an HTML form and our JSON, both handled here so that
+    :class:`LeadSubmission` stays one schema:
+
+    * a form cannot send a nested object, so the ``utm`` map arrives as flat
+      ``utm_source`` / ``utm_campaign`` hidden inputs and is folded back up. An
+      explicit ``utm`` field in the body is overwritten rather than merged: this is the
+      only place that key is built, and honouring a caller-supplied one would let a bot
+      put arbitrary JSON into ``leads.utm``;
+    * an unchecked checkbox is ABSENT rather than false, which the model's default and
+      its ``consent is required`` validator already handle correctly.
+
+    ``extra="forbid"`` still applies, so an unexpected field is still refused.
+    """
+    pairs = parse_qsl(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    payload: dict[str, Any] = {}
+    utm: dict[str, str] = {}
+    for key, value in pairs:
+        if key.startswith("utm_"):
+            utm[key] = value
+        else:
+            payload[key] = value
+    payload["utm"] = utm
+    return LeadSubmission.model_validate(payload)
+
+
+def _answer(
+    *, form_encoded: bool, content_piece_id: UUID, ok: bool = True
+) -> ReceivedResponse | RedirectResponse:
+    """The one answer a submitter gets, in whichever form they asked for it.
+
+    303 rather than 302, because the request was a POST and the thing to fetch next is
+    a GET -- a 302 leaves some clients re-posting. The ``Location`` is a RELATIVE path
+    built from the resolved content piece: nothing from the request contributes to it,
+    so this cannot become an open redirect, and it needs no trust in ``Host``.
+
+    ``no-store`` on the redirect itself, so a cached 303 cannot pin a visitor to a
+    confirmation for a submission they have not made.
+    """
+    if not form_encoded:
+        return ReceivedResponse()
+    flag = "sent" if ok else "error"
+    return RedirectResponse(
+        url=f"{landing_page_path(content_piece_id)}?{flag}=1",
+        status_code=status.HTTP_303_SEE_OTHER,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 async def _attributed_link(
     store: LeadStore, business_id: UUID, code: str
 ) -> ShortLinkRecord | None:
@@ -371,11 +454,13 @@ async def submit_form(
     request: Request,
     store: Annotated[LeadStore, Depends(get_store)],
     limiter: Annotated[FixedWindowRateLimiter, Depends(get_form_limiter)],
-) -> ReceivedResponse:
+) -> ReceivedResponse | RedirectResponse:
     """Accept one lead for the landing page identified by ``form_id``.
 
-    202 rather than 201: the response carries no identifier for the thing created,
-    on purpose, because it must be indistinguishable from the honeypot's answer.
+    202 rather than 201 for a JSON caller: the response carries no identifier for the
+    thing created, on purpose, because it must be indistinguishable from the honeypot's
+    answer. A browser form gets a 303 back to the page instead -- see the module
+    docstring.
 
     ``form_id`` is parsed here rather than declared as a ``UUID`` path parameter so
     that a malformed id produces the same 404 as an unknown one instead of a 422
@@ -383,6 +468,7 @@ async def submit_form(
     """
     await _enforce_rate_limit(request, limiter)
     body = await _read_body_within_cap(request)
+    form_encoded = _is_form_encoded(request)
 
     try:
         content_piece_id = UUID(form_id)
@@ -394,15 +480,24 @@ async def submit_form(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=_NO_SUCH_FORM)
 
     try:
-        payload = LeadSubmission.model_validate_json(body)
+        payload = (
+            _submission_from_form(body)
+            if form_encoded
+            else LeadSubmission.model_validate_json(body)
+        )
     except ValidationError as exc:
+        # A form submitter is sent back to the page with a notice, because a JSON body
+        # is not an answer a person in a browser can act on. Still nothing reflected:
+        # the flag is one bit, and the page's own copy says what is required.
+        if form_encoded:
+            return _answer(form_encoded=True, content_piece_id=form.content_piece_id, ok=False)
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_field_errors(exc)
         ) from exc
 
     # The honeypot. Answered exactly like a success -- see the module docstring.
     if payload.homepage2:
-        return ReceivedResponse()
+        return _answer(form_encoded=form_encoded, content_piece_id=form.content_piece_id)
 
     link = await _attributed_link(store, form.business_id, payload.ref)
 
@@ -423,7 +518,7 @@ async def submit_form(
         content_piece_id=form.content_piece_id,
         source="form",
     )
-    return ReceivedResponse()
+    return _answer(form_encoded=form_encoded, content_piece_id=form.content_piece_id)
 
 
 @router.get(

@@ -18,11 +18,13 @@ from fastapi.responses import JSONResponse
 from backend.app.api import (
     admin_models,
     auth,
+    cost,
     feedback,
     health,
     leads,
     links,
     onboarding,
+    pages,
     runs,
 )
 from backend.app.core.body_limit import BodySizeLimitMiddleware
@@ -126,15 +128,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(admin_models.router)
+    app.include_router(cost.router)
     app.include_router(onboarding.router)
     app.include_router(runs.router)
     app.include_router(feedback.router)
 
     # PUBLIC routes: no session, reachable by a stranger. Mounted separately and last so
     # that "which of these is public?" is answered here rather than by reading each
-    # module. links serves the tracked redirect and the bio-link hub; leads.public_router
-    # is the form endpoint.
+    # module. links serves the tracked redirect and the bio-link hub; pages serves the
+    # generated landing page a tracked link points AT; leads.public_router is the form
+    # endpoint that page posts to.
     app.include_router(links.router)
+    app.include_router(pages.router)
     app.include_router(leads.public_router)
     app.include_router(leads.router)
 

@@ -179,6 +179,121 @@ GENERATE_TOOL = ToolSpec(
     },
 )
 
+LANDING_TOOL = ToolSpec(
+    name="record_landing_page",
+    description=(
+        "Record the landing page this content should convert on, and the ask that "
+        "points at it from each channel. Every proof point must name the document, "
+        "page or profile field it came from; if the evidence supports no proof point, "
+        "return none rather than inventing one."
+    ),
+    parameters={
+        "type": "object",
+        "required": [
+            "headline",
+            "offer",
+            "proof_points",
+            "form_fields",
+            "primary_cta",
+            "consent_text",
+            "ctas",
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "headline": {
+                "type": "string",
+                "description": "25-70 characters. Names the offer and who it is for.",
+            },
+            "subhead": {
+                "type": "string",
+                "description": ("One sentence: what the visitor gets, and what it costs them."),
+            },
+            "offer": {
+                "type": "string",
+                "description": (
+                    "At least 40 characters. What the visitor actually receives in "
+                    "exchange for their details, in concrete terms."
+                ),
+            },
+            "proof_points": {
+                "type": "array",
+                "description": (
+                    "Two or three reasons to believe the offer, each taken from the "
+                    "business's own documents or profile."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["text", "source"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "text": {"type": "string"},
+                        "source": {
+                            "type": "string",
+                            "description": (
+                                "The document, page or profile field this came from, "
+                                "named as it appears in the evidence. Never empty."
+                            ),
+                        },
+                    },
+                },
+            },
+            "form_fields": {
+                "type": "array",
+                "description": (
+                    "One to three fields. Every additional field costs conversions, "
+                    "and one of email or phone is required or the enquiry cannot be "
+                    "answered."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["name", "label"],
+                    "additionalProperties": False,
+                    "properties": {
+                        # Closed on purpose: these are the only names the public lead
+                        # endpoint accepts, so anything else would be a field the
+                        # visitor fills in and the server refuses.
+                        "name": {"type": "string", "enum": ["name", "email", "phone", "message"]},
+                        "label": {"type": "string", "description": "In the business's language."},
+                        "required": {"type": "boolean"},
+                    },
+                },
+            },
+            "primary_cta": {
+                "type": "string",
+                "description": (
+                    "The button label, at most 40 characters, as an action the visitor takes."
+                ),
+            },
+            "consent_text": {
+                "type": "string",
+                "description": (
+                    "One sentence beside the consent checkbox: what the business will "
+                    "do with the details. In the business's language."
+                ),
+            },
+            "ctas": {
+                "type": "array",
+                "description": "Exactly one per requested channel, in that channel's register.",
+                "items": {
+                    "type": "object",
+                    "required": ["channel", "text"],
+                    "additionalProperties": False,
+                    "properties": {
+                        "channel": {"type": "string"},
+                        "text": {
+                            "type": "string",
+                            "description": (
+                                "At most 200 characters. The link is added by the "
+                                "system -- do not write a URL."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+    },
+)
+
 REPACK_TOOL = ToolSpec(
     name="record_posts",
     description="Record one post per requested channel, in that channel's native register.",

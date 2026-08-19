@@ -364,6 +364,27 @@ class ModelRouter:
             "nor configured with an address"
         )
 
+    def _configured_temperature(self, task: TaskClass, model: str) -> float | None:
+        """The operator's temperature for this task and model, if any.
+
+        Typed loosely against the resolver for the same reason `resolve` is: importing
+        `RouteResolver` here would close an import cycle, because `route_config` imports
+        the tables above.
+        """
+        resolver = self._resolver
+        if resolver is None:
+            return None
+        value = resolver.temperature_for(task, model)  # type: ignore[attr-defined]
+        return float(value) if value is not None else None
+
+    def _configured_max_tokens(self, task: TaskClass) -> int | None:
+        """The operator's output ceiling for this task, if any."""
+        resolver = self._resolver
+        if resolver is None:
+            return None
+        value = resolver.max_tokens_for(task)  # type: ignore[attr-defined]
+        return int(value) if value is not None else None
+
     def estimate_usd(
         self,
         model: str,
@@ -408,16 +429,43 @@ class ModelRouter:
         carrying every cause when the chain is exhausted. A non-retryable
         failure (bad request, unparseable tool arguments) is raised straight
         through, because the next provider would reject it identically.
+
+        `temperature` and `max_tokens` left as None fall back to the operator's stored
+        sampling policy for this task, if a resolver carries one; a caller who names
+        either wins. With nothing stored, both stay None and nothing is sent.
         """
         route = self.resolve(task)
         failures: list[ProviderFailure] = []
 
+        # Configured sampling applies only where the CALLER named nothing. A call site
+        # that passes `temperature=` or `max_tokens=` has an intention about this one
+        # call, and an operator's stored default must not override it -- `geo_service`
+        # sizes `max_tokens` to the probe it is running, and every node passes
+        # `temperature=None` precisely so the provider default applies. With no
+        # resolver, or nothing stored, both stay None and behaviour is unchanged.
+        if max_tokens is not None:
+            effective_max_tokens: int | None = max_tokens
+        else:
+            effective_max_tokens = self._configured_max_tokens(task)
+
         for entry in route.chain:
             provider = self._provider_for(entry.provider)
 
+            # Resolved per ENTRY, not once: whether a temperature may be sent depends on
+            # the model, and a chain can fall back from a model that refuses one to a
+            # model that accepts it.
+            effective_temperature = (
+                temperature
+                if temperature is not None
+                else self._configured_temperature(task, entry.model)
+            )
+
             # -- the guard, and it is here on purpose: before the await ------ #
             if budget is not None:
-                estimate = self.estimate_usd(entry.model, messages, tools, max_tokens)
+                # The EFFECTIVE ceiling, not the caller's. The estimate assumes the model
+                # emits its whole allowance, so a configured ceiling the guard did not
+                # know about would make the reservation smaller than the call it guards.
+                estimate = self.estimate_usd(entry.model, messages, tools, effective_max_tokens)
                 if not budget.can_afford(estimate):
                     raise BudgetExceededError(
                         model=entry.model,
@@ -431,8 +479,8 @@ class ModelRouter:
                     messages,
                     model=entry.model,
                     tools=tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
+                    temperature=effective_temperature,
+                    max_tokens=effective_max_tokens,
                 )
             except RETRYABLE_ERRORS as exc:
                 failures.append(
