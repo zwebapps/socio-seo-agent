@@ -58,7 +58,28 @@ body() { # body METHOD PATH [DATA]
 jsonget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)"; }
 
 # --------------------------------------------------------------------------- #
-step "1. Health — is anything there at all"
+step "0. Preflight — is the API even up"
+#
+# curl reports 000 for "could not connect", which through `expect` reads as
+# "wanted 200, got 000" and sends you looking at the endpoint instead of at the
+# process. Checked separately so the message names the actual problem.
+if ! curl -s -o /dev/null --max-time 3 "$API/health"; then
+  printf '  \033[31mFAIL\033[0m nothing is listening on %s\n\n' "$API"
+  printf '  Start it:\n'
+  printf '    make up    # Postgres :5435 + Redis :6381 (docker)\n'
+  printf '    make api   # this API on :8100\n\n'
+  printf '  Point elsewhere with:  API=http://localhost:9000 %s\n' "$0"
+  exit 1
+fi
+pass "something is listening on $API"
+
+# Infra too, since a running API with no database fails later and less clearly.
+if ! (echo > /dev/tcp/127.0.0.1/5435) 2>/dev/null; then
+  printf '  \033[33mwarn\033[0m nothing on :5435 — Postgres looks down; run: make up\n'
+fi
+
+# --------------------------------------------------------------------------- #
+step "1. Health"
 expect 200 "$(code GET /health)" "GET /health"
 expect 200 "$(code GET /api/v1/health)" "GET /api/v1/health"
 
