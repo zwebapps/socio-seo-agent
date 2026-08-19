@@ -30,10 +30,17 @@ dependencies = [
     "anthropic>=0.122.0",
     # Queue + rate-limit token buckets shared across workers (Phase 2)
     "redis>=8.1.0",
+    # The agent runtime. Chosen over a bare ReAct loop for bounded steps, a
+    # human interrupt at a defined point, and per-node evaluation -- see
+    # docs/ARCHITECTURE.md section 14.
+    "langgraph>=1.2.11",
+    # Password hashing. Argon2id, not bcrypt: it is the current OWASP first
+    # choice and resists GPU cracking far better.
+    "argon2-cffi>=25.1.0",
 ]
 
 # Still phase-gated, added when the phase that needs them lands:
-#   Phase 3  langgraph, langchain-core, pypdf, python-docx
+#   pypdf, python-docx  (the kb engine's pdf/docx extractors raise until then)
 #   Phase 12 langfuse, ragas
 
 [dependency-groups]
