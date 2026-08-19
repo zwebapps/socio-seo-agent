@@ -721,3 +721,39 @@ def test_fake_provider_rejects_an_empty_response_set() -> None:
     """An explicitly empty list is a caller mistake, not a request for defaults."""
     with pytest.raises(ValueError, match="canned response"):
         FakeProvider(responses=[])
+
+
+def test_the_fake_provider_fills_an_array_argument_with_one_element() -> None:
+    """An empty array is schema-valid and useless.
+
+    Any tool whose payload is a list — the knowledge-base grader returns `grades: [...]`
+    — was silently defeated by `[]`: every passage read as ungraded, retrieval always
+    reported insufficient, and the RAG path could not be exercised without a paid key.
+    The eval harness found it by scoring RAG-on and RAG-off identically.
+    """
+    from backend.app.llm.fake_provider import _placeholder_for
+
+    grades = _placeholder_for(
+        {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "integer"},
+                    "grade": {"type": "string", "enum": ["relevant", "partial", "irrelevant"]},
+                },
+            },
+        },
+        "seed",
+    )
+
+    assert isinstance(grades, list)
+    assert len(grades) == 1, "an empty list defeats every list-shaped tool"
+    assert grades[0]["grade"] == "relevant", "the first enum value, deterministically"
+
+
+def test_a_scalar_array_still_gets_one_element() -> None:
+    from backend.app.llm.fake_provider import _placeholder_for
+
+    value = _placeholder_for({"type": "array", "items": {"type": "string"}}, "s")
+    assert len(value) == 1 and isinstance(value[0], str)

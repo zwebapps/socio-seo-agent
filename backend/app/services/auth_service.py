@@ -1,6 +1,6 @@
-"""Signup, login, and session resolution.
+"""Signup, login, session resolution, and session revocation.
 
-Three rules shape this module, and each exists because its opposite is a real
+Four rules shape this module, and each exists because its opposite is a real
 bug someone ships every year.
 
 **Signup is one transaction.** A user row without a business row is a state every
@@ -20,6 +20,15 @@ rules ("one upper, one digit, one symbol") measurably push people toward
 ``Password1!`` -- they shrink the search space they claim to widen. Twelve
 characters with the obvious candidates removed is the better trade.
 
+**Every argon2 call goes through the bounded wrapper, and revocation is a real
+operation.** Both hashing and verifying cost 64 MiB, so signup amplifies memory
+exactly as much as login does and neither may run unbounded --
+:func:`~backend.app.core.security.hash_password_bounded` and
+``verify_password_bounded`` are the only versions this module calls. And because
+the session token is stateless HMAC, ending a session needs
+:func:`revoke_sessions`: without it, logout clears the browser's copy of a cookie
+that stays valid for another thirty days in anyone else's hands.
+
 One tension this module does NOT solve, and should not pretend to: signup must
 tell the caller that an address is already registered, because it cannot create
 the account and cannot silently do nothing. The 409 is therefore an enumeration
@@ -37,14 +46,21 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.security import hash_password, needs_rehash, verify_password
+from backend.app.core.security import (
+    hash_password,
+    hash_password_bounded,
+    needs_rehash,
+    revocation_watermark,
+    verify_password_bounded,
+)
 from backend.app.db.models import Business, User
 
 # --------------------------------------------------------------------------- #
@@ -218,7 +234,10 @@ async def signup(
     validate_password(password)
     name = _clean_business_name(business_name)
 
-    user = User(id=uuid4(), email=normalised, password_hash=hash_password(password), is_active=True)
+    # Bounded: hashing costs the same 64 MiB as verifying, so an unthrottled
+    # signup route is the same memory-amplification DoS as an unthrottled login.
+    password_hash = await hash_password_bounded(password)
+    user = User(id=uuid4(), email=normalised, password_hash=password_hash, is_active=True)
     business = Business(id=uuid4(), owner_id=user.id, name=name)
 
     session.add(user)
@@ -241,7 +260,13 @@ async def signup(
 
 
 async def _find_by_email(email: str, session: AsyncSession) -> User | None:
-    result = await session.execute(select(User).where(User.email == email))
+    # `populate_existing` for the same reason as `load_active_user`: a row already
+    # in the identity map would otherwise hand back cached attributes, and a stale
+    # `sessions_valid_from` here means minting a session token that the very next
+    # request refuses.
+    result = await session.execute(
+        select(User).where(User.email == email).execution_options(populate_existing=True)
+    )
     return result.scalar_one_or_none()
 
 
@@ -261,21 +286,21 @@ async def authenticate(email: str, password: str, *, session: AsyncSession) -> U
         normalised = normalise_email(email)
     except InvalidEmailError:
         # Cannot match any row, but must not return faster than a real miss.
-        verify_password(password, _dummy_hash)
+        await verify_password_bounded(password, _dummy_hash)
         return None
 
     user = await _find_by_email(normalised, session)
     if user is None:
-        verify_password(password, _dummy_hash)
+        await verify_password_bounded(password, _dummy_hash)
         return None
 
-    if not verify_password(password, user.password_hash):
+    if not await verify_password_bounded(password, user.password_hash):
         return None
     if not user.is_active:
         return None
 
     if needs_rehash(user.password_hash):
-        user.password_hash = hash_password(password)
+        user.password_hash = await hash_password_bounded(password)
         await session.commit()
 
     return user
@@ -286,6 +311,64 @@ async def load_active_user(user_id: UUID, *, session: AsyncSession) -> User | No
 
     Read on every authenticated request, which is deliberate: deactivation takes
     effect on the next request rather than whenever the cookie happens to expire.
+    Do not "optimise" that round trip into a cache -- switching an account off
+    would then take up to thirty days to mean anything.
+
+    ``populate_existing`` is load-bearing for the same reason. A ``select`` that
+    finds a row already in the session's identity map returns the *cached*
+    attribute values by default, and the factory runs with
+    ``expire_on_commit=False``. So on any session that outlives one request, a
+    ``sessions_valid_from`` bumped by :func:`revoke_sessions` would be invisible
+    here and the revocation check would read a stale ``None`` -- a revoked session
+    silently honoured. Forcing the refresh makes the docstring above true instead
+    of aspirational.
     """
-    result = await session.execute(select(User).where(User.id == user_id, User.is_active.is_(True)))
+    result = await session.execute(
+        select(User)
+        .where(User.id == user_id, User.is_active.is_(True))
+        .execution_options(populate_existing=True)
+    )
     return result.scalar_one_or_none()
+
+
+async def revoke_sessions(user_id: UUID, *, session: AsyncSession) -> datetime:
+    """Invalidate every session token issued to ``user_id`` before now.
+
+    This is the revocation the stateless token could not have on its own: the
+    signed cookie is not stored anywhere, so there is nothing to delete, and
+    ``users.sessions_valid_from`` is the one bit of server state that can refuse
+    it. Logout calls this -- which is what makes logout mean something rather than
+    only clearing the browser's copy -- and a password change must call it too,
+    because the whole point of changing a password is ending the sessions of
+    whoever knew the old one.
+
+    Returns the watermark actually stored. **A caller that immediately issues a
+    replacement session must sign it with this value**, not with a fresh
+    ``now()``: see :func:`~backend.app.core.security.revocation_watermark` for the
+    same-second problem that solves.
+
+    The stored value never moves backwards. ``greatest`` rather than a plain
+    assignment because a clock that steps back -- an NTP correction, a VM
+    migration -- would otherwise *lower* the watermark and un-revoke sessions that
+    had already been refused. ``RETURNING`` is what lets this function report the
+    value that won.
+
+    Unknown or already-deleted user: the ``UPDATE`` matches no row and the
+    computed watermark is returned. Deliberately not an error, because logout is
+    reachable with a validly signed cookie for a user who has since been removed,
+    and that must still be a quiet 204.
+    """
+    watermark = revocation_watermark(datetime.now(UTC))
+    result = await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            sessions_valid_from=func.greatest(
+                func.coalesce(User.sessions_valid_from, watermark), watermark
+            )
+        )
+        .returning(User.sessions_valid_from)
+    )
+    stored = result.scalar_one_or_none()
+    await session.commit()
+    return stored if stored is not None else watermark

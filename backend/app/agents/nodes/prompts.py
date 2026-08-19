@@ -46,7 +46,10 @@ def system(role: str, dna: dict[str, Any], remembered: list[str]) -> Message:
     if banned:
         brand_lines.append("Never claim: " + "; ".join(banned))
     if remembered:
-        brand_lines.append("Remembered preferences: " + "; ".join(remembered))
+        # One per line, not "; "-joined. A rule containing "; " would be ambiguous when
+        # joined, and a bulleted list is followed more reliably than a run-on sentence.
+        brand_lines.append("Remembered preferences:")
+        brand_lines.extend(f"- {rule}" for rule in remembered)
 
     return Message(
         role=Role.SYSTEM,

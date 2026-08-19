@@ -15,7 +15,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.app.api import admin_models, auth, health, onboarding, runs
+from backend.app.api import (
+    admin_models,
+    auth,
+    feedback,
+    health,
+    leads,
+    links,
+    onboarding,
+    runs,
+)
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings, get_settings
 
 #: Below this length an HMAC key is brute-forceable, and the signature is only
@@ -116,6 +125,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin_models.router)
     app.include_router(onboarding.router)
     app.include_router(runs.router)
+    app.include_router(feedback.router)
+
+    # PUBLIC routes: no session, reachable by a stranger. Mounted separately and last so
+    # that "which of these is public?" is answered here rather than by reading each
+    # module. links serves the tracked redirect and the bio-link hub; leads.public_router
+    # is the form endpoint.
+    app.include_router(links.router)
+    app.include_router(leads.public_router)
+    app.include_router(leads.router)
 
     app.add_middleware(
         CORSMiddleware,

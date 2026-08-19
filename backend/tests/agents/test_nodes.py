@@ -388,3 +388,57 @@ def test_every_node_the_graph_expects_is_provided() -> None:
     nodes = build_nodes(_deps())
     missing = [name for name in ORDER if name not in nodes]
     assert not missing, f"the graph would KeyError on: {missing}"
+
+
+async def test_intake_loads_memory_into_the_state_so_it_reaches_the_prompt() -> None:
+    """Before this wiring, `remembered` was read by prompts.system() but written by
+    nothing — the feature existed on both sides of a gap with nothing across it."""
+
+    async def load() -> list[str]:
+        return ["never use exclamation marks", "always mention the 24h Notdienst"]
+
+    nodes = build_nodes(_deps(load_memory=load))
+    updates = await nodes["INTAKE"](_state())
+
+    assert updates["remembered"] == [
+        "never use exclamation marks",
+        "always mention the 24h Notdienst",
+    ]
+
+
+async def test_a_remembered_preference_actually_appears_in_the_system_prompt() -> None:
+    """The end-to-end claim, asserted on the assembled prompt rather than inferred."""
+    router = StubRouter(
+        {
+            TaskClass.PLAN: {
+                "target_keyword": "k",
+                "headings": ["h"],
+            }
+        }
+    )
+    captured: list[str] = []
+
+    class Capturing(StubRouter):
+        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+            captured.append("\n".join(str(m.content) for m in messages))
+            return await super().complete(task, messages, **kw)
+
+    capturing = Capturing({TaskClass.PLAN: {"target_keyword": "k", "headings": ["h"]}})
+    nodes = build_nodes(_deps(capturing))
+    await nodes["PLAN"](
+        _state(opportunity={"title": "t"}, remembered=["never use exclamation marks"])
+    )
+
+    assert "never use exclamation marks" in captured[0]
+    assert "- never use exclamation marks" in captured[0], "one rule per line"
+    assert router is not None
+
+
+async def test_memory_that_fails_to_load_degrades_the_run_rather_than_ending_it() -> None:
+    async def broken() -> list[str]:
+        raise RuntimeError("database unreachable")
+
+    updates = await build_nodes(_deps(load_memory=broken))["INTAKE"](_state())
+
+    assert "remembered" not in updates
+    assert any("remembered" in gap for gap in updates["fact_gaps"])

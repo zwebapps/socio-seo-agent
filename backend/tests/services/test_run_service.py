@@ -19,7 +19,6 @@ from backend.app.services.run_service import (
     InMemoryRunStore,
     RunRecord,
     RunService,
-    RunEventRecord,
 )
 
 

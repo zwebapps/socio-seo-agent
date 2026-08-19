@@ -7,12 +7,16 @@ Three things are deliberate:
 
 * **Every extractor returns through :func:`finalise_extraction`.** That is the
   one place that decides ``ok`` versus ``no_text``, so a format added later
-  cannot get the scanned-document case wrong. It is also the function the tests
-  drive with a PDF-shaped empty result, since ``pypdf`` is not installed.
-* **A missing dependency raises, it does not degrade.** ``pdf`` and ``docx`` are
-  registered and raise :class:`ExtractorUnavailableError` naming the package they
-  need. The registry with an honest gap is the point: the shape of the fix is
-  visible, and no document is ever silently indexed as empty.
+  cannot get the scanned-document case wrong. It is also what makes the
+  scanned-PDF case free: a scan parses perfectly and yields an empty string, and
+  the finaliser turns that into ``no_text`` with an OCR hint.
+* **A missing dependency raises, it does not degrade.** ``pdf`` and ``docx`` need
+  ``pypdf`` and ``python-docx``, which are phase-gated in pyproject.toml. Their
+  parsing logic is written and tested; the library is imported LAZILY, on first
+  use, and its absence raises :class:`ExtractorUnavailableError` naming the
+  package to install. So the gap is honest and the fix is one line of
+  pyproject.toml -- and no document is ever silently indexed as empty, which is
+  what returning ``no_text`` for a missing library would do.
 * **Nothing raises on bad input.** Malformed HTML, a NUL byte in the middle of a
   text file, Windows line endings, a UTF-8 BOM: all handled. A document ingest
   that dies on one bad upload is an ingest a customer cannot use.
@@ -22,8 +26,11 @@ from __future__ import annotations
 
 import codecs
 import re
-from collections.abc import Callable, Mapping
-from typing import Final
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from importlib import import_module
+from io import BytesIO
+from types import ModuleType
+from typing import Any, Final
 
 from bs4 import BeautifulSoup
 
@@ -83,6 +90,15 @@ _HORIZONTAL_RUNS: Final = re.compile(r"[ \t]{2,}")
 MISSING_PACKAGES: Final[Mapping[DocumentKind, str]] = {
     "pdf": "pypdf",
     "docx": "python-docx",
+}
+
+#: The module each format is imported as. Deliberately a SECOND table rather than a
+#: reuse of :data:`MISSING_PACKAGES`: ``python-docx`` installs under one name and
+#: imports under another (``docx``), and conflating the two produces the worst
+#: possible message -- "install python-docx" on a machine where it is installed.
+IMPORT_NAMES: Final[Mapping[DocumentKind, str]] = {
+    "pdf": "pypdf",
+    "docx": "docx",
 }
 
 #: Note attached to a ``no_text`` result. Names OCR explicitly, because the UI's
@@ -243,27 +259,137 @@ def extract_html(data: bytes, filename: str | None = None) -> ExtractionResult:
     return finalise_extraction(text, kind="html", filename=filename, encoding=codec)
 
 
-def extract_pdf(data: bytes, filename: str | None = None) -> ExtractionResult:
-    """Not implemented: ``pypdf`` is not installed.
+def _require(kind: DocumentKind) -> ModuleType:
+    """Import the library this format needs, or raise naming the package to install.
 
-    When it is, the body becomes "read every page's text, join with a blank line,
-    return through :func:`finalise_extraction`" -- and the scanned-PDF case is
-    already handled, because a scan produces an empty string and the finaliser
-    turns that into ``no_text`` with an OCR hint.
+    **Imported lazily, and through ``importlib`` rather than a plain ``import``.**
+    Both halves of that are deliberate:
+
+    * *Lazily*, because ``pypdf`` and ``python-docx`` are phase-gated in
+      pyproject.toml. A module-level import would make the whole kb engine
+      unimportable -- and with it every other extractor, the chunker, and the
+      service above them -- because one optional dependency is absent.
+    * *Through ``importlib``*, because ``import pypdf`` does not type-check while
+      the package is missing, and the usual remedy is worse than the disease: a
+      ``# type: ignore[import-not-found]`` would itself become an error the day the
+      package IS installed, since ``mypy --strict`` warns on unused ignores. A
+      dynamic import type-checks identically in both states, so this file needs no
+      edit when the dependency lands -- only pyproject.toml does.
+
+    The refusal is an exception rather than an empty result. ``no_text`` means "this
+    file genuinely has no text in it" and sends the user to OCR; returning it for a
+    missing library would produce a document marked unscannable that would have
+    indexed perfectly on a machine with the dependency installed.
     """
-    del data, filename
-    raise ExtractorUnavailableError("pdf", MISSING_PACKAGES["pdf"])
+    try:
+        return import_module(IMPORT_NAMES[kind])
+    except ImportError as exc:
+        # The message names the PACKAGE, not the module: nobody should have to know
+        # that `docx` on the import line is `python-docx` on the install line.
+        raise ExtractorUnavailableError(kind, MISSING_PACKAGES[kind]) from exc
+
+
+def _failed_parse(kind: DocumentKind, filename: str | None, *, reason: str) -> ExtractionResult:
+    """A binary file the library could not read.
+
+    Distinct from :func:`_failed_decode`, which is about text encodings, and
+    distinct from ``no_text``: this file did not parse at all, so OCR is not the
+    answer -- a different export is.
+    """
+    where = f" of {filename!r}" if filename else ""
+    return ExtractionResult(
+        kind=kind,
+        status="failed",
+        text="",
+        note=(
+            f"The contents{where} could not be read as {kind.upper()}: {reason} "
+            "This is not a scanned document, so OCR will not help -- please export "
+            "the file again, or upload it in another format."
+        ),
+    )
+
+
+def extract_pdf(data: bytes, filename: str | None = None) -> ExtractionResult:
+    """Pull the text out of a PDF, one page at a time.
+
+    Pages are joined with a blank line, which is the one structural fact a PDF
+    reliably carries: it keeps the last sentence of page 3 from fusing into the
+    first heading of page 4, and it gives the chunker a boundary it can prefer.
+
+    **The scanned-PDF case needs no code here.** A scan parses perfectly and yields
+    an empty string per page, so it arrives at :func:`finalise_extraction` as empty
+    text and comes back as ``no_text`` with the OCR note -- which is exactly why
+    that decision lives in one function rather than in each extractor.
+    """
+    pypdf = _require("pdf")
+    reader: Any = None
+    try:
+        reader = pypdf.PdfReader(BytesIO(data))
+        # `extract_text()` returns None for a page with no text layer in some pypdf
+        # versions and "" in others; both mean the same thing here.
+        pages = [str(page.extract_text() or "") for page in reader.pages]
+    except Exception as exc:  # a bad upload is a fact about the file, not a crash
+        # An encrypted file is the one parse failure with a different remedy, so it
+        # gets its own sentence. Checked AFTER the attempt, not before: pypdf opens
+        # a file encrypted with an empty owner password on its own, and refusing
+        # those up front would reject documents we can in fact read.
+        if getattr(reader, "is_encrypted", False):
+            return _failed_parse(
+                "pdf",
+                filename,
+                reason="it is password-protected, so its pages cannot be opened.",
+            )
+        return _failed_parse("pdf", filename, reason=f"{type(exc).__name__}: {exc}.")
+
+    return finalise_extraction("\n\n".join(pages), kind="pdf", filename=filename)
+
+
+def _without_consecutive_repeats(values: Iterable[str]) -> Iterator[str]:
+    """Drop each value that equals the one before it.
+
+    python-docx reports a horizontally merged cell once per column it spans, so a
+    two-column row with a merged header comes back as ``["Preise", "Preise"]``.
+    Indexing the repeat would double that phrase's weight in retrieval for no
+    reason.
+    """
+    previous: str | None = None
+    for value in values:
+        if value != previous:
+            yield value
+        previous = value
 
 
 def extract_docx(data: bytes, filename: str | None = None) -> ExtractionResult:
-    """Not implemented: ``python-docx`` is not installed.
+    """Pull the text out of a Word document: paragraphs AND tables.
 
-    When it is: paragraphs plus table cells, joined with a blank line, returned
-    through :func:`finalise_extraction`. Tables matter -- a price list in a Word
-    document is almost always a table.
+    **Tables are not optional.** A price list, an opening-hours grid and a service
+    matrix in a ``.docx`` are almost always tables, and those are the passages a
+    diner-facing question actually needs. python-docx's ``document.paragraphs``
+    excludes anything inside a table, so a paragraphs-only implementation would
+    silently drop the most valuable page of a price list and report ``ok``.
+
+    Cells are joined with ``" | "`` so a row stays one retrievable line with its
+    pairing intact: ``"Notdienst | 89,00 EUR"`` answers a question that
+    ``"Notdienst"`` followed by ``"89,00 EUR"`` on separate lines does not.
     """
-    del data, filename
-    raise ExtractorUnavailableError("docx", MISSING_PACKAGES["docx"])
+    docx = _require("docx")
+    try:
+        document = docx.Document(BytesIO(data))
+        blocks: list[str] = ["\n".join(str(p.text) for p in document.paragraphs)]
+        for table in document.tables:
+            rows: list[str] = []
+            for row in table.rows:
+                cells = _without_consecutive_repeats(str(cell.text).strip() for cell in row.cells)
+                line = " | ".join(cell for cell in cells if cell)
+                if line:
+                    rows.append(line)
+            if rows:
+                blocks.append("\n".join(rows))
+    except Exception as exc:  # a bad upload is a fact about the file, not a crash
+        return _failed_parse("docx", filename, reason=f"{type(exc).__name__}: {exc}.")
+
+    text = "\n\n".join(block for block in blocks if block.strip())
+    return finalise_extraction(text, kind="docx", filename=filename)
 
 
 #: The registry. Adding a format is one entry plus one function, and the function

@@ -188,3 +188,62 @@ async def test_business_b_cannot_update_or_delete_business_a(
         )
     ).one_or_none()
     assert row is not None and row.filename == "original.pdf"
+
+
+async def test_an_emptied_tenant_guc_yields_zero_rows_not_an_error(
+    app_engine: AsyncEngine, two_businesses: tuple[UUID, UUID], owner_session: AsyncSession
+) -> None:
+    """The recycled-connection case, which is how this bug actually reaches production.
+
+    `set_config(..., true)` is transaction-local, so at COMMIT the GUC is not unset — it
+    becomes the EMPTY STRING. A policy that casts it directly (`''::uuid`) raises
+    `invalid input syntax for type uuid`, so the first unscoped query on a pooled
+    connection that previously served a scoped transaction returns a 500 rather than
+    zero rows.
+
+    Three reasons that is worse than it sounds: it only happens on a REUSED connection,
+    so it is load-dependent and absent from a fresh run; it surfaces as a database error
+    rather than an authorisation result, so it reads like an outage; and it inverts the
+    intended failure direction — the whole point of these policies is that forgetting to
+    scope shows nothing, safely.
+    """
+    business_a, _ = two_businesses
+    await owner_session.execute(
+        text(
+            "INSERT INTO documents (id, business_id, filename, kind, status, chunk_count) "
+            "VALUES (:id, :b, 'a.pdf', 'pdf', 'indexed', 1)"
+        ),
+        {"id": uuid4(), "b": business_a},
+    )
+    await owner_session.commit()
+
+    factory = async_sessionmaker(app_engine, expire_on_commit=False)
+    async with factory() as s:
+        # Scope, then end the transaction — which empties the GUC rather than unsetting it.
+        async with s.begin():
+            await s.execute(
+                text("SELECT set_config('app.current_business_id', :bid, true)"),
+                {"bid": str(business_a)},
+            )
+            scoped = (await s.execute(text("SELECT count(*) FROM documents"))).scalar_one()
+        assert scoped == 1, "the scoped read should see the row"
+
+        # Same connection, now unscoped. This must be 0, not an exception.
+        after = (await s.execute(text("SELECT count(*) FROM documents"))).scalar_one()
+
+    assert after == 0, "an emptied tenant GUC must yield zero rows"
+
+
+async def test_every_tenant_policy_is_null_safe(app_engine: AsyncEngine) -> None:
+    """Guard the guard: a new table added with the naive cast reintroduces the bug, and
+    the failure would only appear under connection reuse."""
+    async with app_engine.connect() as conn:
+        rows = await conn.execute(
+            text("SELECT tablename, qual FROM pg_policies WHERE schemaname = 'public'")
+        )
+        unsafe = [t for t, qual in rows if "nullif" not in (qual or "").lower()]
+
+    assert not unsafe, (
+        f"these policies cast the tenant GUC without NULLIF, so an emptied GUC raises "
+        f"instead of returning zero rows: {sorted(unsafe)}"
+    )

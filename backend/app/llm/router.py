@@ -46,6 +46,7 @@ from backend.app.llm.contract import (
 )
 from backend.app.llm.fake_provider import FakeProvider
 from backend.app.llm.pricing import compute_usd, conservative_token_estimate
+from backend.app.obs import Tracer, get_tracer, llm_span_fields
 
 OPENROUTER_KEY_ENV: Final = "OPENROUTER_API_KEY"
 ANTHROPIC_KEY_ENV: Final = "ANTHROPIC_API_KEY"
@@ -236,6 +237,7 @@ class ModelRouter:
         task_tiers: Mapping[TaskClass, ModelTier] | None = None,
         default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         resolver: object | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         """Build a router.
 
@@ -260,6 +262,10 @@ class ModelRouter:
         self._task_tiers = task_tiers if task_tiers is not None else TASK_TIERS
         self._default_max_tokens = default_max_tokens
         self._resolver = resolver
+        # No credentials means a genuinely free no-op tracer, same posture as every
+        # other provider here. Redaction lives inside the tracer, so no call site can
+        # leak prompt text by forgetting.
+        self._tracer = tracer if tracer is not None else get_tracer(env)
 
     @property
     def providers(self) -> Mapping[str, Provider]:
@@ -384,6 +390,7 @@ class ModelRouter:
         budget: BudgetState | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        trace: Mapping[str, str] | None = None,
     ) -> Completion:
         """Run `task` against its chain, falling back on retryable failures.
 
@@ -426,6 +433,28 @@ class ModelRouter:
 
             if budget is not None:
                 budget.record(completion.usage)
+
+            # Traced AFTER the cost is booked, so the span reports what was actually
+            # charged rather than an estimate. `attempt` matters: a call that succeeded
+            # on the second entry of the chain looks identical to a first-try success
+            # without it, and "why is this slow" is usually a silent fallback.
+            context = trace or {}
+            with self._tracer.span(
+                "llm.complete",
+                **llm_span_fields(
+                    run_id=context.get("run_id", ""),
+                    business_id=context.get("business_id", ""),
+                    node=context.get("node", task.value),
+                    prompt_version=context.get("prompt_version", ""),
+                    usage=completion.usage,
+                    outcome="ok",
+                    task=task.value,
+                    tier=route.tier.value,
+                    attempt=len(failures) + 1,
+                ),
+            ):
+                pass
+
             return completion
 
         raise AllProvidersFailedError(task.value, failures)

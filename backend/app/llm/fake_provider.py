@@ -91,8 +91,31 @@ def _placeholder_for(schema: Mapping[str, Any], seed: str) -> Any:
         case "boolean":
             return True
         case "array":
-            return []
+            # ONE element, not an empty list.
+            #
+            # An empty array is schema-valid and useless: any tool whose payload is a
+            # list is silently defeated by it. The knowledge-base grader is exactly
+            # that shape — it returns `grades: [...]`, so an empty list made every
+            # retrieved passage read as ungraded, retrieval always reported
+            # "insufficient", and the whole RAG path was unexercisable without a paid
+            # key. Found by the eval harness reporting an identical score for
+            # RAG-on and RAG-off.
+            items = schema.get("items")
+            if isinstance(items, dict):
+                return [_placeholder_for(items, f"{seed}-0")]
+            return [f"fake-{seed}-0"]
         case "object":
+            # Recurse into the declared properties. An empty object has the same defect
+            # as an empty array one level down: schema-valid, and useless to any caller
+            # that reads a field out of it.
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                return {
+                    name: _placeholder_for(prop, f"{seed}-{name}")
+                    if isinstance(prop, dict)
+                    else f"fake-{seed}-{name}"
+                    for name, prop in properties.items()
+                }
             return {}
         case _:
             return f"fake-{seed}"

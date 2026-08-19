@@ -79,6 +79,13 @@ class NodeDeps:
     #: Agentic retrieval over the business's own documents. None = no knowledge base
     #: configured yet, which is a normal state, not an error.
     retrieve: Callable[..., Awaitable[Any]] | None = None
+    #: Long-term business memory, already rendered as prompt lines.
+    #:
+    #: A callable rather than a session, so the nodes stay database-free and the tests
+    #: stay hermetic. Read at INTAKE and carried in state for the whole run: reading it
+    #: per node would let a mid-run edit change the brief halfway through, and produce a
+    #: page written to two different sets of rules.
+    load_memory: Callable[[], Awaitable[list[str]]] | None = None
     channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
 
 
@@ -144,7 +151,20 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 "fact_gaps": [*state["fact_gaps"], "business profile"],
             }
         surfaces = state["surfaces"] or ["google"]
-        return {"surfaces": surfaces}
+        updates: dict[str, Any] = {"surfaces": surfaces}
+
+        # Memory is loaded here and nowhere else. Before this, `state["remembered"]` was
+        # threaded into the system prompt correctly but nothing ever populated it, so a
+        # remembered preference reached no model — the feature existed on both sides of a
+        # gap with nothing across it.
+        if deps.load_memory:
+            try:
+                updates["remembered"] = await deps.load_memory()
+            except Exception as exc:  # broad on purpose: memory is an enhancement
+                logger.warning("intake: could not load memory: %s", exc)
+                updates["fact_gaps"] = [*state["fact_gaps"], "remembered preferences"]
+
+        return updates
 
     async def harvest(state: AgentState) -> dict[str, Any]:
         """Gather evidence from the engines. Engines only — no model, ever.

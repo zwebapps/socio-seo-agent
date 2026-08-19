@@ -5,7 +5,6 @@ resumed from a sequence number forces a client that lost its connection to repla
 whole run, and a stream that never terminates leaks a connection per reload.
 """
 
-from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -73,11 +72,13 @@ async def test_the_event_stream_replays_from_a_sequence_number() -> None:
         await service.record_event(run.id, node=f"N{i}", status="done")
     await service.finish(run.id, outcome="done")
 
-    async with _client(service) as client:
-        async with client.stream("GET", f"/api/v1/runs/{run.id}/events?after=2") as response:
-            assert response.status_code == 200
-            assert response.headers["content-type"].startswith("text/event-stream")
-            body = "".join([chunk async for chunk in response.aiter_text()])
+    async with (
+        _client(service) as client,
+        client.stream("GET", f"/api/v1/runs/{run.id}/events?after=2") as response,
+    ):
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = "".join([chunk async for chunk in response.aiter_text()])
 
     assert "N2" in body and "N3" in body
     assert "N0" not in body, "events before `after` should not be replayed"
@@ -90,9 +91,11 @@ async def test_the_stream_terminates_when_the_run_is_finished() -> None:
     await service.record_event(run.id, node="REVIEW", status="done")
     await service.await_approval(run.id)
 
-    async with _client(service) as client:
-        async with client.stream("GET", f"/api/v1/runs/{run.id}/events") as response:
-            body = "".join([chunk async for chunk in response.aiter_text()])
+    async with (
+        _client(service) as client,
+        client.stream("GET", f"/api/v1/runs/{run.id}/events") as response,
+    ):
+        body = "".join([chunk async for chunk in response.aiter_text()])
 
     assert "awaiting_approval" in body
     assert body.rstrip().endswith("data: {}") or "event: end" in body
