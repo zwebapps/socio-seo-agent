@@ -192,3 +192,38 @@ async def test_the_app_role_still_reads_nothing_unscoped(
         blind = await conn.execute(text("SELECT count(*) FROM runs WHERE id = :i"), {"i": run.id})
 
     assert blind.scalar() == 0
+
+
+async def test_a_reason_longer_than_the_column_still_records_the_terminal_state(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The bug, against the database that actually raises.
+
+    `runs.finished_reason` is VARCHAR(255). A provider failure produced a reason of
+    about 700 characters -- an `AllProvidersFailedError` naming two refused models with
+    their 404 bodies -- so the UPDATE raised `StringDataRightTruncationError` and
+    `finish` failed. The executor's handler then tried to record THAT exception as the
+    reason, which was longer still and failed identically, leaving the run saying
+    `running` forever: indistinguishable from one still working.
+
+    This assertion cannot be made against `InMemoryRunStore`, which is a dict and
+    accepts any length. It is the same lesson as the rest of this file: a guard about a
+    database constraint has to be tested against the database.
+    """
+    from backend.app.services.run_service import MAX_FINISHED_REASON, RunService
+
+    store = PostgresRunStore(business_a)
+    service = RunService(store)
+    run = await store.create(_run(business_a))
+
+    long_reason = "Opportunity selection could not run. Cause: " + ("y" * 900)
+    await service.finish(run.id, outcome="partial", reason=long_reason)
+
+    finished = await store.get(run.id)
+    assert finished is not None
+    assert finished.state == "partial", "the terminal state must be written regardless"
+    assert finished.finished_reason is not None
+    assert len(finished.finished_reason) <= MAX_FINISHED_REASON
+    assert finished.finished_reason.startswith("Opportunity selection could not run"), (
+        "the human sentence is written first precisely so it survives truncation"
+    )

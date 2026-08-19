@@ -17,7 +17,12 @@ import pytest
 from backend.app.agents.nodes import NodeDeps
 from backend.app.services import run_executor as executor_module
 from backend.app.services.run_executor import EXECUTOR_NODE, RunExecutor, summarise_crawl
-from backend.app.services.run_service import InMemoryRunStore, RunService
+from backend.app.services.run_service import (
+    MAX_FINISHED_REASON,
+    InMemoryRunStore,
+    RunService,
+    clamp_reason,
+)
 
 BUSINESS = UUID("11111111-1111-4111-8111-111111111111")
 
@@ -43,6 +48,7 @@ class _Graph:
         self.outcome = outcome
         self.raises = raises
         self.visited = visited or ["INTAKE"]
+        self.reason: str | None = None
         self.calls: list[dict[str, Any]] = []
 
     async def __call__(
@@ -68,6 +74,8 @@ class _Graph:
             raise self.raises
         state["outcome"] = self.outcome
         state["visited"] = self.visited
+        if self.reason is not None:
+            state["finished_reason"] = self.reason
         return type("Result", (), {"state": state, "interrupted": self.interrupted})()
 
 
@@ -573,3 +581,31 @@ async def test_the_router_gets_the_recorders_sink(
 
     assert len(seen) == 1
     assert seen[0] == _SpyRecorder.instances[0].sink, "the sink must be the recorder's"
+
+
+# --------------------------------------------------------------------------- #
+# A long reason must not strand the run
+# --------------------------------------------------------------------------- #
+
+
+def test_a_reason_longer_than_the_column_is_clamped() -> None:
+    """`runs.finished_reason` is VARCHAR(255); exceeding it makes the UPDATE raise."""
+    clamped = clamp_reason("x" * 900)
+
+    assert clamped is not None
+    assert len(clamped) <= MAX_FINISHED_REASON
+    assert clamped.endswith("..."), "a reader must be able to tell it was cut"
+
+
+def test_a_short_reason_is_left_exactly_as_written() -> None:
+    """No cosmetic rewriting of a message that already fits."""
+    assert clamp_reason("No opportunity met the bar for this business.") == (
+        "No opportunity met the bar for this business."
+    )
+    assert clamp_reason(None) is None
+
+
+# The end-to-end version of this lives in `tests/db/test_run_store.py`, deliberately.
+# `InMemoryRunStore` is a dict with no column width, so a test here passes whether or not
+# the reason is clamped -- it cannot fail for its own reason. Only real Postgres raises
+# `StringDataRightTruncationError`, which is the failure being guarded against.

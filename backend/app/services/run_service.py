@@ -20,7 +20,7 @@ import json
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -141,6 +141,27 @@ def _clean_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
     return kept
 
 
+#: Matches `runs.finished_reason` (VARCHAR(255)). Not a style choice -- exceeding it
+#: makes the UPDATE raise, which strands the run in `running`.
+MAX_FINISHED_REASON: Final = 255
+
+#: Marks a clamped reason, so a reader can tell a truncated message from a terse one.
+_TRUNCATION_MARK: Final = " ..."
+
+
+def clamp_reason(reason: str | None) -> str | None:
+    """Fit a reason into the column, marking it when something was cut.
+
+    Keeps the HEAD, because every reason in this codebase is written with the
+    human-readable sentence first and the machine detail after -- so what survives
+    truncation is the part somebody reads.
+    """
+    if reason is None or len(reason) <= MAX_FINISHED_REASON:
+        return reason
+    keep = MAX_FINISHED_REASON - len(_TRUNCATION_MARK)
+    return reason[:keep].rstrip() + _TRUNCATION_MARK
+
+
 class RunService:
     """The lifecycle of a run: start, record, checkpoint, finish."""
 
@@ -216,9 +237,23 @@ class RunService:
         await self._store.update(run)
 
     async def finish(self, run_id: UUID, *, outcome: RunState, reason: str | None = None) -> None:
+        """Write the terminal state. The reason is CLAMPED to the column width.
+
+        Found the hard way. `runs.finished_reason` is VARCHAR(255), and a reason that
+        embeds a provider error can be far longer -- an `AllProvidersFailedError` naming
+        two refused models with their 404 bodies is about 700 characters. The UPDATE
+        raised `StringDataRightTruncationError`, so `finish` failed; the executor's
+        failure handler then tried to record THAT exception as the reason, which was
+        longer still and failed the same way. The run was left saying `running` forever.
+
+        Clamping here rather than at each call site because every caller has the same
+        problem and only this one knows the column: a caller that composes a reason from
+        an exception cannot know how long the exception will be. Truncating a message is
+        a cosmetic loss; failing to record a terminal state strands the run.
+        """
         run = await self._require(run_id)
         run.state = outcome
-        run.finished_reason = reason
+        run.finished_reason = clamp_reason(reason)
         await self._store.update(run)
 
     async def mark_resumed(self, run_id: UUID) -> None:
@@ -237,6 +272,7 @@ class RunService:
 
 __all__ = [
     "ALLOWED_PAYLOAD_KEYS",
+    "MAX_FINISHED_REASON",
     "EventStatus",
     "InMemoryRunStore",
     "RunEventRecord",
@@ -244,4 +280,5 @@ __all__ = [
     "RunService",
     "RunState",
     "RunStore",
+    "clamp_reason",
 ]

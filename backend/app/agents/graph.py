@@ -231,11 +231,17 @@ async def run_graph(
                             # work and are returned. Not `done` either -- nothing was
                             # decided, so the run did not do what it set out to do.
                             "outcome": "partial",
+                            # The human sentence FIRST and the provider detail last,
+                            # because this string is clamped to the column width
+                            # (`run_service.clamp_reason`) and a provider error can be
+                            # hundreds of characters. Ordered this way, truncation costs
+                            # the machine detail; ordered the other way it would cut the
+                            # clarification that is the whole point of this branch.
                             "finished_reason": (
                                 "Opportunity selection could not run, so no topic was "
-                                f"chosen: {failure}. This is a failure to look, NOT a "
-                                "finding that nothing was worth writing about. The audit "
-                                "findings gathered before it are returned."
+                                "chosen. This is a failure to look, NOT a finding that "
+                                "nothing was worth writing about; the audit findings "
+                                f"gathered before it are returned. Cause: {failure}"
                             ),
                         },
                         interrupted=False,

@@ -290,6 +290,11 @@ class RunExecutor:
                 # looks, which is indistinguishable from a run that is merely slow.
                 logger.exception("run %s failed", run_id)
                 try:
+                    # Type first, message after: `finish` clamps to the column width,
+                    # and the exception CLASS is the part worth keeping when a message
+                    # runs long. This path previously handed an unbounded exception
+                    # string to a VARCHAR(255) column, so the attempt to record a
+                    # failure failed too and the run stayed `running`.
                     await service.finish(
                         run_id, outcome="failed", reason=f"{type(exc).__name__}: {exc}"
                     )
