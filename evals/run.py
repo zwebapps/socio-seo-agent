@@ -51,7 +51,7 @@ import hashlib
 import math
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -99,6 +99,13 @@ from evals.rubric import (
 # --------------------------------------------------------------------------- #
 
 DEFAULT_REPORT_PATH: Final = Path("evals/report.md")
+
+#: A prompt builder: a case and its retrieved passages in, one user message out.
+PromptBuilder = Callable[[EvalCase, Mapping[str, str] | None], str]
+
+#: Declared here rather than beside `PROMPT_BUILDERS`, because `RunConfig` needs it
+#: as a field default and that class is defined first.
+DEFAULT_PROMPT_VERSION: Final = "v2"
 
 #: Per-case ceiling. The product's own cap is $0.50 per run
 #: (docs/AGENT_RUNTIME.md section 8), and a case is one run's worth of work.
@@ -154,6 +161,10 @@ class RunConfig:
     #: Whatever it is set to, the report header names the tier and the models that
     #: actually served, so a cheap-tier run can never be read as a strong-tier one.
     tier: ModelTier | None = None
+    #: Which generation prompt to run. See `PROMPT_BUILDERS`; `v1` is kept
+    #: executable so the improvement over it can be re-measured on demand rather
+    #: than taken on trust.
+    prompt_version: str = DEFAULT_PROMPT_VERSION
 
     @property
     def env(self) -> Mapping[str, str] | None:
@@ -450,7 +461,62 @@ def _format_rules(channel: str, limits: ChannelLimits) -> str:
     return f"Format rules for {channel}:\n" + "\n".join(f"- {rule}" for rule in rules)
 
 
-def _user_prompt(case: EvalCase, passages: Mapping[str, str] | None) -> str:
+def _user_prompt_v1(case: EvalCase, passages: Mapping[str, str] | None) -> str:
+    """The ORIGINAL prompt, kept so the improvement can be re-measured, not asserted.
+
+    Preserved verbatim rather than described. Its three defects are the subject of
+    the comparison and every one of them was found by running it:
+
+    * the channel line names only a MAXIMUM length, so the rubric's 2,500-character
+      floor on `blog_article` was a requirement the model was never given;
+    * an empty hashtag range renders as ``0-0 hashtags``, which reads like a
+      formatting artefact rather than a prohibition;
+    * nothing tells the model that ``[chunk:plumber-01#0]`` is not a hashtag, so
+      "no hashtags" gives it a reason to strip the ``#0`` off a citation.
+
+    Keeping it executable is the point: `--prompt-version v1` reproduces the old
+    numbers on demand, so "v2 is better" stays a measurement instead of a claim in a
+    commit message. And it earned that immediately, by SHRINKING the credit the prompt
+    change deserves. Three live runs, `--tier cheap` on `gpt-4.1-mini`, `rag_on` mean:
+
+        v1, before the rubric was fixed .................. 0.67   (format 0.35)
+        v1, after  the rubric was fixed .................. 0.81   (format 0.94)
+        v2, after  the rubric was fixed .................. 0.84   (format 1.00)
+
+    So of the 0.17 total, **0.14 was the measurement bug** (citation markers counted
+    as hashtags, which penalised the RAG arm for citing) and **0.03 was this prompt**.
+    Without a runnable v1 the whole 0.17 would have been attributed to the prompt
+    rewrite, which would have been flattering and wrong.
+
+    The prompt's 0.03 is real and is exactly where it was aimed: `format` 0.94 -> 1.00
+    (the length floor, which v1 never states), `brand` 0.95 -> 1.00, and `grounding`
+    0.38 -> 0.41. Note also that hashtag enforcement made ZERO corrections under BOTH
+    prompts -- the model was never actually breaching a hashtag cap, so that engine is
+    currently insurance rather than load-bearing.
+    """
+    limits = CHANNEL_LIMITS[case.channel]
+    parts = [
+        f"Business: {case.business.name}, {case.business.vertical} in "
+        f"{case.business.city}. Services: {', '.join(case.business.services)}.",
+        f"Channel: {case.channel} (max {limits.max_chars} characters, "
+        f"{limits.hashtags_min}-{limits.hashtags_max} hashtags, "
+        f"{'links allowed' if limits.link_in_body else 'NO clickable link in the body'}).",
+        f"Target keyword: {case.target_keyword}.",
+        f"Brief: {case.brief}",
+        f"Must mention: {', '.join(case.must_contain)}.",
+        f"Never claim: {', '.join(case.banned_claims)}.",
+    ]
+    if passages is None:
+        parts.append("You have no source documents. Do not state any figure you cannot support.")
+    else:
+        parts.append(
+            "Source passages. Cite the id in square brackets after any figure you "
+            "take from one, exactly as shown:\n" + _grounded_block(passages)
+        )
+    return "\n\n".join(parts)
+
+
+def _user_prompt_v2(case: EvalCase, passages: Mapping[str, str] | None) -> str:
     limits = CHANNEL_LIMITS[case.channel]
     rules = _format_rules(case.channel, limits)
     parts = [
@@ -493,6 +559,23 @@ def _user_prompt(case: EvalCase, passages: Mapping[str, str] | None) -> str:
     return "\n\n".join(parts)
 
 
+#: The selectable prompt variants. A dict rather than an if/else so adding v3 is a
+#: line here and nothing else, and so `--prompt-version` can list them itself.
+PROMPT_BUILDERS: Final[Mapping[str, PromptBuilder]] = {
+    "v1": _user_prompt_v1,
+    "v2": _user_prompt_v2,
+}
+
+
+#: What each variant reports as its trace label. The RAG arm of v2 is tagged v3
+#: because it went through an intermediate form that fixed `format` by destroying
+#: `grounding` -- see the note in `_user_prompt_v2`.
+_PROMPT_LABELS: Final[Mapping[str, tuple[str, str]]] = {
+    "v1": ("eval.generate.v1", "eval.generate.rag.v1"),
+    "v2": (PROMPT_VERSION_RAG_OFF, PROMPT_VERSION_RAG_ON),
+}
+
+
 def _enforce_channel_format(case: EvalCase, text: str) -> HashtagEnforcement:
     """Apply the deterministic channel rules the product would apply before publishing.
 
@@ -528,6 +611,7 @@ async def _generate(
     budget: BudgetState,
     passages: Mapping[str, str] | None,
     prompt_version: str,
+    build_prompt: PromptBuilder,
 ) -> tuple[str, str, int, int, Decimal]:
     """One GENERATE call, traced. Returns ``(text, model, in, out, usd)``.
 
@@ -537,7 +621,7 @@ async def _generate(
     """
     messages = [
         Message(role=Role.SYSTEM, content=_SYSTEM),
-        Message(role=Role.USER, content=_user_prompt(case, passages)),
+        Message(role=Role.USER, content=build_prompt(case, passages)),
     ]
 
     with tracer.span("evals.generate", run_id=case.case_id, node="GENERATE") as span:
@@ -673,7 +757,8 @@ async def run_case(
         tracer=tracer,
         budget=off_budget,
         passages=None,
-        prompt_version=PROMPT_VERSION_RAG_OFF,
+        prompt_version=_PROMPT_LABELS[config.prompt_version][0],
+        build_prompt=PROMPT_BUILDERS[config.prompt_version],
     )
     off_enforced = _enforce_channel_format(case, off_text)
     off_text = off_enforced.text
@@ -740,7 +825,8 @@ async def run_case(
         tracer=tracer,
         budget=on_budget,
         passages=retrieved,
-        prompt_version=PROMPT_VERSION_RAG_ON,
+        prompt_version=_PROMPT_LABELS[config.prompt_version][1],
+        build_prompt=PROMPT_BUILDERS[config.prompt_version],
     )
     on_enforced = _enforce_channel_format(case, on_text)
     on_text = on_enforced.text
@@ -878,6 +964,10 @@ def render_report(
         "reserved and rendered empty; no value is estimated from the deterministic "
         "scores, because a faithfulness number that is really a rubric average would "
         "be a fabrication.",
+        f"- **Generation prompt:** `{config.prompt_version}` "
+        f"({', '.join(f'`{label}`' for label in _PROMPT_LABELS[config.prompt_version])}). "
+        "Rerun with `--prompt-version v1` to reproduce the original numbers; v1 is kept "
+        "executable so a prompt improvement stays a measurement rather than a claim.",
         f"- **Cases:** {len(rows)} of {len(CASES)} in the eval set.",
         "- **Scoring:** deterministic (`evals/rubric.py`). No model is used as a judge.",
         "",
@@ -1169,6 +1259,16 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
             "strong chain. The report header names the tier either way."
         ),
     )
+    parser.add_argument(
+        "--prompt-version",
+        choices=sorted(PROMPT_BUILDERS),
+        default=DEFAULT_PROMPT_VERSION,
+        help=(
+            "which generation prompt to run. v1 is the original, kept executable so "
+            "the improvement over it can be re-measured rather than trusted. The "
+            "report header names whichever was used."
+        ),
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_REPORT_PATH, help="report path")
     parser.add_argument(
         "--case",
@@ -1183,6 +1283,7 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         out_path=parsed.out,
         only=tuple(parsed.case),
         tier=None if parsed.tier is None else ModelTier(parsed.tier),
+        prompt_version=str(parsed.prompt_version),
     )
 
 

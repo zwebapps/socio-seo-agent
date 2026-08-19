@@ -238,7 +238,11 @@ async def seeded(owner_engine: AsyncEngine) -> AsyncIterator[tuple[User, UUID, U
             {"id": user_id, "email": f"{EMAIL_PREFIX}{user_id.hex}@example.test"},
         )
         await s.execute(
-            text("INSERT INTO businesses (id, owner_id, name, locale) VALUES (:id, :o, :n, 'de')"),
+            text(
+                "INSERT INTO businesses (id, owner_id, name, slug, locale) VALUES "
+                "(:id, :o, :n, 'fixture-' || "
+                "left(replace(cast(gen_random_uuid() AS text), '-', ''), 12), 'de')"
+            ),
             {"id": business_id, "o": user_id, "n": "fbapi business"},
         )
         await s.execute(

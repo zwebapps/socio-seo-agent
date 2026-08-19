@@ -62,6 +62,7 @@ from backend.app.core.security import (
     verify_password_bounded,
 )
 from backend.app.db.models import Business, User
+from backend.app.services.slugs import business_slug, suffixed_slug
 
 # --------------------------------------------------------------------------- #
 # Errors -- typed, so the route layer maps them to status codes without guessing
@@ -190,6 +191,21 @@ def validate_password(password: str) -> None:
         raise WeakPasswordError("That password is one of the most commonly guessed ones.")
 
 
+def _is_slug_conflict(exc: IntegrityError) -> bool:
+    """Whether this unique violation is the slug one specifically.
+
+    The signup insert can violate two unique constraints -- the user's email and
+    the business's slug -- and they mean opposite things: one is "that account
+    exists" (a 409 the caller must see) and the other is "that name is taken" (an
+    internal detail the caller must never see, because a second customer called
+    Müller is entitled to sign up). Matching on the constraint name is what keeps
+    the retry below from swallowing a genuine duplicate-email.
+    """
+    if getattr(exc.orig, "sqlstate", None) != "23505":
+        return False
+    return "uq_businesses_slug" in str(getattr(exc.orig, "constraint_name", "") or str(exc.orig))
+
+
 def _clean_business_name(raw: str) -> str:
     name = raw.strip()
     if not name:
@@ -238,7 +254,10 @@ async def signup(
     # signup route is the same memory-amplification DoS as an unthrottled login.
     password_hash = await hash_password_bounded(password)
     user = User(id=uuid4(), email=normalised, password_hash=password_hash, is_active=True)
-    business = Business(id=uuid4(), owner_id=user.id, name=name)
+    business_id = uuid4()
+    business = Business(
+        id=business_id, owner_id=user.id, name=name, slug=business_slug(name, business_id)
+    )
 
     session.add(user)
     session.add(business)
@@ -246,6 +265,24 @@ async def signup(
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
+        if _is_slug_conflict(exc):
+            # Two customers with the same name is ordinary, not an error: the second
+            # one gets the suffixed form. Retried here rather than pre-checked with a
+            # SELECT, because that check is racy and this one is decided by the
+            # database. Once, not in a loop -- the suffix comes from the business's
+            # own UUID, so a second collision would mean a repeated UUID, and
+            # retrying that forever would hang the request instead of reporting it.
+            session.add(user)
+            session.add(
+                Business(
+                    id=business_id,
+                    owner_id=user.id,
+                    name=name,
+                    slug=suffixed_slug(name, business_id),
+                )
+            )
+            await session.commit()
+            return SignupResult(user_id=user.id, business_id=business_id, email=normalised)
         if getattr(exc.orig, "sqlstate", None) == "23505":
             # Neutral on purpose: it does not name the address, and it does not
             # say whose account it is. See the module docstring -- this still

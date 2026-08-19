@@ -94,6 +94,7 @@ from backend.app.services.link_service import (
 )
 
 __all__ = [
+    "BusinessHandle",
     "CodeExhaustionError",
     "FormTarget",
     "HubCta",
@@ -121,6 +122,20 @@ HUB_VISIBLE_STATUSES: Final = ("approved", "published")
 #: Default page size for :meth:`PostgresLeadStore.list_leads`.
 DEFAULT_LEAD_LIMIT: Final = 100
 MAX_LEAD_LIMIT: Final = 500
+
+
+@dataclass(frozen=True, slots=True)
+class BusinessHandle:
+    """A business identified from its public hub address.
+
+    Carries the ``slug`` as well as the id so the caller can redirect a UUID
+    request to the canonical readable address instead of serving two URLs for one
+    page forever.
+    """
+
+    id: UUID
+    name: str
+    slug: str
 
 
 class LeadStoreError(Exception):
@@ -311,6 +326,23 @@ _BUSINESS_FOR_OWNER = text(
 )
 
 _BUSINESS_NAME = text("SELECT name FROM businesses WHERE id = :business_id")
+
+#: The hub's lookup: a slug OR the UUID that used to be the only address.
+#:
+#: One statement rather than two round-trips, and an indexed equality on each side
+#: -- ``id`` is the primary key and ``slug`` is UNIQUE -- so this is not the
+#: full-table scan that the "derive it from the name at read time" idea would have
+#: needed. The UUID cast is guarded by the caller: a handle that does not parse as a
+#: UUID arrives as NULL, because ``'not-a-uuid'::uuid`` raises rather than returning
+#: no rows.
+_BUSINESS_BY_HANDLE = text(
+    """
+    SELECT id, name, slug
+    FROM businesses
+    WHERE slug = :handle OR id = :maybe_id
+    LIMIT 1
+    """
+)
 
 
 class PostgresLeadStore:
@@ -608,6 +640,35 @@ class PostgresLeadStore:
         async with session() as db:
             row = (await db.execute(_BUSINESS_NAME, {"business_id": business_id})).first()
         return str(row[0]) if row is not None else None
+
+    async def business_by_handle(self, handle: str) -> BusinessHandle | None:
+        """Resolve a hub address -- a slug, or the UUID the hub used to take.
+
+        BOTH forms resolve, permanently. ``/go/{uuid}`` is the address that may
+        already be printed on a flyer or pasted into an Instagram bio, and for
+        Instagram and TikTok the hub IS the conversion path, so retiring that form
+        would silently kill live campaigns. The slug is the address we hand out from
+        now on; the UUID is the one we promised not to break.
+
+        Read on the unscoped session for the same reason as :meth:`business_name`:
+        ``businesses`` is the tenant table itself and carries no RLS policy.
+        """
+        try:
+            maybe_id: UUID | None = UUID(handle)
+        except ValueError:
+            # Not a UUID: search by slug alone. Passed as NULL rather than omitted,
+            # so the statement stays one prepared shape for both cases.
+            maybe_id = None
+
+        async with session() as db:
+            row = (
+                (await db.execute(_BUSINESS_BY_HANDLE, {"handle": handle, "maybe_id": maybe_id}))
+                .mappings()
+                .first()
+            )
+        if row is None:
+            return None
+        return BusinessHandle(id=row["id"], name=str(row["name"]), slug=str(row["slug"]))
 
     async def _assert_link_visible(self, business_id: UUID, link_id: UUID) -> None:
         async with business_session(business_id) as db:

@@ -92,7 +92,11 @@ async def two_businesses(owner_session: AsyncSession) -> AsyncIterator[tuple[UUI
             {"id": user_id, "email": f"{label}-{user_id}@example.test"},
         )
         await owner_session.execute(
-            text("INSERT INTO businesses (id, owner_id, name, locale) VALUES (:id, :o, :n, 'de')"),
+            text(
+                "INSERT INTO businesses (id, owner_id, name, slug, locale) VALUES "
+                "(:id, :o, :n, 'fixture-' || "
+                "left(replace(cast(gen_random_uuid() AS text), '-', ''), 12), 'de')"
+            ),
             {"id": biz_id, "o": user_id, "n": f"business-{label}"},
         )
     await owner_session.commit()

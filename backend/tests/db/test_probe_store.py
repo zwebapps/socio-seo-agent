@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
@@ -367,3 +367,89 @@ async def test_one_business_never_reads_another_businesss_run(
     assert restored is not None
     assert restored.mentions == 1
     assert restored.usable_answers == 1
+
+
+# --------------------------------------------------------------------------- #
+# run_id -- a run says its own name, instead of being inferred from the clock
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_same_run_id_folds_a_retry_onto_the_same_rows(
+    store: PostgresProbeStore, business_a: UUID, prompts: list[GeoPrompt]
+) -> None:
+    """The explicit form of ``test_a_retried_run_does_not_double_count``.
+
+    Same guarantee, but stated by the caller rather than deduced from two writes
+    happening close together.
+    """
+    run = uuid4()
+    outcomes = [answered(prompts[0], mentioned=True), answered(prompts[1]), no_answer(prompts[2])]
+
+    await store.save_outcomes(business_a, outcomes, run_id=run)
+    await store.save_outcomes(business_a, outcomes, run_id=run)
+
+    assert await count_rows(business_a, "geo_results") == 3
+
+
+async def test_two_run_ids_close_together_are_two_runs(
+    store: PostgresProbeStore, business_a: UUID, prompts: list[GeoPrompt]
+) -> None:
+    """The case the timestamp window gets WRONG, and the reason for the column.
+
+    An operator re-probing to investigate a bad result is not retrying the earlier
+    run -- they want a second measurement. Under the six-hour ``RUN_DEDUPE_WINDOW``
+    the second probe silently folded into the first and the new measurement vanished.
+    With distinct run ids it is recorded as what it is.
+
+    Note both saves carry the SAME ``probed_at``, so the only thing separating them
+    is the id. That is deliberate: it isolates the new behaviour from the clock
+    entirely, which is the whole point of the column.
+    """
+    stamp = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    outcomes = [answered(prompts[0], mentioned=True), answered(prompts[1])]
+
+    await store.save_outcomes(business_a, outcomes, probed_at=stamp, run_id=uuid4())
+    await store.save_outcomes(business_a, outcomes, probed_at=stamp, run_id=uuid4())
+
+    assert await count_rows(business_a, "geo_results") == 4, (
+        "two distinct runs must record two sets of rows, even at the same instant"
+    )
+
+
+async def test_omitting_the_run_id_keeps_the_legacy_window_behaviour(
+    store: PostgresProbeStore, business_a: UUID, prompts: list[GeoPrompt]
+) -> None:
+    """Rows written before the migration have no id, so the fallback must still work.
+
+    Without this the heuristic could be deleted, and every pre-migration run would
+    lose the only thing that identifies it.
+    """
+    outcomes = [answered(prompts[0], mentioned=True), answered(prompts[1])]
+
+    await store.save_outcomes(business_a, outcomes)
+    await store.save_outcomes(business_a, outcomes)
+
+    assert await count_rows(business_a, "geo_results") == 2
+
+
+async def test_a_run_id_is_persisted_and_not_silently_dropped(
+    store: PostgresProbeStore, business_a: UUID, prompts: list[GeoPrompt], app_engine: AsyncEngine
+) -> None:
+    """The column has to actually receive the value.
+
+    Asserted directly, because every behavioural test above would also pass if
+    ``run_id`` were accepted by the signature and then thrown away -- the timestamp
+    fallback would carry them.
+    """
+    run = uuid4()
+    await store.save_outcomes(business_a, [answered(prompts[0], mentioned=True)], run_id=run)
+
+    async with app_engine.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.current_business_id', :b, true)"),
+            {"b": str(business_a)},
+        )
+        stored = await conn.execute(text("SELECT DISTINCT run_id FROM geo_results"))
+        values = [row[0] for row in stored]
+
+    assert run in values

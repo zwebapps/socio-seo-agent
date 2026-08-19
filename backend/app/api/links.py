@@ -45,7 +45,12 @@ from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 from starlette.background import BackgroundTask
 
-from backend.app.db.adapters.lead_store import HubCta, PostgresLeadStore, ShortLinkRecord
+from backend.app.db.adapters.lead_store import (
+    BusinessHandle,
+    HubCta,
+    PostgresLeadStore,
+    ShortLinkRecord,
+)
 from backend.app.services.link_service import (
     CODE_ALPHABET,
     MAX_CODE_LENGTH,
@@ -88,6 +93,8 @@ class LinkStore(Protocol):
     async def list_hub_ctas(self, business_id: UUID) -> list[HubCta]: ...
 
     async def business_name(self, business_id: UUID) -> str | None: ...
+
+    async def business_by_handle(self, handle: str) -> BusinessHandle | None: ...
 
 
 def get_store() -> LinkStore:
@@ -248,24 +255,25 @@ async def hub(
 ) -> HubResponse:
     """The public list of a business's active CTAs, each as a tracked short link.
 
-    ``slug`` is the business id today. ``businesses`` has no slug column, and adding
-    one is a migration this module cannot make; deriving a readable slug from the
-    business *name* was rejected instead of deferred, because it is ambiguous the
-    first time two customers share a name and it would need a full-table scan on a
-    public endpoint to resolve.
+    ``slug`` accepts EITHER the readable slug (``/go/mueller-sanitaer-gmbh``, added
+    by migration ``9a4f21c7de83``) or the business UUID, which is the address this
+    route took before the column existed. Both resolve, permanently: the UUID form
+    may already be printed on a flyer or pasted into an Instagram bio, and for
+    Instagram and TikTok this hub IS the conversion path, so retiring it would
+    silently kill live campaigns. One indexed lookup covers both -- the earlier
+    objection to slugs was about deriving one from the *name* at read time, which
+    would have needed a scan; a stored unique column does not.
 
     An empty hub is a 200 with no entries, not a 404: a business that has just
     signed up has no CTAs yet, and a 404 would make a freshly pasted bio link look
     broken.
     """
-    try:
-        business_id = UUID(slug)
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND) from exc
-
-    name = await store.business_name(business_id)
-    if name is None:
+    business = await store.business_by_handle(slug)
+    if business is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=_NOT_FOUND)
+
+    business_id = business.id
+    name = business.name
 
     ctas = await store.list_hub_ctas(business_id)
     response.headers.update(_HUB_CACHE)

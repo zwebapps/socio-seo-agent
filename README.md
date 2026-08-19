@@ -147,6 +147,37 @@ model key placed there would be a published key.
 Full reasoning, including alternatives, is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §14.
 
+## Deploying behind a proxy
+
+**`FORWARDED_ALLOW_IPS` must name your reverse proxy.** This is a requirement, not a
+tuning knob, and getting it wrong fails silently.
+
+The rate limiter and every abuse control key on the client's address. Behind a proxy
+the socket peer *is* the proxy, so the client address has to come from
+`X-Forwarded-For`. uvicorn only trusts that header from an address in
+`--forwarded-allow-ips`, which defaults to `FORWARDED_ALLOW_IPS` in the environment
+or `127.0.0.1`.
+
+That default is right for a proxy sharing the container's network namespace and wrong
+for the usual setup, where the proxy is its own service with its own address. In that
+case the header arrives, is discarded, and **every client on the internet shares one
+rate-limit bucket** — so the first abusive caller locks out everybody. Nothing errors.
+The limiter works; it works against the wrong subject.
+
+```bash
+# the proxy's address, as this container sees it
+FORWARDED_ALLOW_IPS=172.18.0.5
+```
+
+**Do not set it to `*`.** That is the fix that looks easiest and is worse than the
+bug: trusting a forwarded header from any source lets a client claim any address, so
+the limit is not shared, it is *evaded* — by varying one header per request.
+
+`--proxy-headers` is deliberately **not** in the Dockerfile `CMD`: uvicorn 0.52
+already defaults it on, and passing it would suggest it was the missing piece.
+`backend/app/core/proxy_trust.py` detects both misconfigurations at runtime and logs
+what to change.
+
 ## Honest limits
 
 - Deterministic SEO scoring gates drafts; it does not predict rankings.

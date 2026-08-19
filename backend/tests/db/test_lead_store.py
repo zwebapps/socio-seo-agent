@@ -628,3 +628,73 @@ async def test_the_hub_never_shows_another_business_ctas(
 
     assert a_codes == {a_link.code}
     assert b_codes == {b_link.code}
+
+
+# --------------------------------------------------------------------------- #
+# The hub address -- slug and UUID, both forever
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_hub_resolves_a_business_by_its_slug(
+    store: PostgresLeadStore, business_a: UUID, app_engine: AsyncEngine
+) -> None:
+    """The readable address, which is the reason the column exists.
+
+    The slug is made unique per run rather than hard-coded: ``slug`` is UNIQUE across
+    the platform and this database is not truncated between runs, so a fixed literal
+    fails on the second invocation -- against a row left by the first.
+    """
+    slug = f"mueller-sanitaer-{uuid4().hex[:8]}"
+    async with app_engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE businesses SET slug = :s WHERE id = :i"),
+            {"s": slug, "i": business_a},
+        )
+
+    found = await store.business_by_handle(slug)
+
+    assert found is not None
+    assert found.id == business_a
+    assert found.slug == slug
+
+
+async def test_the_hub_still_resolves_the_old_uuid_address(
+    store: PostgresLeadStore, business_a: UUID
+) -> None:
+    """The backward-compatibility guarantee, and it is not a nicety.
+
+    ``/go/{uuid}`` is what the hub took before the slug column existed, so that
+    string may already be printed on a flyer or pasted into an Instagram bio. For
+    Instagram and TikTok -- which have no clickable link of their own -- this hub is
+    the ENTIRE conversion path, so breaking the old form would silently kill live
+    campaigns with no error anywhere.
+    """
+    found = await store.business_by_handle(str(business_a))
+
+    assert found is not None
+    assert found.id == business_a
+    # The canonical readable address comes back too, so a caller can redirect
+    # rather than serve one page at two URLs forever.
+    assert found.slug
+
+
+async def test_an_unknown_handle_resolves_to_none(store: PostgresLeadStore) -> None:
+    """Both shapes of miss: a slug nobody has, and a well-formed but unused UUID."""
+    assert await store.business_by_handle("no-such-business") is None
+    assert await store.business_by_handle(str(uuid4())) is None
+
+
+async def test_a_handle_that_is_not_a_uuid_does_not_error(store: PostgresLeadStore) -> None:
+    """``'not-a-uuid'::uuid`` RAISES in Postgres rather than matching nothing.
+
+    So the UUID branch has to be guarded in Python before the statement runs. Without
+    that, every slug lookup -- the normal case -- would 500 instead of resolving.
+    """
+    assert await store.business_by_handle("definitely-not-a-uuid") is None
+
+
+async def test_a_handle_shaped_like_an_injection_resolves_to_none(
+    store: PostgresLeadStore, business_a: UUID
+) -> None:
+    """The handle is a URL segment, so it is bound, never interpolated."""
+    assert await store.business_by_handle("' OR 1=1 --") is None

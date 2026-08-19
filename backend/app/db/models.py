@@ -100,6 +100,13 @@ class Business(Base, UuidPkMixin, TimestampMixin):
         PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: The readable public address: ``/go/{slug}`` is the Instagram/TikTok bio
+    #: link, and a v4 UUID is not something anyone can say out loud. Unique across
+    #: the platform, because it is a public identifier -- two customers with the
+    #: same name get different slugs (see ``slugify_business_name``).
+    #: No server default on purpose -- see migration ``9a4f21c7de83``. A unique
+    #: public address has no sensible default, so every writer must choose one.
+    slug: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
     website: Mapped[str | None] = mapped_column(String(2048))
     industry: Mapped[str | None] = mapped_column(String(120))
     locale: Mapped[str] = mapped_column(
@@ -456,6 +463,18 @@ class GeoResult(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     )
     error: Mapped[str | None] = mapped_column(Text)
     probed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    #: Which probe run this row belongs to. Nullable because rows written before
+    #: migration ``b5e73c1a8f42`` genuinely have no run identity -- see that
+    #: migration for why one was not invented for them. Not a FK to ``runs``:
+    #: probing is not driven from an agent run, so an FK would refuse a standalone
+    #: probe. ``probed_at`` remains the run's TIME; this is its NAME.
+    run_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+
+    # Declared here, not only in the migration: an index Alembic cannot see is an
+    # index Alembic tries to DROP on the next autogenerate -- the same trap the
+    # HNSW index above documents. Composite with business_id because every read is
+    # tenant-scoped by RLS, so the planner wants both columns together.
+    __table_args__ = (Index("ix_geo_results_business_run", "business_id", "run_id"),)
 
 
 # --------------------------------------------------------------------------- #

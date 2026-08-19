@@ -27,4 +27,24 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"
 
+# --------------------------------------------------------------------------- #
+# Running behind a proxy: FORWARDED_ALLOW_IPS is a DEPLOYMENT REQUIREMENT.
+#
+# `--proxy-headers` is NOT passed because uvicorn 0.52 already defaults it to on;
+# adding it would imply it was the missing piece, and it is not. The missing piece is
+# `--forwarded-allow-ips`, which defaults to FORWARDED_ALLOW_IPS in the environment,
+# or `127.0.0.1`.
+#
+# That default is correct only for a proxy sharing this container's network
+# namespace. In the ordinary topology -- a reverse proxy as its own service with its
+# own address -- X-Forwarded-For arrives, is NOT trusted, and is discarded. The peer
+# stays the proxy, so every client in the world lands in one rate-limit bucket and
+# the first abusive caller locks out everybody. Nothing errors; the limiter works
+# perfectly against the wrong subject.
+#
+# So the operator MUST set FORWARDED_ALLOW_IPS to the proxy's address. Not to `*`:
+# trusting a forwarded header from anyone lets a client claim any address and evade
+# the limit entirely by varying one header, which is worse than sharing a bucket.
+# `core/proxy_trust.py` detects both mistakes at runtime and says so in the log.
+# --------------------------------------------------------------------------- #
 CMD ["uvicorn", "backend.app.asgi:app", "--host", "0.0.0.0", "--port", "8000"]

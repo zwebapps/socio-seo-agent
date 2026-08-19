@@ -4,7 +4,13 @@ Implements the port declared in ``backend.app.services.geo_service``. Two
 questions decide everything in this module, and both have a wrong answer that
 still looks like it works.
 
-**What is a run?** ``geo_results`` carries no run id, so a run is defined by its
+**What is a run?** Since migration ``b5e73c1a8f42`` a run can say its own name:
+pass ``run_id`` to :meth:`PostgresProbeStore.save_outcomes` and a retry is the same
+id while a new run is a new one -- no window and no inference. What follows is the
+FALLBACK, which still runs whenever no ``run_id`` is given, and which is the only
+thing that can identify the run of a row written before that migration.
+
+Without a run id, a run is defined by its
 ``probed_at`` stamp: one save writes one timestamp across every row of the batch.
 That makes "the latest run" a single indexed lookup, and it makes a *retry*
 identifiable -- a re-send of the same (prompt, model) pairs shortly after the
@@ -105,7 +111,18 @@ _UPDATE_RESULT = text(
     WHERE geo_prompt_id = :geo_prompt_id
       AND provider = :provider
       AND model = :model
-      AND probed_at = :probed_at
+      AND (
+          -- Key on the run id when this run has one, and fall back to the timestamp
+          -- for rows written before migration ``b5e73c1a8f42``. Both branches, not
+          -- one: keying only on run_id would stop a legacy retry from folding, and
+          -- keying only on probed_at is the approximation this column replaces.
+          -- Cast explicitly: a bare ``:run_id IS NOT NULL`` gives asyncpg nothing to
+          -- infer from, and it refuses the statement ("could not determine data type
+          -- of parameter"). The cast also keeps the placeholder at ONE type across
+          -- both branches, which asyncpg likewise requires.
+          (cast(:run_id AS uuid) IS NOT NULL AND run_id = cast(:run_id AS uuid))
+          OR (cast(:run_id AS uuid) IS NULL AND probed_at = :probed_at)
+      )
     """
 )
 
@@ -113,10 +130,10 @@ _INSERT_RESULT = text(
     """
     INSERT INTO geo_results
         (id, business_id, geo_prompt_id, provider, model, mentioned, cited, no_answer,
-         answer_excerpt, competitors_seen, error, probed_at)
+         answer_excerpt, competitors_seen, error, probed_at, run_id)
     VALUES
         (:id, :business_id, :geo_prompt_id, :provider, :model, :mentioned, :cited, :no_answer,
-         :answer_excerpt, (:competitors_seen)::text::jsonb, :error, :probed_at)
+         :answer_excerpt, (:competitors_seen)::text::jsonb, :error, :probed_at, :run_id)
     """
 )
 
@@ -160,21 +177,30 @@ class PostgresProbeStore:
         outcomes: Sequence[ProbeOutcome],
         *,
         probed_at: datetime | None = None,
+        run_id: UUID | None = None,
     ) -> int:
         """Persist one run's outcomes, and return how many rows were written.
 
-        Idempotent per (prompt, model, run): re-sending a run within
-        :data:`RUN_DEDUPE_WINDOW` updates the rows it already wrote and adds only
-        the ones that are missing, so a retried run neither duplicates rows nor
-        splits itself into two runs.
+        Idempotent per (prompt, model, run), and there are now two ways to say which
+        run this is:
 
-        ``probed_at`` is an optional override for a caller that owns a real run
-        identity, and for tests that need two runs a week apart. Everything else
-        about the signature matches the ``ProbeStore`` port.
+        * **``run_id`` -- the explicit, exact one.** Pass the same id to record a
+          retry of a run; pass a new one to record a genuinely new run. No window, no
+          guessing. A caller that re-probes twice in an hour gets two runs, and a
+          worker that died halfway through and re-ran gets one, which is what each of
+          them actually is.
+        * **omit it and the old timestamp heuristic applies**, unchanged: a re-send
+          within :data:`RUN_DEDUPE_WINDOW` folds onto the rows it is retrying. Kept
+          because rows written before migration ``b5e73c1a8f42`` have no run id, so
+          this is the only thing that can still identify their run.
 
-        A batch is expected to hold at most one probe per (prompt, provider,
-        model); a repeat inside one batch lands on the same row, which is the same
-        thing the retry rule does deliberately.
+        ``probed_at`` remains an override for a caller that owns a real run identity,
+        and for tests that need two runs a week apart. It is the run's TIME; a
+        ``run_id`` is its NAME, and the two are no longer the same field.
+
+        A batch is expected to hold at most one probe per (prompt, provider, model); a
+        repeat inside one batch lands on the same row, which is the same thing the
+        retry rule does deliberately.
         """
         if not outcomes:
             return 0
@@ -190,6 +216,7 @@ class PostgresProbeStore:
                     geo_prompt_id=prompt_ids[_prompt_key(outcome)],
                     outcome=outcome,
                     probed_at=run_at,
+                    run_id=run_id,
                 )
                 updated = await db.execute(_UPDATE_RESULT, params)
                 if _rowcount(updated) == 0:
@@ -287,6 +314,7 @@ def _result_params(
     geo_prompt_id: UUID,
     outcome: ProbeOutcome,
     probed_at: datetime,
+    run_id: UUID | None,
 ) -> dict[str, Any]:
     """One row's parameters, for the update and the insert alike.
 
@@ -299,6 +327,7 @@ def _result_params(
     seen = list(dict.fromkeys([*outcome.competitors_mentioned, *outcome.competitors_cited]))
     return {
         "id": uuid4(),
+        "run_id": run_id,
         "business_id": business_id,
         "geo_prompt_id": geo_prompt_id,
         "provider": outcome.provider,

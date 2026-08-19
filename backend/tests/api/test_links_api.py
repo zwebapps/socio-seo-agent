@@ -28,11 +28,14 @@ import httpx
 import pytest
 
 from backend.app.api import links as links_api
-from backend.app.db.adapters.lead_store import HubCta, ShortLinkRecord
+from backend.app.db.adapters.lead_store import BusinessHandle, HubCta, ShortLinkRecord
 from backend.app.main import create_app
 
 BUSINESS_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_BUSINESS_ID = UUID("22222222-2222-4222-8222-222222222222")
+#: The readable hub address. A real slug shape, so a route that only ever accepted
+#: UUIDs cannot pass these tests by accident.
+BUSINESS_SLUG = "mueller-sanitaer-gmbh"
 LINK_ID = UUID("33333333-3333-4333-8333-333333333333")
 
 CHROME = (
@@ -92,6 +95,19 @@ class FakeStore:
 
     async def business_name(self, business_id: UUID) -> str | None:
         return self._name if business_id == BUSINESS_ID else None
+
+    async def business_by_handle(self, handle: str) -> BusinessHandle | None:
+        """Resolve either address form, exactly as the real store does.
+
+        Both are answered by the same fake so the route's own branch is what is under
+        test, rather than the fake's opinion about which form is canonical.
+        """
+        if handle in {str(BUSINESS_ID), BUSINESS_SLUG} and self._name is not None:
+            # A business with no name is how this fake spells "no such business", so
+            # it must not resolve a handle either -- the real store returns None for
+            # the same row.
+            return BusinessHandle(id=BUSINESS_ID, name=self._name, slug=BUSINESS_SLUG)
+        return None
 
 
 def a_link(*, code: str = "abcd2345", target: str = TARGET) -> ShortLinkRecord:
@@ -375,17 +391,55 @@ async def test_an_unknown_business_is_a_404() -> None:
     assert response.status_code == 404
 
 
-@pytest.mark.parametrize("slug", ["mueller-sanitaer", "../../etc/passwd", "0"])
-async def test_a_slug_that_is_not_an_identifier_is_a_404(slug: str) -> None:
-    """``businesses`` has no slug column, so the hub is keyed on the id today.
+@pytest.mark.parametrize("handle", ["nobody-by-that-name", "../../etc/passwd", "0"])
+async def test_an_unrecognised_hub_handle_is_a_404(handle: str) -> None:
+    """REPLACES ``test_a_slug_that_is_not_an_identifier_is_a_404``.
 
-    A readable slug is a one-column migration; guessing one from the business name
-    would be ambiguous the first time two customers share a name.
+    That test asserted every non-UUID handle was a 404, which was correct while
+    ``businesses`` had no slug column -- and is now exactly the behaviour that must
+    NOT hold: migration ``9a4f21c7de83`` added the column, and a readable slug is the
+    address the hub hands out. Its original rationale ("guessing one from the business
+    name would be ambiguous") was about deriving a slug at read time, which is not
+    what a stored unique column does.
+
+    The property worth keeping is the narrower one: an UNRECOGNISED handle is a 404,
+    in whatever shape it arrives. Kept stronger than before by covering all three
+    shapes of miss -- an unknown slug, a traversal attempt, and a bare digit -- and
+    paired with the test below, which proves a KNOWN slug resolves. Either test alone
+    is satisfiable by a route that is simply broken in one direction.
     """
     store = FakeStore(ctas=some_ctas())
 
     async with _client(store) as client:
-        assert (await client.get(f"/go/{slug}")).status_code == 404
+        assert (await client.get(f"/go/{handle}")).status_code == 404
+
+
+async def test_the_hub_resolves_a_readable_slug() -> None:
+    """The reason the column exists: an address a person can say out loud."""
+    store = FakeStore(ctas=some_ctas())
+
+    async with _client(store) as client:
+        response = await client.get(f"/go/{BUSINESS_SLUG}")
+
+    assert response.status_code == 200
+    assert response.json()["business"]["id"] == str(BUSINESS_ID)
+
+
+async def test_the_hub_still_resolves_the_old_uuid_address() -> None:
+    """The compatibility guarantee, and it is load-bearing rather than polite.
+
+    ``/go/{uuid}`` may already be printed on a flyer or pasted into an Instagram bio,
+    and for Instagram and TikTok -- which have no clickable link of their own -- this
+    hub is the ENTIRE conversion path. Dropping the old form would kill live campaigns
+    with no error anywhere.
+    """
+    store = FakeStore(ctas=some_ctas())
+
+    async with _client(store) as client:
+        response = await client.get(f"/go/{BUSINESS_ID}")
+
+    assert response.status_code == 200
+    assert response.json()["business"]["id"] == str(BUSINESS_ID)
 
 
 async def test_a_business_with_no_ctas_still_renders() -> None:

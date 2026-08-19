@@ -239,7 +239,9 @@ async def world(owner_engine: AsyncEngine) -> AsyncIterator[World]:
             )
             await s.execute(
                 text(
-                    "INSERT INTO businesses (id, owner_id, name, locale) VALUES (:id, :o, :n, 'de')"
+                    "INSERT INTO businesses (id, owner_id, name, slug, locale) VALUES "
+                    "(:id, :o, :n, 'fixture-' || "
+                    "left(replace(cast(gen_random_uuid() AS text), '-', ''), 12), 'de')"
                 ),
                 {"id": business_id, "o": user_id, "n": f"fbsvc {label}"},
             )
