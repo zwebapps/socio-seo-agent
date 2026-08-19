@@ -1,7 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { ApiError, previewOnboarding, type PreviewResponse } from "../lib/api";
+import {
+  ApiError,
+  confirmOnboarding,
+  previewOnboarding,
+  type PreviewResponse,
+} from "../lib/api";
 
 type State =
   | { kind: "idle" }
@@ -9,18 +14,39 @@ type State =
   | { kind: "ready"; data: PreviewResponse }
   | { kind: "error"; code: string; message: string };
 
+/** Where the confirm step is, separate from the draft's own state. */
+type SaveState =
+  | { kind: "unsaved" }
+  | { kind: "saving" }
+  | { kind: "saved"; website: string }
+  | { kind: "failed"; message: string };
+
 export default function OnboardPage() {
   const [url, setUrl] = useState("");
   const [state, setState] = useState<State>({ kind: "idle" });
+  const [save, setSave] = useState<SaveState>({ kind: "unsaved" });
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     setState({ kind: "loading" });
     try {
       setState({ kind: "ready", data: await previewOnboarding(url.trim()) });
+      // A new draft has not been confirmed, whatever the previous one's state was.
+      setSave({ kind: "unsaved" });
     } catch (error) {
       const e = error as ApiError;
       setState({ kind: "error", code: e.code ?? "unknown", message: e.message });
+    }
+  }
+
+  async function confirm(data: PreviewResponse) {
+    setSave({ kind: "saving" });
+    try {
+      const stored = await confirmOnboarding(data.dna, data.sourceUrl);
+      setSave({ kind: "saved", website: stored.website });
+    } catch (error) {
+      const e = error as ApiError;
+      setSave({ kind: "failed", message: e.message });
     }
   }
 
@@ -71,9 +97,89 @@ export default function OnboardPage() {
       <div className="mt-8" aria-live="polite">
         {state.kind === "loading" && <Skeleton />}
         {state.kind === "error" && <ErrorPanel code={state.code} message={state.message} />}
-        {state.kind === "ready" && <Draft data={state.data} />}
+        {state.kind === "ready" && (
+          <>
+            <Draft data={state.data} />
+            <Confirm state={save} onConfirm={() => void confirm(state.data)} />
+          </>
+        )}
       </div>
     </main>
+  );
+}
+
+/**
+ * The step that used to be missing.
+ *
+ * Before this, the draft was displayed and thrown away: `businesses.dna` stayed `{}` for
+ * every business ever created, so a later run had no website to crawl and the
+ * regulated-claim guard had no claims to enforce. The page's own copy promised "nothing
+ * is used until you confirm", which was accidentally true because nothing was used at all.
+ *
+ * The saved state names the website explicitly rather than saying "Saved", because that
+ * key is the one doing the work -- it is what makes the next run read this site.
+ */
+function Confirm({
+  state,
+  onConfirm,
+}: {
+  state: SaveState;
+  onConfirm: () => void;
+}) {
+  if (state.kind === "saved") {
+    return (
+      <div
+        className="mt-6 rounded-xl border p-4"
+        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+        // Announced, because the button that triggered this is replaced by it.
+        aria-live="polite"
+      >
+        <p className="text-sm font-medium" style={{ color: "var(--ok, var(--primary))" }}>
+          Saved. Runs for this business will now read {state.website}.
+        </p>
+        <a
+          href="/"
+          className="soft-press mt-3 inline-block px-4 py-2 text-sm font-medium"
+          style={{
+            borderRadius: "var(--r-pill)",
+            background: "var(--primary)",
+            color: "var(--primary-ink)",
+            boxShadow:
+              "-4px -4px 10px var(--shadow-light), 5px 5px 14px var(--shadow-dark)",
+          }}
+        >
+          Next: start a run
+        </a>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-6" aria-live="polite">
+      <button
+        type="button"
+        onClick={onConfirm}
+        disabled={state.kind === "saving"}
+        className="soft-press px-4 py-2 text-sm font-medium disabled:opacity-45"
+        style={{
+          borderRadius: "var(--r-pill)",
+          background: "var(--primary)",
+          color: "var(--primary-ink)",
+          boxShadow:
+            "-4px -4px 10px var(--shadow-light), 5px 5px 14px var(--shadow-dark)",
+        }}
+      >
+        {state.kind === "saving" ? "Saving…" : "This is correct — save it"}
+      </button>
+      <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+        Until you save, this draft is not used by anything.
+      </p>
+      {state.kind === "failed" ? (
+        <p className="mt-2 text-sm" style={{ color: "var(--err)" }}>
+          {state.message}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

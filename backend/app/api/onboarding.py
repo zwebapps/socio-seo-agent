@@ -15,18 +15,23 @@ than an afterthought. Three rules shape this module:
 
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
+from backend.app.api.runs import current_business
+from backend.app.db.session import business_session
 from backend.app.engines.crawl import fetch_page
 from backend.app.engines.crawl.contract import CrawlError, UnsafeUrlError
 from backend.app.llm import ModelRouter
 from backend.app.services.onboarding_service import (
     BusinessDnaDraft,
+    BusinessNotFoundError,
     ThinSiteError,
     draft_dna_from_website,
+    save_confirmed_dna,
 )
 
 router = APIRouter(prefix="/api/v1/onboarding", tags=["onboarding"])
@@ -100,6 +105,83 @@ class PreviewResponse(CamelModel):
     needs_confirmation: bool
     instruction_like_content: bool
     fact_gaps: list[str]
+
+
+class ConfirmRequest(CamelModel):
+    """The draft as the owner is willing to have it stored.
+
+    The DNA comes from the client rather than being re-crawled, because the owner is
+    expected to have corrected it -- `BusinessDnaDraft` says "pending the owner's
+    confirmation", and this is that confirmation.
+    """
+
+    dna: BusinessDnaDraft
+    source_url: str = Field(min_length=1, max_length=2048)
+
+
+class ConfirmResponse(CamelModel):
+    """What was actually stored, echoed back rather than assumed.
+
+    An owner needs to see that the website was recorded, because that key is what makes
+    a later run crawl their site at all.
+    """
+
+    saved: bool
+    website: str
+    services: list[str]
+    banned_claims: list[str]
+
+
+def get_business_session_opener() -> Any:
+    """The tenant-scoped session opener. Overridden in tests."""
+    return business_session
+
+
+@router.post(
+    "/confirm",
+    response_model=ConfirmResponse,
+    response_model_by_alias=True,
+    summary="Store the Business DNA the owner confirmed",
+)
+async def confirm(
+    payload: ConfirmRequest,
+    business_id: Annotated[UUID, Depends(current_business)],
+    open_session: Annotated[Any, Depends(get_business_session_opener)],
+) -> ConfirmResponse:
+    """Accept a confirmed draft. THE step that was missing.
+
+    `/preview` drafted a DNA and handed it back, and nothing could accept it -- so the
+    draft was shown to the owner and thrown away, and `businesses.dna` stayed `{}` for
+    every business ever created. Two consequences, neither cosmetic: the
+    regulated-claim guard reads `banned_claims` from there, so a dentist's forbidden
+    phrases were never enforced for a real tenant; and HARVEST reads `website`, so no
+    run could crawl the site the owner had just pasted in.
+
+    Authenticated, unlike `/preview`. Preview needs no tenant because it stores nothing;
+    this one writes to a specific business, and the business comes from the SESSION
+    rather than the body -- accepting a business id from the client would be letting the
+    client make an authorisation decision.
+    """
+    async with open_session(business_id) as session:
+        try:
+            stored = await save_confirmed_dna(
+                business_id,
+                dna=payload.dna,
+                source_url=payload.source_url,
+                session=session,
+            )
+        except BusinessNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=_error("business_not_found", "No such business."),
+            ) from exc
+
+    return ConfirmResponse(
+        saved=True,
+        website=str(stored.get("website") or ""),
+        services=list(stored.get("services") or []),
+        banned_claims=list(stored.get("banned_claims") or []),
+    )
 
 
 def _error(code: str, message: str) -> dict[str, str]:

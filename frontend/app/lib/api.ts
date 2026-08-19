@@ -130,3 +130,62 @@ export async function previewOnboarding(url: string): Promise<PreviewResponse> {
 
   return (await response.json()) as PreviewResponse;
 }
+
+export type ConfirmResponse = {
+  saved: boolean;
+  website: string;
+  services: string[];
+  bannedClaims: string[];
+};
+
+/**
+ * Store the DNA the owner just confirmed.
+ *
+ * The step that used to be missing: `previewOnboarding` drafted a DNA and handed it
+ * back, and nothing could accept it -- so the draft was shown and thrown away, and every
+ * business kept `dna = {}`. What that cost is not obvious from the screen: the agent
+ * reads `website` from there to crawl the site, and the regulated-claim guard reads
+ * `bannedClaims`, so neither worked for a real business.
+ *
+ * `credentials: "include"` because this one is AUTHENTICATED, unlike preview -- it writes
+ * to a specific business, and the business comes from the session rather than the body.
+ * The `Origin` header the CSRF guard requires is supplied by the browser automatically,
+ * which is why this must be called from a client component and not a server one.
+ */
+export async function confirmOnboarding(
+  dna: BusinessDna,
+  sourceUrl: string,
+): Promise<ConfirmResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}/api/v1/onboarding/confirm`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ dna, sourceUrl }),
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError(
+      "network",
+      `Cannot reach the API at ${API_URL}. Is it running? (make api)`,
+      0,
+    );
+  }
+
+  if (response.status === 401) {
+    throw new ApiError("unauthenticated", "Please sign in first, then save.", 401);
+  }
+
+  if (!response.ok) {
+    const body: unknown = await response.json().catch(() => null);
+    const detail = (body as { detail?: unknown } | null)?.detail;
+    if (detail && typeof detail === "object" && "code" in detail) {
+      const d = detail as { code: string; message: string };
+      throw new ApiError(d.code, d.message, response.status);
+    }
+    throw new ApiError("unknown", `Could not save (${response.status}).`, response.status);
+  }
+
+  return (await response.json()) as ConfirmResponse;
+}

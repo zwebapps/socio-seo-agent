@@ -15,10 +15,15 @@ fail rather than regex our way to a shape -- see AGENT_RUNTIME.md section 4.
 """
 
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, Literal
+from typing import Any, Final, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.db.models import Business
 from backend.app.engines.crawl import parse_page
 from backend.app.llm import (
     BudgetState,
@@ -62,7 +67,26 @@ Tone = Literal["professional", "friendly", "concise"]
 
 
 class BusinessDnaDraft(BaseModel):
-    """What we believe about a business, pending the owner's confirmation."""
+    """What we believe about a business, pending the owner's confirmation.
+
+    Carries camelCase aliases, and it has to. This model is nested inside `CamelModel`
+    responses and requests in `api/onboarding.py`, and `response_model_by_alias` does NOT
+    reach into a nested plain `BaseModel` -- so it was shipping `banned_claims` while the
+    frontend's `BusinessDna` type read `bannedClaims`, meaning the preview screen's
+    banned-claims list rendered `undefined` for every business. The same mismatch inbound
+    silently dropped the confirmed claims on the way to the database: the one
+    safety-critical field on this model, lost without an error.
+
+    (The exact same shape of bug was found and fixed on `CostReport` in the developer
+    console. Two occurrences make it a pattern worth naming: a plain `BaseModel` nested
+    in a `CamelModel` is a wire-format bug waiting to happen.)
+
+    `populate_by_name=True` so both spellings are accepted inbound -- the snake_case name
+    is what every existing test and the agent runtime use internally, and breaking those
+    to fix the wire would be trading one mismatch for another.
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
     name: str
     industry: str | None = None
@@ -240,3 +264,82 @@ async def draft_dna_from_website(
         instruction_like_content=instruction_like,
         fact_gaps=_gaps(dna),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Confirming the draft -- the step that was missing
+# --------------------------------------------------------------------------- #
+
+#: The key HARVEST reads to decide whether it has a site to crawl.
+#:
+#: Not merely informational: `agents/nodes` checks `dna.get("website")` and, when it is
+#: absent, records the fact gap "website (none on record)" and crawls nothing. So saving
+#: the confirmed draft WITHOUT this key produces a business whose runs can never look at
+#: its own website -- which is the entire point of pasting the URL in the first place.
+WEBSITE_KEY: Final = "website"
+
+#: Keys inside `businesses.dna` that this module does not own and must not clobber.
+#:
+#: `preferences` is written by `memory_service` (the "what I remember about your
+#: business" panel). Replacing the whole `dna` dict on confirm would silently delete
+#: every rule the owner had taught the agent -- a data loss with no error, visible only
+#: as the agent quietly forgetting.
+FOREIGN_DNA_KEYS: Final = ("preferences",)
+
+
+class BusinessNotFoundError(LookupError):
+    """No such business. Raised rather than silently creating one."""
+
+    def __init__(self, business_id: UUID) -> None:
+        self.business_id = business_id
+        super().__init__(f"No business {business_id}")
+
+
+async def save_confirmed_dna(
+    business_id: UUID,
+    *,
+    dna: BusinessDnaDraft,
+    source_url: str,
+    session: AsyncSession,
+) -> dict[str, Any]:
+    """Persist the DNA the owner confirmed, and return what was stored.
+
+    `/preview` drafts a DNA and hands it back for the owner to check; until this
+    function existed there was nothing to accept it, so the draft was shown and thrown
+    away and `businesses.dna` stayed `{}` for every business ever created. The
+    consequence was not cosmetic: the regulated-claim guard reads `banned_claims` from
+    here, so a dentist's forbidden phrases were never enforced for a real tenant, and
+    HARVEST reads `website`, so no run could crawl the site it was told about.
+
+    Takes the draft from the CALLER rather than re-crawling, because the owner is
+    expected to have corrected it -- that is what "pending the owner's confirmation" in
+    `BusinessDnaDraft` means. It is their own business's data, so there is nothing to
+    defend against beyond the schema doing its job.
+
+    Merges rather than replaces (see `FOREIGN_DNA_KEYS`) and builds a NEW dict rather
+    than mutating, because JSONB mutation in place is not tracked by SQLAlchemy: the
+    flush would emit no UPDATE and the write would appear to succeed. Same reasoning,
+    and the same trap, as `memory_service._with_preferences`.
+
+    Does not commit. The caller owns the transaction.
+    """
+    statement = select(Business).where(Business.id == business_id).with_for_update()
+    business = (await session.execute(statement)).scalar_one_or_none()
+    if business is None:
+        raise BusinessNotFoundError(business_id)
+
+    existing = dict(business.dna or {})
+    stored: dict[str, Any] = {
+        **dna.model_dump(mode="json"),
+        WEBSITE_KEY: source_url,
+    }
+    # Anything another module owns survives, whatever the draft says.
+    for key in FOREIGN_DNA_KEYS:
+        if key in existing:
+            stored[key] = existing[key]
+
+    business.dna = stored
+    # The column too, so "which businesses have we crawled" is a query rather than a
+    # JSONB dig. The DNA copy is the one the agent reads; this one is for us.
+    business.website = source_url
+    return stored
