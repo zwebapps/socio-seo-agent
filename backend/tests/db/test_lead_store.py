@@ -58,16 +58,19 @@ VISITOR_IP = "203.0.113.42"
 
 
 @pytest.fixture
-def scoped_sessions(
-    app_engine: AsyncEngine, owner_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[None]:
-    """Point both session factories at this test's engines.
+def scoped_sessions(app_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point the session factory at this test's engine.
 
-    Two factories, because the store deliberately has two connection paths: every
-    write goes through the RESTRICTED role under ``business_session``, and the
-    single cross-tenant ``resolve`` goes through the privileged one. Patching the
-    factories rather than injecting sessions keeps the real RLS scoping under test
-    instead of replacing it with a hand-rolled copy that could differ.
+    ONE factory, and that is the point of migration ``7c1e4a90b2d5``. This fixture
+    used to patch two, because the store had two connection paths: writes on the
+    restricted role under ``business_session``, and the cross-tenant ``resolve`` on
+    a privileged one. The privileged path is gone -- both unscoped lookups now go
+    through SECURITY DEFINER functions on this same restricted role -- so a second
+    factory would be a fiction, and worse, patching one would have let a test pass
+    on privilege the deployment does not have.
+
+    Patching the factory rather than injecting sessions keeps the real RLS scoping
+    under test instead of replacing it with a hand-rolled copy that could differ.
 
     Function-scoped, because an asyncpg pool belongs to the event loop that created
     it -- see this package's conftest.
@@ -76,11 +79,6 @@ def scoped_sessions(
         session_module,
         "_session_factory",
         async_sessionmaker(app_engine, expire_on_commit=False, autoflush=False),
-    )
-    monkeypatch.setattr(
-        lead_store_module,
-        "_privileged_factory",
-        async_sessionmaker(owner_engine, expire_on_commit=False, autoflush=False),
     )
     yield
 
@@ -230,9 +228,14 @@ async def test_the_restricted_role_reads_nothing_from_short_links_unscoped(
     ``short_links`` has FORCE row-level security and a policy keyed on a
     transaction-local GUC. With no GUC set the restricted application role sees
     ZERO rows and no error -- so a public ``/l/{code}`` cannot be served by "just
-    querying without the tenant scope". That is why ``resolve`` is the one method
-    in this store that runs on a privileged connection, and why the privilege is
-    spent on exactly one single-row lookup.
+    querying without the tenant scope". That is why ``resolve`` goes through the
+    ``resolve_short_link`` SECURITY DEFINER function (migration ``7c1e4a90b2d5``)
+    rather than a bare SELECT.
+
+    The two assertions are the whole design in two lines: RLS still blinds this
+    role completely, AND the narrow function still answers. Read together with
+    ``test_the_app_role_has_no_rls_bypass`` below, which is what stops the second
+    assertion from passing for the wrong reason.
     """
     link = await store.create_link(business_a, target_url="https://mueller.example/lp")
 
@@ -278,18 +281,47 @@ async def test_resolve_returns_none_for_a_code_shaped_like_an_injection(
     assert await store.resolve("' OR 1=1 --") is None
 
 
-async def test_privileged_role_can_actually_see_past_row_level_security(
-    store: PostgresLeadStore,
-) -> None:
-    """A self-diagnosis, because getting this wrong fails only in production.
+async def test_the_app_role_has_no_rls_bypass(app_engine: AsyncEngine) -> None:
+    """The load-bearing precondition for every RLS test in this file.
 
-    ``FORCE ROW LEVEL SECURITY`` binds the table OWNER too, so the resolve works
-    only where the connecting role bypasses RLS. Locally and in CI it does. If a
-    deployment connects as an owner without ``BYPASSRLS``, every code would 404
-    while the rows sat there -- green tests, dead links. The store answers the
-    question explicitly so the deployment can be told.
+    This REPLACES an earlier test that asserted the *privileged* role could see
+    past RLS. That test was correct about the old design and is now meaningless:
+    the privileged connection is gone (migration ``7c1e4a90b2d5``), so there is no
+    longer a role whose bypass we depend on.
+
+    What matters instead is the opposite property, and it is strictly stronger.
+    Every "RLS blocks this" assertion in this file would pass vacuously if the
+    application role were a superuser or carried ``BYPASSRLS`` -- and so would
+    ``resolve`` succeeding, for entirely the wrong reason. Asserting the absence of
+    a bypass is what makes the rest of the file mean anything.
     """
-    assert await store.resolver_can_bypass_rls() is True
+    async with app_engine.connect() as conn:
+        row = await conn.execute(
+            text("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")
+        )
+        is_super, can_bypass = row.one()
+
+    assert is_super is False, "the app role must not be a superuser, or RLS is decorative"
+    assert can_bypass is False, "the app role must not carry BYPASSRLS"
+
+
+async def test_the_resolver_function_is_not_executable_by_public(
+    app_engine: AsyncEngine,
+) -> None:
+    """A SECURITY DEFINER function is executable by PUBLIC unless revoked.
+
+    So the ``REVOKE`` in the migration is the control, and the ``GRANT`` after it
+    is what keeps the application working. If a future migration recreated the
+    function without the revoke, it would silently become callable by every role
+    on the database -- an unscoped read of every tenant's links, available to
+    anyone who can connect.
+    """
+    async with app_engine.connect() as conn:
+        for signature in ("resolve_short_link(varchar)", "resolve_form_target(uuid)"):
+            granted = await conn.execute(
+                text(f"SELECT has_function_privilege('public', '{signature}', 'EXECUTE')")
+            )
+            assert granted.scalar() is False, f"{signature} is callable by PUBLIC"
 
 
 # --------------------------------------------------------------------------- #

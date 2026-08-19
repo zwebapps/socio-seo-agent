@@ -24,37 +24,41 @@ That is asserted, not assumed: ``tests/db/test_lead_store.py``
 ``session()`` -- which uses the same restricted role -- is not an option here; it
 would silently 404 every link in the product.
 
-**The right long-term answer is a narrow SECURITY DEFINER function**, matching the
-posture the rest of this codebase uses for cross-tenant reads. It needs a
-migration, which this module cannot add, so the exact SQL is recorded in
-:data:`RESOLVE_MIGRATION_SQL` below and swapping to it is a two-line change to
-:meth:`resolve`.
+Both lookups go through a narrow ``SECURITY DEFINER`` function --
+``resolve_short_link(varchar)`` and ``resolve_form_target(uuid)``, added by
+migration ``7c1e4a90b2d5`` -- which is the same posture the rest of this codebase
+uses for cross-tenant reads. Each function hard-codes its ``WHERE`` clause,
+returns at most one row, is ``STABLE`` so it cannot write, pins its
+``search_path``, and is executable by ``sma_app`` alone. **RLS is not weakened for
+the application role:** these run on the ordinary restricted session, and every
+read and write that follows uses ``business_session`` with the business id the
+function returned, so a wrong answer here would land writes in the wrong tenant --
+which is why the resolvers are tested directly.
 
-Until then the two lookups run on the privileged (migration-role) connection, and
-the privilege is rationed as tightly as it can be:
+The privilege is rationed by the function's own shape rather than by the caller's
+restraint:
 
 * **one statement, bound parameter, single row.** No dynamic SQL, no string
   building, and the input is a URL segment, so it is bound rather than
   interpolated.
-* **the transaction is ``READ ONLY``**, declared before the query. So even a
-  defect in this module cannot write through the privileged connection.
-* **nothing else in the request runs unscoped.** The click write, the lead write
-  and every read that follows use ``business_session`` with the business id this
-  lookup returned -- so RLS is active for all of them, and if the resolve ever
-  returned the wrong business the writes would land in the wrong tenant, which is
-  why :meth:`resolve`'s answer is tested directly.
+* **read-only by declaration.** ``STABLE`` and ``LANGUAGE sql``, so no edit to
+  this module can write through it.
 * **the code is a credential.** 56**8 is about 46 bits from ``secrets`` (see
   ``link_service.new_code``), the lookup returns at most one row, and the row it
   returns is a redirect target that was created to be handed to the public
   anyway. ``content_pieces`` ids are v4 UUIDs, likewise unguessable.
 
-**The honest caveat**, recorded because it fails only in production: ``FORCE ROW
-LEVEL SECURITY`` binds the table owner too, so this path works only where the
-privileged role bypasses RLS. It does locally and in CI (the Postgres image makes
-that role a superuser). A deployment whose migration role is a plain owner without
-``BYPASSRLS`` would see every code 404 while the rows sat in the table.
-:meth:`resolver_can_bypass_rls` answers that question explicitly so a deployment
-check can fail loudly instead of a customer's printed flyer going dead.
+What this replaced, recorded because the failure mode is instructive
+-------------------------------------------------------------------
+Until ``7c1e4a90b2d5`` both lookups ran on the **migration-role connection**: a
+second, privileged pool, inside a request served to the public. It was rationed
+carefully, but it also only worked where that role bypasses RLS -- ``FORCE ROW
+LEVEL SECURITY`` binds the table owner too, so a deployment whose migration role
+was a plain owner would have 404'd every short link while the rows sat in the
+table. Locally and in CI that role is a superuser, so no test could have caught
+it. A ``resolver_can_bypass_rls`` self-check existed to make that answerable at
+startup; with the privileged connection gone there is no longer a question to
+ask, so the check went with it.
 
 What is deliberately never stored
 ---------------------------------
@@ -71,8 +75,6 @@ become untrue later.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final
@@ -80,9 +82,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from backend.app.core.config import get_settings
 from backend.app.db.session import business_session, session
 from backend.app.services.link_service import (
     KNOWN_CHANNELS,
@@ -94,7 +94,6 @@ from backend.app.services.link_service import (
 )
 
 __all__ = [
-    "RESOLVE_MIGRATION_SQL",
     "CodeExhaustionError",
     "FormTarget",
     "HubCta",
@@ -106,39 +105,6 @@ __all__ = [
     "UnknownShortLinkError",
 ]
 
-
-#: The migration that would retire the privileged connection in this module.
-#:
-#: Recorded here rather than in a comment because it is the actual remedy, and
-#: because the shape of it is the argument: the function hard-codes its WHERE
-#: clause, returns one row, is owned by the migration role, and is executable by
-#: the application role only. Nothing about RLS is weakened for the app role --
-#: this is the same posture the project already uses for cross-tenant reads.
-#:
-#: With it applied, :meth:`PostgresLeadStore.resolve` becomes a
-#: ``business_session``-free call to ``SELECT * FROM resolve_short_link(:code)``
-#: over the ordinary restricted session, and ``_privileged_session`` goes away.
-RESOLVE_MIGRATION_SQL: Final = """
-CREATE FUNCTION resolve_short_link(p_code varchar)
-RETURNS TABLE (
-    id uuid, business_id uuid, code varchar, target_url varchar,
-    content_piece_id uuid, channel varchar, campaign varchar, click_count integer
-)
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = public, pg_temp
-STABLE
-AS $$
-    SELECT id, business_id, code, target_url,
-           content_piece_id, channel, campaign, click_count
-    FROM short_links
-    WHERE code = p_code
-    LIMIT 1
-$$;
-
-REVOKE ALL ON FUNCTION resolve_short_link(varchar) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION resolve_short_link(varchar) TO sma_app;
-"""
 
 #: How many fresh codes to try before declaring the generator broken.
 #:
@@ -268,72 +234,14 @@ class FormTarget:
     title: str
 
 
-# --------------------------------------------------------------------------- #
-# The privileged connection -- see the module docstring
-# --------------------------------------------------------------------------- #
+#: The SECURITY DEFINER resolver, not a bare SELECT: ``short_links`` has FORCE RLS
+#: and a public visitor has no business id to scope by -- the lookup is what
+#: produces one. See migration ``7c1e4a90b2d5``.
+_RESOLVE_LINK = text("SELECT * FROM resolve_short_link(:code)")
 
-_privileged_factory: async_sessionmaker[AsyncSession] | None = None
-
-
-def _get_privileged_factory() -> async_sessionmaker[AsyncSession]:
-    """Session factory on the migration role, created on first use.
-
-    Separate from ``db.session``'s engine on purpose: that one is the restricted
-    runtime role and must stay the default for everything. A tiny pool, because
-    this connection serves exactly two single-row lookups.
-    """
-    global _privileged_factory
-    if _privileged_factory is None:
-        engine = create_async_engine(
-            get_settings().database_url,
-            pool_pre_ping=True,
-            pool_size=2,
-            max_overflow=2,
-        )
-        _privileged_factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
-    return _privileged_factory
-
-
-@asynccontextmanager
-async def _privileged_session() -> AsyncIterator[AsyncSession]:
-    """A read-only transaction on the privileged role.
-
-    ``SET TRANSACTION READ ONLY`` is issued before anything else, so this
-    connection cannot write even if a later edit to this module tries to. That is
-    the one mitigation available for a privilege that cannot yet be removed.
-    """
-    factory = _get_privileged_factory()
-    async with factory() as db, db.begin():
-        await db.execute(text("SET TRANSACTION READ ONLY"))
-        yield db
-
-
-_RESOLVE_LINK = text(
-    """
-    SELECT id, business_id, code, target_url,
-           content_piece_id, channel, campaign, click_count
-    FROM short_links
-    WHERE code = :code
-    LIMIT 1
-    """
-)
-
-_RESOLVE_FORM = text(
-    """
-    SELECT business_id, id AS content_piece_id, status, title
-    FROM content_pieces
-    WHERE id = :piece_id
-    LIMIT 1
-    """
-)
-
-_CAN_BYPASS_RLS = text(
-    """
-    SELECT coalesce(bool_or(rolsuper OR rolbypassrls), false)
-    FROM pg_roles
-    WHERE rolname = current_user
-    """
-)
+#: Likewise for the anonymous form submitter, whose only handle on the tenant is
+#: the content-piece id in the URL.
+_RESOLVE_FORM = text("SELECT * FROM resolve_form_target(:piece_id)")
 
 _INSERT_LINK = text(
     """
@@ -485,13 +393,14 @@ class PostgresLeadStore:
     async def resolve(self, code: str) -> ShortLinkRecord | None:
         """Find a link by its code, with no tenant context. See the module docstring.
 
-        This is the unscoped read. It runs one bound, single-row, read-only
-        statement on the privileged connection because ``short_links`` has FORCE
-        RLS and a public visitor has no business id to scope by -- the lookup is
-        what produces one. Everything the caller does afterwards runs under
-        ``business_session`` with the business id returned here.
+        This is the unscoped read, and it is unscoped by DESIGN rather than by
+        privilege: ``resolve_short_link`` is a SECURITY DEFINER function with a
+        hard-coded single-row ``WHERE``, executable only by the application role,
+        called here on the ordinary restricted session. Everything the caller does
+        afterwards runs under ``business_session`` with the business id returned
+        here.
         """
-        async with _privileged_session() as db:
+        async with session() as db:
             row = (await db.execute(_RESOLVE_LINK, {"code": code})).mappings().first()
 
         if row is None:
@@ -506,20 +415,6 @@ class PostgresLeadStore:
             campaign=row["campaign"],
             click_count=int(row["click_count"]),
         )
-
-    async def resolver_can_bypass_rls(self) -> bool:
-        """Whether the privileged role can actually see past row-level security.
-
-        A deployment check, not a hot path. ``FORCE ROW LEVEL SECURITY`` binds the
-        table owner as well, so if the configured migration role is a plain owner
-        without ``BYPASSRLS`` then :meth:`resolve` returns ``None`` for every
-        existing code -- a silent, total outage of the redirect that looks exactly
-        like "nobody has created any links yet". Locally and in CI the role is a
-        superuser, so tests would never catch it. Ask this at startup and refuse to
-        pretend.
-        """
-        async with _privileged_session() as db:
-            return bool((await db.execute(_CAN_BYPASS_RLS)).scalar())
 
     async def record_click(
         self,
@@ -640,11 +535,12 @@ class PostgresLeadStore:
     async def resolve_form(self, content_piece_id: UUID) -> FormTarget | None:
         """Which business a public form belongs to. The second unscoped read.
 
-        Same necessity and same rationing as :meth:`resolve`: the submitter is
+        Same necessity and same shape as :meth:`resolve`: the submitter is
         anonymous, so the content piece id in the URL is the only thing that can
-        name the tenant. One bound, single-row, read-only statement.
+        name the tenant, and the read goes through a SECURITY DEFINER function on
+        the restricted session.
         """
-        async with _privileged_session() as db:
+        async with session() as db:
             row = (
                 (await db.execute(_RESOLVE_FORM, {"piece_id": content_piece_id})).mappings().first()
             )
