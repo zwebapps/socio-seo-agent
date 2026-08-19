@@ -71,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # by default would bill every run. `--live` loads it explicitly inside `main()` -- and
 # then asserts it actually got a provider, so the flag cannot claim to spend money
 # while quietly measuring FakeProvider.
+from backend.app.engines.channel import HashtagEnforcement, enforce_hashtags
 from backend.app.llm.contract import BudgetState, Message, ModelTier, Role, TaskClass
 from backend.app.llm.router import TASK_TIERS, TIER_CHAINS, ModelRouter, config_status
 from backend.app.obs import Tracer, get_tracer, llm_span_fields, tracing_status
@@ -82,6 +83,7 @@ from backend.app.services.kb_service import (
 from evals.dataset import CASES, EvalCase
 from evals.rubric import (
     CHANNEL_LIMITS,
+    ChannelLimits,
     Rendering,
     RubricResult,
     aggregate,
@@ -106,8 +108,11 @@ DEFAULT_BUDGET_USD: Final = Decimal("0.50")
 #: to the harness, not to the product: the real GENERATE prompt lands with the
 #: renderers in Phase 6, and this runner must then call it instead of composing
 #: its own.
-PROMPT_VERSION_RAG_OFF: Final = "eval.generate.v1"
-PROMPT_VERSION_RAG_ON: Final = "eval.generate.rag.v1"
+#: v2 states the length floor and spells out the hashtag rule (see `_format_rules`).
+#: The RAG variant is v3: v2 also repeated the rules after the passage block, which
+#: fixed `format` and destroyed `grounding` -- see the note in `_user_prompt`.
+PROMPT_VERSION_RAG_OFF: Final = "eval.generate.v2"
+PROMPT_VERSION_RAG_ON: Final = "eval.generate.rag.v3"
 
 #: How a generated output is expected to cite: ``[chunk:plumber-01#0]``.
 CITATION_RE: Final = re.compile(r"\[chunk:([^\]\s]+)\]")
@@ -348,6 +353,13 @@ class ArmResult:
     tokens_out: int
     cost_usd: Decimal
     error: str | None = None
+    #: How many hashtags the deterministic channel engine had to remove, and how
+    #: many the model left missing. Reported, never swallowed: a `format` column
+    #: reading 1.00 because a renderer cleaned up after the model is the renderer's
+    #: competence, not the model's, and a report that shows only the former is
+    #: crediting the wrong component.
+    hashtags_removed: int = 0
+    hashtag_shortfall: int = 0
 
     @property
     def mean_score(self) -> float:
@@ -391,14 +403,61 @@ def _grounded_block(passages: Mapping[str, str]) -> str:
     return "\n".join(f"[chunk:{chunk_id}] {text}" for chunk_id, text in passages.items())
 
 
+def _format_rules(channel: str, limits: ChannelLimits) -> str:
+    """The mechanically-checked rules, stated so a model cannot misread them.
+
+    Every line here corresponds to something `rubric.score_format` measures. Two
+    defects in the first version of this prompt, both found by the 2026-08-19 live
+    run and both visible in that report's `format` column:
+
+    * **`min_chars` was never mentioned at all.** The rubric floors `blog_article`
+      at 2,500 characters and `email` at 300, and the prompt only ever named a
+      *maximum* -- so the model was failing a requirement it was never given. It is
+      not a reluctance problem: asked directly for "mindestens 2800 Zeichen",
+      `gpt-4.1-mini` returned 5,032. It simply was not asked.
+    * **`0-0 hashtags`** is what an empty range rendered as, which reads like a
+      formatting artefact rather than a prohibition. It is now spelled out.
+    """
+    rules: list[str] = []
+    if limits.min_chars:
+        rules.append(
+            f"AT LEAST {limits.min_chars} characters. This is a floor, not a target: "
+            "a shorter piece is rejected outright, so keep writing until you pass it."
+        )
+    rules.append(f"At most {limits.max_chars} characters.")
+    if limits.hashtags_max == 0:
+        rules.append("NO hashtags. Not one, not at the end, not inside a sentence.")
+    elif limits.hashtags_min == limits.hashtags_max:
+        rules.append(f"Exactly {limits.hashtags_max} hashtags.")
+    else:
+        rules.append(f"Between {limits.hashtags_min} and {limits.hashtags_max} hashtags.")
+    rules.append(
+        "A link in the body is fine."
+        if limits.link_in_body
+        else "NO URL in the body -- it would not be clickable on this channel."
+    )
+    # Said explicitly whenever hashtags are restricted, because the two instructions
+    # otherwise contradict each other: a chunk id is `<case_id>#<ordinal>`, so an
+    # obedient model reading "no hashtags" has a reason to strip the `#0` off a
+    # citation and hand back an id that never existed -- which the grounding scorer
+    # then reports, correctly, as a fabricated source.
+    if limits.hashtags_max < 5:
+        rules.append(
+            "A citation marker such as [chunk:example#0] is NOT a hashtag. Reproduce "
+            "any id you cite exactly as it was given to you, including the # and the "
+            "number after it."
+        )
+    return f"Format rules for {channel}:\n" + "\n".join(f"- {rule}" for rule in rules)
+
+
 def _user_prompt(case: EvalCase, passages: Mapping[str, str] | None) -> str:
     limits = CHANNEL_LIMITS[case.channel]
+    rules = _format_rules(case.channel, limits)
     parts = [
         f"Business: {case.business.name}, {case.business.vertical} in "
         f"{case.business.city}. Services: {', '.join(case.business.services)}.",
-        f"Channel: {case.channel} (max {limits.max_chars} characters, "
-        f"{limits.hashtags_min}-{limits.hashtags_max} hashtags, "
-        f"{'links allowed' if limits.link_in_body else 'NO clickable link in the body'}).",
+        f"Channel: {case.channel}.",
+        rules,
         f"Target keyword: {case.target_keyword}.",
         f"Brief: {case.brief}",
         f"Must mention: {', '.join(case.must_contain)}.",
@@ -411,7 +470,54 @@ def _user_prompt(case: EvalCase, passages: Mapping[str, str] | None) -> str:
             "Source passages. Cite the id in square brackets after any figure you "
             "take from one, exactly as shown:\n" + _grounded_block(passages)
         )
+        # The citation instruction is the LAST thing in this prompt, and it has to
+        # stay there. Measured, both directions, on `gpt-4.1-mini`:
+        #
+        #   v1  format rules mid-prompt, passages + citation last
+        #       -> format 0.35, grounding 0.35
+        #   v2a format rules mid-prompt, passages, then a format REMINDER last
+        #       -> format 1.00, grounding 0.02  (19 of 20 cases cited nothing)
+        #
+        # Appending the reminder fixed one dimension by breaking the other: whatever
+        # ends this message is what the model obeys, so the two instructions were
+        # simply taking turns. The `oracle` column stayed healthy throughout, which
+        # is what proves it was a citing failure and not a retrieval one.
+        #
+        # So the reminder is gone, and nothing is lost by removing it, because the
+        # two things it was there to protect are now held elsewhere: hashtag counts
+        # by `engines/channel` (arithmetic, enforced in code, which is why the model
+        # ignoring them is survivable) and the length floor by the `_format_rules`
+        # block above, which measured 0 pieces short of the minimum in both arms.
+        # A prompt cannot end with two different instructions; the one that must win
+        # is the one no code can enforce afterwards.
     return "\n\n".join(parts)
+
+
+def _enforce_channel_format(case: EvalCase, text: str) -> HashtagEnforcement:
+    """Apply the deterministic channel rules the product would apply before publishing.
+
+    Scoring the raw completion would measure something that never ships: a real
+    pipeline renders for a channel, and enforcing a hashtag count is that renderer's
+    job. It lives in `engines/channel` rather than here precisely so this is not the
+    eval marking its own homework -- the eval consumes a product engine, and
+    `backend/tests/engines/test_channel.py` scores its output with this same rubric.
+
+    Length is deliberately NOT enforced here. Truncating an article to fit a
+    ceiling, or padding one to reach a floor, would be editing the copy rather than
+    formatting it -- so length stays a genuine measurement of the model, which is
+    why the `format` column can still fail on it.
+    """
+    limits = CHANNEL_LIMITS[case.channel]
+    return enforce_hashtags(
+        text,
+        minimum=limits.hashtags_min,
+        maximum=limits.hashtags_max,
+        # Chunk ids are `<case_id>#<ordinal>`, so a citation contains a `#`. Without
+        # this the enforcement rewrote `[chunk:plumber-01#0]` to
+        # `[chunk:plumber-01]` and the grounding scorer -- correctly -- reported a
+        # fabricated source.
+        protect=(CITATION_RE,),
+    )
 
 
 async def _generate(
@@ -569,6 +675,8 @@ async def run_case(
         passages=None,
         prompt_version=PROMPT_VERSION_RAG_OFF,
     )
+    off_enforced = _enforce_channel_format(case, off_text)
+    off_text = off_enforced.text
     off_grounding = _grounding_triple(
         off_text, cited=_cited_ids(off_text), retrieved={}, oracle=oracle
     )
@@ -585,6 +693,8 @@ async def run_case(
         tokens_in=off_in,
         tokens_out=off_out,
         cost_usd=off_usd,
+        hashtags_removed=off_enforced.removed,
+        hashtag_shortfall=off_enforced.shortfall,
     )
 
     # ---- arm 2: RAG on. The real agentic retrieval loop. ---- #
@@ -632,6 +742,8 @@ async def run_case(
         passages=retrieved,
         prompt_version=PROMPT_VERSION_RAG_ON,
     )
+    on_enforced = _enforce_channel_format(case, on_text)
+    on_text = on_enforced.text
     on_cited = _cited_ids(on_text)
     on_grounding = _grounding_triple(on_text, cited=on_cited, retrieved=retrieved, oracle=oracle)
     rag_on = ArmResult(
@@ -648,6 +760,8 @@ async def run_case(
         tokens_out=on_out,
         cost_usd=on_usd,
         error=error,
+        hashtags_removed=on_enforced.removed,
+        hashtag_shortfall=on_enforced.shortfall,
     )
 
     # ---- the control: the human reference answer, same three conditions ---- #
@@ -843,6 +957,45 @@ def _render_aggregate(rows: Sequence[CaseRow]) -> list[str]:
                 f"{_fmt(on.by_dimension.get(dimension, 0.0))} |"
             )
         lines.append("")
+
+    lines += _render_enforcement(rows)
+    return lines
+
+
+def _render_enforcement(rows: Sequence[CaseRow]) -> list[str]:
+    """What the deterministic channel engine had to correct.
+
+    This sits directly under the `format` row on purpose. Hashtag counts are
+    enforced in code, so `format` can read well *because* a renderer cleaned up
+    after the model -- and a table that showed only the clean score would be
+    reporting the renderer's competence as the model's. These two numbers are how
+    the reader tells the difference, and how a future prompt change can be judged:
+    fewer corrections means the prompt got better, not just the output.
+    """
+    lines = [
+        "### Deterministic format enforcement",
+        "",
+        "Hashtag counts are enforced by `backend/app/engines/channel` before scoring, "
+        "because counting is arithmetic and a model will not do it reliably — measured "
+        "on `gpt-4.1-mini`, the bare instruction `Keine Hashtags` still produced 21. "
+        "**Read the `format` row above together with this one:** a correction is work "
+        "the model left for the renderer, so a clean `format` score with a high "
+        "correction count is the renderer's competence and not the model's. **Zero "
+        "corrections is therefore the good outcome, not a sign the check is idle** — "
+        "it means the prompt carried the rule on its own. Length is deliberately *not* "
+        "enforced: truncating or padding copy would be editing it rather than "
+        "formatting it, so `format` can still fail on length.",
+        "",
+        "| arm | pieces corrected | hashtags removed | pieces left short of the minimum |",
+        "|---|---|---|---|",
+    ]
+    for arm_name in ("rag_off", "rag_on"):
+        arms = [getattr(row, arm_name) for row in rows]
+        corrected = sum(1 for arm in arms if arm.hashtags_removed)
+        removed = sum(arm.hashtags_removed for arm in arms)
+        short = sum(1 for arm in arms if arm.hashtag_shortfall)
+        lines.append(f"| {arm_name} | {corrected} of {len(arms)} | {removed} | {short} |")
+    lines.append("")
     return lines
 
 

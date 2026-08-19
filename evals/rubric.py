@@ -199,6 +199,15 @@ class Rendering:
 
 _URL_RE: Final = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 _HASHTAG_RE: Final = re.compile(r"#\w+", re.UNICODE)
+#: A citation marker, e.g. ``[chunk:plumber-01#0]``. Excluded from the hashtag
+#: count for the same reason URLs are: the ``#`` inside it is part of an
+#: identifier, not a tag. Getting this wrong was not cosmetic -- chunk ids are
+#: ``<case_id>#<ordinal>``, so every citation counted as a hashtag, and since only
+#: the RAG arm cites anything, the rubric was penalising that arm *for doing the
+#: thing RAG is for*. The 2026-08-19 live run read `format` 0.35 against 0.95 on
+#: that basis, and every single one of its reported hashtag violations
+#: ("6 hashtags exceed the maximum of 0 for blog_article") was citations.
+_CITATION_RE: Final = re.compile(r"\[chunk:[^\]\s]+\]", re.IGNORECASE)
 _SENTENCE_SPLIT_RE: Final = re.compile(r"(?<=[.!?])\s+|\n+")
 _NUMBER_RE: Final = re.compile(r"\d+(?:[.,]\d+)*")
 _THOUSANDS_RE: Final = re.compile(r"^\d{1,3}(?:[.,]\d{3})+$")
@@ -210,12 +219,12 @@ def extract_urls(text: str) -> tuple[str, ...]:
 
 
 def extract_hashtags(text: str) -> tuple[str, ...]:
-    """Every hashtag, with URLs removed first.
+    """Every hashtag, with URLs and citation markers removed first.
 
     Without stripping URLs, a fragment identifier (``.../a#anchor``) counts as a
     hashtag and a perfectly compliant post fails the cap.
     """
-    return tuple(_HASHTAG_RE.findall(_URL_RE.sub(" ", text)))
+    return tuple(_HASHTAG_RE.findall(_CITATION_RE.sub(" ", _URL_RE.sub(" ", text))))
 
 
 def normalise_number(token: str) -> str:

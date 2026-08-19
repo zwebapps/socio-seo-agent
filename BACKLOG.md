@@ -86,6 +86,15 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] Per-business model override (`model_routes.business_id`) — one nullable column, no demand yet
 
 ## Phase 11 — Security hardening
+- [ ] Two channel-limit tables disagree, and one is wrong. `agents/nodes.CHANNEL_LIMITS` is
+  `Mapping[str, int]` (plain ceilings: linkedin 3000, facebook 2000, instagram 2200, x 280) while
+  `evals/rubric.CHANNEL_LIMITS` holds the richer spec the rubric grades against (min_chars,
+  hashtag ranges, link rules). The channel NAMES do not even match — `facebook` vs
+  `facebook_post`, `instagram` vs `instagram_caption` — and the numbers conflict (linkedin's 3000
+  is the rubric's *hard* max, not its 1700 editorial target). The rubric's own comment predicted
+  this: "two copies of a platform limit is how the eval starts disagreeing with the product it is
+  grading." Resolve when `channel_specs` lands in Phase 6; until then `engines/channel` takes
+  limits as arguments so it is not a third copy
 - [ ] 10-payload prompt-injection corpus as a test
 - [ ] Per-node tool allowlist enforced in the runtime, not only documented
 - [ ] Regulated-claim guard from `dna.banned_claims`
@@ -95,7 +104,7 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] Langfuse seam, no-op without keys, redaction inside the tracer — `d9deedf`
 - [x] 20 cases + 5 deterministic scorers (Ragas absent, marked so, not invented) — `d9deedf`
 - [x] `evals/report.md` with RAG off vs on vs oracle — `d9deedf`
-- [ ] prompt v1-vs-v2 comparison (needs a live key). Cheap-vs-strong is now runnable: `evals/run.py --tier {cheap,mid,strong}` overrides the GENERATE tier and the report header names it. Blocked for THIS credential only — its OpenRouter data policy refuses the mid and strong chains (404 `no endpoints matching your guardrail restrictions`), so only `--tier cheap` can run live until that account setting changes
+- [ ] prompt v1-vs-v2 comparison as a FLAG (the comparison itself has now been done by hand across four live runs — see the note in `evals/run.py._user_prompt`; what is missing is the ability to run both arms in one invocation). Cheap-vs-strong is now runnable: `evals/run.py --tier {cheap,mid,strong}` overrides the GENERATE tier and the report header names it. Blocked for THIS credential only — its OpenRouter data policy refuses the mid and strong chains (404 `no endpoints matching your guardrail restrictions`), so only `--tier cheap` can run live until that account setting changes
 - [ ] ⛔ Langfuse keys
 
 ## Phase 13 — Feedback → learned preferences

@@ -530,3 +530,33 @@ def test_aggregate_counts_the_untested_cells() -> None:
 
     assert summary.mean_score == 1.0
     assert summary.not_exercised == 1, "a perfect mean must disclose how much was untested"
+
+
+def test_a_citation_marker_is_not_counted_as_a_hashtag() -> None:
+    """The measurement bug behind the reported `format` regression.
+
+    Chunk ids are `<case_id>#<ordinal>`, so `[chunk:plumber-01#0]` contains a `#`.
+    Counting it as a hashtag penalised the RAG arm *for citing its sources* -- the
+    one thing that arm exists to do. Every hashtag violation in the 2026-08-19 live
+    report ("6 hashtags exceed the maximum of 0 for blog_article") was citations.
+    """
+    text = "Kosten 89 Euro. [chunk:plumber-01#0] Anfahrt frei. [chunk:plumber-01#1]"
+
+    assert extract_hashtags(text) == ()
+
+
+def test_real_hashtags_are_still_counted_alongside_citations() -> None:
+    """The fix must not become a blanket excuse: a genuine tag still counts."""
+    text = "Frisch gebacken. [chunk:bakery-01#0] #Baeckerei #Koblenz"
+
+    assert extract_hashtags(text) == ("#Baeckerei", "#Koblenz")
+
+
+def test_an_article_full_of_citations_no_longer_fails_the_hashtag_cap() -> None:
+    """End to end through the scorer that was producing the wrong verdict."""
+    body = "Guter Text über den Service. " * 100
+    cited = body + " ".join(f"[chunk:plumber-01#{index}]" for index in range(6))
+
+    result = score_format(Rendering(text=cited), "blog_article")
+
+    assert not any("hashtag" in violation.lower() for violation in result.violations)
