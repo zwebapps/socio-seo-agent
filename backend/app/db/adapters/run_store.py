@@ -21,10 +21,45 @@ from backend.app.services.run_service import RunEventRecord, RunRecord
 
 
 class PostgresRunStore:
-    """The real store behind ``RunService``."""
+    """The real store behind ``RunService``, scoped to one business.
+
+    **The business id is a constructor argument, and that is the fix for a bug that
+    made every run endpoint 404 in production.**
+
+    This store used to resolve the owning business from the run row itself, calling
+    that a chicken-and-egg: RLS needs the business id, and the id lives on the row RLS
+    protects. Its docstring said the lookup ran on "the OWNER session" -- but it
+    imported ``db.session.session``, which is the RESTRICTED role. Under FORCE row-level
+    security with no tenant GUC set, that role reads ZERO rows, so the lookup returned
+    ``None`` for every run in existence and every read 404'd. Verified against the live
+    database: the owner role counts 1, the app role unscoped counts 0. The Phase 9
+    timeline screen had therefore never worked outside tests, because the in-memory
+    store has no RLS to fail against.
+
+    There was never a chicken-and-egg. Every route that reaches this store already
+    depends on ``current_business``, so the caller knows the tenant before it asks --
+    the lookup was answering a question nobody needed to ask. Taking the id here means
+    RLS does the isolation rather than a privileged read carved out of it: a run
+    belonging to another tenant is simply not found, which is the same 404 the API
+    already returns, arrived at by the database instead of by an ``if``.
+
+    Deliberately NOT the SECURITY DEFINER pattern used for ``resolve_short_link``
+    (migration ``7c1e4a90b2d5``). That exists because a public visitor genuinely has no
+    tenant context and the lookup is what produces one. Here the context exists, so the
+    right move is to use it, not to privilege a read past it.
+
+    One instance per request, since it carries request state.
+    """
+
+    def __init__(self, business_id: UUID) -> None:
+        self._business_id = business_id
 
     async def create(self, run: RunRecord) -> RunRecord:
-        async with business_session(run.business_id) as s:
+        # Insert under this request's tenant. The record carries a business_id too, and
+        # for a brand-new row they are the same -- but scoping to the request means a
+        # record claiming a different tenant fails the RLS WITH CHECK rather than being
+        # written where it asked to be.
+        async with business_session(self._business_id) as s:
             s.add(
                 Run(
                     id=run.id,
@@ -38,10 +73,7 @@ class PostgresRunStore:
         return run
 
     async def get(self, run_id: UUID) -> RunRecord | None:
-        business_id = await self._business_for(run_id)
-        if business_id is None:
-            return None
-        async with business_session(business_id) as s:
+        async with business_session(self._business_id) as s:
             row = (await s.execute(select(Run).where(Run.id == run_id))).scalar_one_or_none()
         if row is None:
             return None
@@ -57,7 +89,17 @@ class PostgresRunStore:
         )
 
     async def update(self, run: RunRecord) -> None:
-        async with business_session(run.business_id) as s, s.begin():
+        # This request's tenant, NOT the record's own `business_id`. Trusting the
+        # record would let a caller that constructed one reach another tenant's row --
+        # RLS would be scoped to whatever the argument claimed, which is the client
+        # choosing its own authorisation. Under this scope a foreign row is invisible
+        # and the KeyError below is what a mismatch produces.
+        # No `s.begin()`: `business_session` has already opened the transaction --
+        # it must, because `SET LOCAL` is transaction-scoped. A second begin raises
+        # InvalidRequestError. This line used to carry one, and it never fired only
+        # because the broken tenant lookup returned early before reaching it, so the
+        # first bug was hiding the second.
+        async with business_session(self._business_id) as s:
             row = (await s.execute(select(Run).where(Run.id == run.id))).scalar_one_or_none()
             if row is None:
                 raise KeyError(run.id)
@@ -68,13 +110,15 @@ class PostgresRunStore:
             row.checkpoint = run.checkpoint
 
     async def append_event(self, event: RunEventRecord) -> None:
-        business_id = await self._business_for(event.run_id)
-        if business_id is None:
-            raise KeyError(event.run_id)
-        async with business_session(business_id) as s, s.begin():
+        # No `s.begin()`: `business_session` has already opened the transaction --
+        # it must, because `SET LOCAL` is transaction-scoped. A second begin raises
+        # InvalidRequestError. This line used to carry one, and it never fired only
+        # because the broken tenant lookup returned early before reaching it, so the
+        # first bug was hiding the second.
+        async with business_session(self._business_id) as s:
             s.add(
                 RunEvent(
-                    business_id=business_id,
+                    business_id=self._business_id,
                     run_id=event.run_id,
                     seq=event.seq,
                     node=event.node,
@@ -84,20 +128,14 @@ class PostgresRunStore:
             )
 
     async def next_seq(self, run_id: UUID) -> int:
-        business_id = await self._business_for(run_id)
-        if business_id is None:
-            raise KeyError(run_id)
-        async with business_session(business_id) as s:
+        async with business_session(self._business_id) as s:
             highest = (
                 await s.execute(select(func.max(RunEvent.seq)).where(RunEvent.run_id == run_id))
             ).scalar()
         return int(highest or 0) + 1
 
     async def list_events(self, run_id: UUID, *, after_seq: int = 0) -> Sequence[RunEventRecord]:
-        business_id = await self._business_for(run_id)
-        if business_id is None:
-            return []
-        async with business_session(business_id) as s:
+        async with business_session(self._business_id) as s:
             rows = (
                 (
                     await s.execute(
@@ -120,22 +158,6 @@ class PostgresRunStore:
             )
             for row in rows
         ]
-
-    async def _business_for(self, run_id: UUID) -> UUID | None:
-        """Find which business owns a run, so the scoped session can be opened.
-
-        A chicken-and-egg: RLS needs the business id, and the business id lives on the row
-        RLS is protecting. Resolved with the OWNER session for this ONE column lookup —
-        `runs.id` is a UUID nobody can guess, the query returns a single scalar, and every
-        subsequent statement in the request runs scoped. Widening this shortcut to anything
-        else would defeat the isolation it is carved out of.
-        """
-        from backend.app.db.session import session
-
-        async with session() as s:
-            return (
-                await s.execute(select(Run.business_id).where(Run.id == run_id))
-            ).scalar_one_or_none()
 
 
 __all__ = ["PostgresRunStore"]

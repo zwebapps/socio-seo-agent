@@ -47,11 +47,6 @@ MAX_STREAM_SECONDS = 15 * 60
 TERMINAL = frozenset({"awaiting_approval", "done", "failed", "partial"})
 
 
-def get_run_service() -> RunService:
-    """The real service. Overridden in tests."""
-    return RunService(PostgresRunStore())
-
-
 async def current_business(user: CurrentUser) -> UUID:
     """The business this caller is acting for.
 
@@ -77,6 +72,20 @@ async def current_business(user: CurrentUser) -> UUID:
             },
         )
     return business_id
+
+
+async def get_run_service(
+    business_id: Annotated[UUID, Depends(current_business)],
+) -> RunService:
+    """The real service, scoped to this caller's business. Overridden in tests.
+
+    The tenant is injected HERE rather than resolved inside the store, which is what
+    fixes the 404-on-every-run bug: the store used to look the owning business up from
+    the run row on an unscoped session, and under FORCE row-level security that read
+    returns nothing. Every route already depends on `current_business`, so the answer
+    was available all along -- see `PostgresRunStore` for the full account.
+    """
+    return RunService(PostgresRunStore(business_id))
 
 
 class CamelModel(BaseModel):

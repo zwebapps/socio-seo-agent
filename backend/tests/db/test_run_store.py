@@ -1,0 +1,194 @@
+"""``PostgresRunStore`` against real Postgres, with RLS actually on.
+
+**This file exists because its absence hid a total outage.** The run store was only
+ever exercised through ``InMemoryRunStore``, which is a dict and has no row-level
+security to fail against. So every test passed while the real store returned ``None``
+for every run that exists: it resolved the owning business from the run row on an
+unscoped session, and under ``FORCE ROW LEVEL SECURITY`` the restricted application
+role reads zero rows without a tenant GUC. The Phase 9 timeline screen had never
+worked outside tests.
+
+The lesson generalises, and it is the reason this file is structured around the
+restricted role rather than around the store's methods: an adapter whose whole job is
+to satisfy RLS cannot be tested against something that does not have RLS.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+
+from backend.app.db import session as session_module
+from backend.app.db.adapters.run_store import PostgresRunStore
+from backend.app.services.run_service import RunEventRecord, RunRecord
+
+pytestmark = pytest.mark.db
+
+
+@pytest.fixture
+def scoped_sessions(app_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point the session factory at this test's engine -- the RESTRICTED role.
+
+    Deliberately the restricted role and nothing else. Using the owner engine here
+    would reproduce exactly the blindness that let the bug through.
+    """
+    monkeypatch.setattr(
+        session_module,
+        "_session_factory",
+        async_sessionmaker(app_engine, expire_on_commit=False, autoflush=False),
+    )
+    yield
+
+
+@pytest.fixture
+async def business_a(two_businesses: tuple[UUID, UUID]) -> UUID:
+    return two_businesses[0]
+
+
+@pytest.fixture
+async def business_b(two_businesses: tuple[UUID, UUID]) -> UUID:
+    return two_businesses[1]
+
+
+def _run(business_id: UUID, *, goal: str = "get more leads") -> RunRecord:
+    return RunRecord(id=uuid4(), business_id=business_id, goal=goal, state="queued")
+
+
+# --------------------------------------------------------------------------- #
+# The bug
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_run_reads_back_on_the_restricted_role(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The regression test for the 404-on-every-run bug.
+
+    Before the fix this returned ``None``: the store asked an unscoped session which
+    business owned the run, RLS answered "no rows", and the store concluded the run did
+    not exist. Nothing errored -- which is why it looked like "nobody has started a run
+    yet" rather than like a bug.
+    """
+    store = PostgresRunStore(business_a)
+    created = await store.create(_run(business_a))
+
+    found = await store.get(created.id)
+
+    assert found is not None, "the run exists; a None here is the bug this file was written for"
+    assert found.id == created.id
+    assert found.business_id == business_a
+    assert found.goal == "get more leads"
+
+
+async def test_a_run_belonging_to_another_business_is_invisible(
+    scoped_sessions: None, business_a: UUID, business_b: UUID
+) -> None:
+    """Isolation is now the DATABASE's answer, not an ``if`` in the route.
+
+    The API also compares ``run.business_id`` to the caller's, and that check stays as
+    defence in depth -- but this asserts the store cannot hand it a foreign row to
+    compare in the first place.
+    """
+    a_store = PostgresRunStore(business_a)
+    b_store = PostgresRunStore(business_b)
+    a_run = await a_store.create(_run(business_a, goal="A's private goal"))
+
+    assert await b_store.get(a_run.id) is None
+
+
+async def test_events_are_written_and_read_under_the_callers_scope(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """`append_event` had the same unscoped lookup, so it raised KeyError for every run."""
+    store = PostgresRunStore(business_a)
+    run = await store.create(_run(business_a))
+
+    seq = await store.next_seq(run.id)
+    await store.append_event(
+        RunEventRecord(
+            run_id=run.id, seq=seq, node="INTAKE", status="done", payload={}, at=datetime.now(UTC)
+        )
+    )
+
+    events = await store.list_events(run.id)
+    assert [e.node for e in events] == ["INTAKE"]
+    assert await store.next_seq(run.id) == seq + 1
+
+
+async def test_another_business_cannot_read_the_events(
+    scoped_sessions: None, business_a: UUID, business_b: UUID
+) -> None:
+    """Run events carry the payloads, so leaking them leaks the work itself."""
+    a_store = PostgresRunStore(business_a)
+    run = await a_store.create(_run(business_a))
+    await a_store.append_event(
+        RunEventRecord(
+            run_id=run.id, seq=1, node="GENERATE", status="done", payload={}, at=datetime.now(UTC)
+        )
+    )
+
+    assert list(await PostgresRunStore(business_b).list_events(run.id)) == []
+
+
+async def test_updating_another_businesss_run_raises_rather_than_writing(
+    scoped_sessions: None, business_a: UUID, business_b: UUID
+) -> None:
+    """`update` scopes to the REQUEST's tenant, not to the record's own business_id.
+
+    Trusting the record would be the client choosing its own authorisation: a caller
+    holding a constructed ``RunRecord`` could name another tenant and have RLS scoped to
+    whatever it claimed. Under the request's scope the row is invisible, so the write
+    finds nothing and says so.
+    """
+    a_run = await PostgresRunStore(business_a).create(_run(business_a))
+    forged = RunRecord(
+        id=a_run.id,
+        business_id=business_a,  # the record claims A...
+        goal="hijacked",
+        state="done",
+    )
+
+    with pytest.raises(KeyError):
+        await PostgresRunStore(business_b).update(forged)  # ...but B is asking
+
+    still_a = await PostgresRunStore(business_a).get(a_run.id)
+    assert still_a is not None
+    assert still_a.goal == "get more leads", "A's run must be untouched"
+    assert still_a.state == "queued"
+
+
+async def test_a_checkpoint_survives_the_round_trip(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The checkpoint IS the resumability mechanism, so it has to come back intact."""
+    store = PostgresRunStore(business_a)
+    run = await store.create(_run(business_a))
+    run.checkpoint = {"node": "GENERATE", "draft": {"title": "Rohrbruch in Koblenz"}}
+
+    await store.update(run)
+    restored = await store.get(run.id)
+
+    assert restored is not None
+    assert restored.checkpoint["draft"]["title"] == "Rohrbruch in Koblenz"
+
+
+async def test_the_app_role_still_reads_nothing_unscoped(
+    scoped_sessions: None, business_a: UUID, app_engine: AsyncEngine
+) -> None:
+    """The premise, proved rather than assumed.
+
+    If this ever returns a row, every isolation assertion above is vacuous and the
+    store's tenant scoping is decoration.
+    """
+    from sqlalchemy import text
+
+    run = await PostgresRunStore(business_a).create(_run(business_a))
+
+    async with app_engine.connect() as conn:
+        blind = await conn.execute(text("SELECT count(*) FROM runs WHERE id = :i"), {"i": run.id})
+
+    assert blind.scalar() == 0

@@ -233,3 +233,44 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] **A cookie-bearing request from a non-browser client is now refused** (no `Origin`/`Referer`).
   Intended — the cookie is a browser credential and there is no machine-to-machine mode — but it is a
   behaviour change for anyone curling with a session cookie.
+
+## Found by the review-tabs work, fixed the same day (2026-08-19)
+
+- [x] **Every run endpoint 404'd in production, and checkpointing could never have worked.**
+  `PostgresRunStore._business_for` resolved the owning business from the run row on an UNSCOPED
+  session — its docstring said "the OWNER session" but it imported `db.session.session`, which is
+  the RESTRICTED role. Under FORCE RLS with no tenant GUC that reads zero rows, so the lookup
+  returned `None` for every run and `GET /runs/{id}`, `/events` and `/review` all 404'd. Verified
+  live: owner counts 1, app role counts 0. **The Phase 9 timeline screen had never worked outside
+  tests**, because `InMemoryRunStore` is a dict with no RLS to fail against.
+  Fixed by constructor-injecting the tenant (`PostgresRunStore(business_id)`) from the
+  `current_business` dependency every route already had — so there was never a chicken-and-egg, and
+  isolation is now the database's answer rather than an `if` in the route. Deliberately NOT the
+  SECURITY DEFINER pattern used for `resolve_short_link`: that exists because a public visitor has
+  no tenant context, whereas here the context existed and the right move is to use it rather than
+  privilege a read past it. Zero protocol changes — the id goes in the constructor, not the methods.
+  **The first bug was hiding a second:** `update` and `append_event` called `s.begin()` on a session
+  `business_session` had already begun, which raises `InvalidRequestError`. They had never fired,
+  because the broken lookup returned early first. So a run's checkpoint — the entire resumability
+  mechanism — could not have been written in production either.
+  `backend/tests/db/test_run_store.py` is new and is the test whose absence hid all of this: the
+  store was only ever exercised against the in-memory implementation. An adapter whose whole job is
+  to satisfy RLS cannot be tested against something that has no RLS.
+- [x] **The `--edge` contrast token failed the 3:1 it existed to provide** — 1.57:1 light, 1.86:1
+  dark, while `globals.css` claimed 3:1 in a comment. So the documented mitigation for the
+  neumorphic ~1.2:1 shadow problem was delivering nothing, on every interactive control, in both
+  themes. Now 3.37 / 3.57 against `--bg` with the worst surface checked too, and the focus ring got
+  its own `--focus-ring` token (3.89 light) so the brand `--accent` did not have to move. Ratios
+  recomputed independently from the hex values, not taken on trust.
+- [ ] **Nothing in the application executes the graph.** `run_graph`, `build_nodes` and
+  `RunService.checkpoint` are called only from tests, so `POST /api/v1/runs` creates a `queued` row
+  that never advances and `runs.checkpoint` stays `{}`. Every real run's review therefore renders
+  the honest empty states, correctly, and that is all it can render. **This is the largest remaining
+  functional gap in the product** — the pieces all exist and pass tests individually; nothing joins
+  them at runtime.
+- [ ] `/api/v1/onboarding` has only `/preview` — nothing persists the drafted Business DNA, so
+  `tone`/`audience`/`banned_claims` are empty for every business (created at signup with `dna = {}`).
+  Consequence: the regulated-claim guard has no claims to enforce for a real tenant.
+- [ ] `/auth/me` exposes no `businessId`, which is why the memory routes derive the tenant from the
+  session instead of taking a path id like their `proposals` sibling.
+- [ ] REPACK discards hashtags — `REPACK_TOOL` asks the model for them, the node stores only `body`.
