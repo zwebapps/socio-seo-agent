@@ -111,6 +111,10 @@ class UserOut(CamelModel):
     id: UUID
     email: str
     is_active: bool
+    #: Exposed so the UI can tell an operator from a customer and hide what the
+    #: customer cannot use anyway. It is NOT the authorisation decision — the server
+    #: re-checks the role on every admin call.
+    role: str
 
 
 def _error(code: str, message: str) -> dict[str, str]:
@@ -285,7 +289,7 @@ async def login(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_INVALID_CREDENTIALS)
 
     _set_session_cookie(response, user.id, settings)
-    return UserOut(id=user.id, email=user.email, is_active=user.is_active)
+    return UserOut(id=user.id, email=user.email, is_active=user.is_active, role=user.role)
 
 
 @router.post(
@@ -312,4 +316,4 @@ async def logout(settings: Annotated[Settings, Depends(get_auth_settings)]) -> R
     summary="The signed-in user",
 )
 async def me(user: CurrentUser) -> UserOut:
-    return UserOut(id=user.id, email=user.email, is_active=user.is_active)
+    return UserOut(id=user.id, email=user.email, is_active=user.is_active, role=user.role)

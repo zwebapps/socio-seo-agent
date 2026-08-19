@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from backend.app.api import admin_models as admin_api
+from backend.app.db.models import Role, User
 from backend.app.llm.route_config import (
     InMemoryRouteStore,
     ProviderSettingRecord,
@@ -58,7 +59,15 @@ def _client(
 
     app.dependency_overrides[admin_api.get_resolver] = _resolver
     if authenticated:
-        app.dependency_overrides[admin_api.require_admin] = lambda: None
+        # A real platform admin, not None: the routes record who made the change, so
+        # overriding with None was pretending the dependency returns nothing when it
+        # returns the author.
+        app.dependency_overrides[admin_api.require_admin] = lambda: User(
+            email="admin@example.test",
+            password_hash="x",
+            is_active=True,
+            role=Role.PLATFORM_ADMIN,
+        )
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 

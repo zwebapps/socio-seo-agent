@@ -115,12 +115,20 @@ export default function ModelsAdminPage() {
               <p className="text-sm font-semibold" style={{ color: "var(--err)" }}>
                 {error.code === "not_authenticated"
                   ? "Sign in required"
-                  : "Something went wrong"}
+                  : error.code === "forbidden"
+                    ? "Not available on this account"
+                    : "Something went wrong"}
               </p>
               <p className="mt-1 text-sm">{error.message}</p>
               {error.code === "network" && (
                 <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
                   Start the API with <code>make api</code>, then retry.
+                </p>
+              )}
+              {error.code === "forbidden" && (
+                <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+                  These are platform-wide settings. Ask whoever operates this
+                  installation if you need them changed.
                 </p>
               )}
               {error.code === "not_authenticated" && (
@@ -135,7 +143,7 @@ export default function ModelsAdminPage() {
                 </p>
               )}
             </div>
-            {error.code !== "not_authenticated" && (
+            {error.code !== "not_authenticated" && error.code !== "forbidden" && (
               <SoftButton onClick={() => void load()}>Retry</SoftButton>
             )}
           </div>

@@ -26,6 +26,7 @@ from pydantic.alias_generators import to_camel
 
 from backend.app.api.auth import CurrentUser
 from backend.app.db.adapters.route_store import PostgresRouteStore, RouteConfigWriter
+from backend.app.db.models import Role, User
 from backend.app.llm import ModelTier, TaskClass, config_status
 from backend.app.llm.catalogue import CatalogueModel, list_models
 from backend.app.llm.pricing import is_priced
@@ -74,18 +75,35 @@ async def get_resolver() -> RouteResolver:
     return resolver
 
 
-async def require_admin(user: CurrentUser) -> object:
-    """Authentication gate that also yields the author.
+async def require_admin(user: CurrentUser) -> User:
+    """Platform-admin gate that also yields the author.
 
     Returns the caller rather than None so a route needs ONE dependency instead of two:
-    asking for `CurrentUser` again alongside this would make the auth check appear
-    twice in every signature, and an `Optional[CurrentUser]` parameter is not a shape
-    FastAPI can build a response model from.
+    asking for `CurrentUser` again alongside this would put the auth check in every
+    signature twice, and an `Optional[CurrentUser]` parameter is not a shape FastAPI can
+    build a response model from.
 
-    Currently any authenticated user, because this build has no role column yet. Kept as
-    its own dependency so adding one is a change here rather than in five routes — and
-    so a test overriding it makes the intent obvious.
+    **403, not 401, for a signed-in user with the wrong role.** The two are not
+    interchangeable: 401 means "go and sign in", which for someone already signed in is
+    a loop they cannot escape. 403 means "I know who you are, and no".
+
+    Deactivation beats role: an inactive account is refused whatever it is. `current_user`
+    already rejects an inactive session, and this repeats the check because a future
+    caller might resolve the user some other way, and the cost of the extra comparison is
+    nothing next to the cost of missing it.
+
+    The refusal deliberately does NOT say "you need platform admin". Naming the
+    capability tells a customer exactly what to go phishing for, and it is not
+    information they can act on legitimately.
     """
+    if not user.is_active or user.role != Role.PLATFORM_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "forbidden",
+                "message": "Your account cannot change these settings.",
+            },
+        )
     return user
 
 
@@ -188,7 +206,7 @@ def _task_class(raw: str) -> TaskClass:
 
 @router.get("/routes", response_model=RoutesOut, response_model_by_alias=True)
 async def list_routes(
-    _: Annotated[object, Depends(require_admin)],
+    _: Annotated[User, Depends(require_admin)],
     resolver: Annotated[RouteResolver, Depends(get_resolver)],
 ) -> RoutesOut:
     """Every task class with its EFFECTIVE route and where that route came from."""
@@ -211,7 +229,7 @@ async def list_routes(
 async def put_route(
     task_class: str,
     payload: RouteIn,
-    admin: Annotated[object, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_admin)],
     writer: Annotated[Writer, Depends(get_writer)],
 ) -> dict[str, str]:
     """Point one task class at a specific chain of models."""
@@ -220,7 +238,7 @@ async def put_route(
         task_class=task.value,
         tier=payload.tier.value,
         chain=[{"provider": e.provider, "model": e.model} for e in payload.chain],
-        updated_by=getattr(admin, "id", None),
+        updated_by=admin.id,
         note=payload.note,
     )
     return {"status": "saved", "taskClass": task.value}
@@ -229,7 +247,7 @@ async def put_route(
 @router.delete("/routes/{task_class}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_route(
     task_class: str,
-    _: Annotated[object, Depends(require_admin)],
+    _: Annotated[User, Depends(require_admin)],
     writer: Annotated[Writer, Depends(get_writer)],
 ) -> Response:
     """Revert one task class to the code default."""
@@ -240,7 +258,7 @@ async def delete_route(
 
 @router.get("/providers", response_model=ProvidersOut, response_model_by_alias=True)
 async def list_providers(
-    _: Annotated[object, Depends(require_admin)],
+    _: Annotated[User, Depends(require_admin)],
     resolver: Annotated[RouteResolver, Depends(get_resolver)],
 ) -> ProvidersOut:
     """Provider availability, and what each one needs in order to be usable.
@@ -281,7 +299,7 @@ async def list_providers(
 async def put_provider(
     provider: str,
     payload: ProviderIn,
-    admin: Annotated[object, Depends(require_admin)],
+    admin: Annotated[User, Depends(require_admin)],
     writer: Annotated[Writer, Depends(get_writer)],
 ) -> dict[str, str]:
     """Turn a provider on or off, and set its address if it is a local one."""
@@ -298,7 +316,7 @@ async def put_provider(
         provider=name,
         enabled=payload.enabled,
         base_url=payload.base_url,
-        updated_by=getattr(admin, "id", None),
+        updated_by=admin.id,
         note=payload.note,
     )
     return {"status": "saved", "provider": name}
@@ -315,7 +333,7 @@ class CatalogueOut(CamelModel):
 
 @router.get("/available", response_model=CatalogueOut, response_model_by_alias=True)
 async def available_models(
-    _: Annotated[object, Depends(require_admin)],
+    _: Annotated[User, Depends(require_admin)],
     resolver: Annotated[RouteResolver, Depends(get_resolver)],
     provider: str = "openrouter",
 ) -> CatalogueOut:

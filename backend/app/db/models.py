@@ -13,6 +13,7 @@ learned_style, approvals.
 
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -40,6 +41,27 @@ from backend.app.db.base import Base, BusinessScopedMixin, TimestampMixin, UuidP
 EMBEDDING_DIM = 1536
 
 
+class Role(StrEnum):
+    """What a user is allowed to do.
+
+    Two scopes in one column, deliberately:
+
+    * MEMBER and OWNER are BUSINESS-scoped — they describe a person's standing inside
+      their own business, and neither can touch anything platform-wide.
+    * PLATFORM_ADMIN is PLATFORM-scoped. It exists because model routing and provider
+      settings have no business_id: they are the operator's cost-and-quality decisions,
+      so a customer must not be able to change them.
+
+    A second column would be tidier in the abstract, but there is exactly one
+    platform-scoped capability today and a `role` a reviewer can read in a table row
+    beats two columns nobody can hold in their head.
+    """
+
+    MEMBER = "member"
+    OWNER = "owner"
+    PLATFORM_ADMIN = "platform_admin"
+
+
 class User(Base, UuidPkMixin, TimestampMixin):
     __tablename__ = "users"
 
@@ -49,7 +71,19 @@ class User(Base, UuidPkMixin, TimestampMixin):
         default=True, server_default=text("true"), nullable=False
     )
 
+    #: Defaults to OWNER: signup creates a business, and the person who created it owns
+    #: it. PLATFORM_ADMIN is never reachable through signup -- it is granted out of band
+    #: by scripts/grant_platform_admin.py, because a self-service path to it would be
+    #: privilege escalation by HTTP request.
+    role: Mapped[str] = mapped_column(
+        String(32), default=Role.OWNER, server_default=Role.OWNER.value, nullable=False
+    )
+
     businesses: Mapped[list["Business"]] = relationship(back_populates="owner")
+
+    __table_args__ = (
+        CheckConstraint("role in ('member','owner','platform_admin')", name="role_valid"),
+    )
 
 
 class Business(Base, UuidPkMixin, TimestampMixin):

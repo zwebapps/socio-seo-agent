@@ -64,6 +64,15 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
     if (response.status === 401) {
       throw new ApiError("not_authenticated", "Sign in to change model settings.", 401);
     }
+    if (response.status === 403) {
+      // Distinct from 401 on purpose: this person IS signed in, so sending them to the
+      // login page is a loop they cannot escape.
+      throw new ApiError(
+        "forbidden",
+        "Your account does not have access to these settings.",
+        403,
+      );
+    }
     if (Array.isArray(detail) && detail.length > 0) {
       const first = detail[0] as { msg?: string; loc?: unknown[] };
       throw new ApiError(
