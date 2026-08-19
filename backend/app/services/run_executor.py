@@ -199,14 +199,38 @@ class RunExecutor:
         # task can be collected mid-run -- a bug that presents as a run silently
         # stopping at a random node.
         self._tasks: set[asyncio.Task[None]] = set()
+        # Which runs this process is executing right now.
+        #
+        # Needed because the database CANNOT answer it. A row saying `running` means
+        # either "a task is driving this" or "a process died and left it there", and
+        # those want opposite responses from `resume`: refuse the first, allow the
+        # second. The stored state cannot tell them apart; the executor can, for its
+        # own process, which is the only place a duplicate could be started.
+        self._live: set[UUID] = set()
 
     @property
     def in_flight(self) -> int:
         """How many runs are executing or queued. Exists so a test can assert it."""
         return len(self._tasks)
 
+    def is_running(self, run_id: UUID) -> bool:
+        """Whether THIS process is already executing that run.
+
+        Only ever this process. A second replica could be running it and this would
+        say no -- which is honest about what an in-process executor can know, and is
+        why the module docstring calls a distributed worker the real answer. It closes
+        the duplicate that is actually reachable today: two requests to one API.
+        """
+        return run_id in self._live
+
     def submit(self, run_id: UUID, business_id: UUID, goal: str, *, resume: bool = False) -> None:
-        """Start executing a run. Returns immediately."""
+        """Start executing a run. Returns immediately.
+
+        Marks the run live BEFORE creating the task, not inside it: a task does not
+        begin until the loop yields, so registering it there would leave a window in
+        which `is_running` says no and a second submit slips through.
+        """
+        self._live.add(run_id)
         task = asyncio.create_task(
             self._guarded(run_id, business_id, goal, resume=resume),
             name=f"run:{run_id}",
@@ -221,6 +245,13 @@ class RunExecutor:
 
     async def _guarded(self, run_id: UUID, business_id: UUID, goal: str, *, resume: bool) -> None:
         """Run under the concurrency limit, and never let an exception escape silently."""
+        try:
+            await self._run_once(run_id, business_id, goal, resume=resume)
+        finally:
+            # In a `finally`, so a crash cannot leave a run permanently unresumable.
+            self._live.discard(run_id)
+
+    async def _run_once(self, run_id: UUID, business_id: UUID, goal: str, *, resume: bool) -> None:
         async with self._semaphore:
             service = self._service_factory(business_id)
             try:

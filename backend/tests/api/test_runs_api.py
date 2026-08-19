@@ -272,6 +272,9 @@ class _RecordingExecutor:
     def submit(self, run_id: UUID, business_id: UUID, goal: str, *, resume: bool = False) -> None:
         self.submitted.append((run_id, business_id, goal, resume))
 
+    def is_running(self, run_id: UUID) -> bool:
+        return False
+
 
 def _client_with_executor(service: RunService, executor: _RecordingExecutor) -> httpx.AsyncClient:
     app = create_app()
@@ -383,3 +386,52 @@ async def test_the_application_holds_exactly_one_executor() -> None:
 
     assert isinstance(first, RunExecutor)
     assert first is second
+
+
+class _LiveExecutor(_RecordingExecutor):
+    """Reports the given runs as already executing in this process."""
+
+    def __init__(self, live: set[UUID]) -> None:
+        super().__init__()
+        self._live = live
+
+    def is_running(self, run_id: UUID) -> bool:
+        return run_id in self._live
+
+
+async def test_resuming_a_run_that_is_already_executing_is_refused() -> None:
+    """Found by driving the real API, not by reading the code.
+
+    A run in state `running` was accepted for resume, which would put a SECOND
+    executor on the same run: two writers racing on `next_seq` and on the checkpoint --
+    the exact corruption the ordered event drain prevents one level down, reintroduced
+    one level up.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    executor = _LiveExecutor(live={run.id})
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "run_already_executing"
+    assert executor.submitted == []
+
+
+async def test_a_run_left_running_by_a_dead_process_can_still_be_resumed() -> None:
+    """The other half, and the reason refusing the DB state `running` would be wrong.
+
+    After a restart the row still says `running` and nothing is driving it. That is the
+    case resume exists for, so it must be allowed -- which is why the check asks the
+    executor rather than the database.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    executor = _LiveExecutor(live=set())  # a fresh process knows of no live runs
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 202
+    assert executor.submitted == [(run.id, BUSINESS, "more leads", True)]

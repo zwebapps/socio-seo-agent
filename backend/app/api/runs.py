@@ -268,6 +268,23 @@ async def resume_run(
                 "message": f"This run already finished ({run.state}) and cannot be resumed.",
             },
         )
+    if executor.is_running(run_id):
+        # Found by driving the real API: a run that is ACTIVELY executing was accepted
+        # for resume, which would put a second executor on the same run -- two writers
+        # racing on `next_seq` and on the checkpoint, i.e. exactly the corruption the
+        # ordered event drain exists to prevent, reintroduced one level up.
+        #
+        # Refusing the DB state `running` outright would be wrong: after a process
+        # restart the row still says `running` and nothing is driving it, which is the
+        # case resume exists for. Only the executor can tell those apart, and only for
+        # its own process -- see `RunExecutor.is_running`.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_already_executing",
+                "message": "This run is already executing.",
+            },
+        )
     if run.state == "awaiting_approval":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
