@@ -31,7 +31,7 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] `kb` engine (extract, chunk, hash) + agentic retrieval loop with trace — `9a3aba8`
 - [x] pgvector `ChunkStore`, `ProbeStore`, `RouterEmbedder` — `ddac077`
 - [x] Fix: duplicate text cited the wrong document — `ddac077`
-- [ ] PDF and DOCX extractors (registry entries currently raise; needs pypdf, python-docx)
+- [x] pdf/docx extractors behind a lazy import naming the missing package — `d9deedf`
 
 ## Phase 4 — seo + serp + NAP
 - [x] `seo` engine: deterministic 0–100 score, quantitative fix hints, JSON-LD — `c7fc7a1`
@@ -48,21 +48,21 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] `AgentState`, run caps, JSON checkpoint round trip — `731670a`
 - [x] Graph driver: retry loop, early exits, interrupt, resume, events — `731670a`
 - [x] Wire the real nodes: 8 nodes, injected deps, HARVEST+VALIDATE call no model — `5c9409c`
-- [ ] Persist runs and run_events; SSE endpoint for the timeline
+- [x] Persist runs + run_events; resumable, terminating SSE stream — `3163123`
 
 ## Phase 7 — Memory
-- [ ] Business memory read at INTAKE and applied in the system prompt
+- [x] Business memory read at INTAKE and rendered one rule per line — `d9deedf`
 - [ ] "What I remember about your business" panel, editable
-- [ ] Cross-run demo: state a preference in run 1, see it obeyed in run 2
+- [x] A remembered preference asserted present in the assembled prompt — `d9deedf`
 
 ## Phase 8 — Lead loop
-- [ ] `leads` + `short_links` tables with RLS
-- [ ] Short-link service `/l/{code}` and the `/go/{business}` link hub
+- [x] `short_links`, `link_clicks`, `leads` with RLS — `3163123`
+- [x] Short-link service `/l/{code}` + link hub `/go/{id}` — `d9deedf`
 - [ ] Landing page + CTA generation
-- [ ] Public form endpoint (honeypot, rate limit) and `content_piece → lead` attribution
+- [x] Public form (honeypot, rate limit, size cap) + content→lead attribution — `d9deedf`
 
 ## Phase 9 — UI completion
-- [ ] Run timeline screen consuming SSE
+- [x] Run timeline screen, resumable with a polling fallback — `3163123`
 - [ ] Review tabs: draft · SEO findings · social · AI blocks
 - [x] `/developer/models`: model picker, provider toggles, Ollama address, behind a server-side role check — `1e5f4c5`, `a8b541f`
 - [ ] `/developer` extras: temperature and max-token sliders, prompt-version selector, tool toggles, cost dashboard
@@ -71,8 +71,8 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] RLS on every business-scoped table + isolation suite that derives its own table list — `26684dc`
 - [x] argon2id + HMAC sessions, indistinguishable login failures, no-domain cookie — `6061732`
 - [x] Refuse to boot on the default `SESSION_SECRET` outside local — `6061732`
-- [ ] Server-side revocation: `users.sessions_valid_from` folded into the signed token
-- [ ] Rate-limit `/login` and `/signup` on Redis — argon2 at 64 MiB × 4 lanes makes login a memory-amplification DoS
+- [x] Server-side revocation via `sessions_valid_from` in the signed token — `d9deedf`
+- [x] Rate limit per IP AND per email, plus a concurrency gate capping argon2 at ~256 MiB — `d9deedf`
 
 ## Runtime configuration (added 2026-08-19, not in the original plan)
 - [x] `model_routes` + `provider_settings` tables; empty config behaves as the code defaults — `9a9c3bc`
@@ -92,14 +92,26 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] CSRF beyond SameSite=Lax; `__Host-` cookie prefix
 
 ## Phase 12 — Observability and evaluation
-- [ ] Langfuse tracing on every model and tool call, feedback attached as a score
-- [ ] Eval set of 20 cases; Ragas faithfulness + a deterministic rubric
-- [ ] `evals/report.md`: RAG off vs on, prompt v1 vs v2
+- [x] Langfuse seam, no-op without keys, redaction inside the tracer — `d9deedf`
+- [x] 20 cases + 5 deterministic scorers (Ragas absent, marked so, not invented) — `d9deedf`
+- [x] `evals/report.md` with RAG off vs on vs oracle — `d9deedf`
+- [ ] prompt v1-vs-v2 and cheap-vs-strong comparison (needs a live key)
 - [ ] ⛔ Langfuse keys
 
 ## Phase 13 — Feedback → learned preferences
-- [ ] Rating + 4-axis rubric + reject reason
-- [ ] Distil recurring rejections into proposed brand rules the user approves
+- [x] 4-axis rating + reject reason + proposal approval — `d9deedf`
+- [x] Distil at 3+ occurrences into PROPOSED rules, applied only on approval — `d9deedf`
+
+## Found while building, still open
+- [x] RLS policies were not null-safe: an emptied tenant GUC RAISED instead of returning zero rows — `d9deedf`
+- [x] `FakeProvider` returned empty arrays/objects, making every list-shaped tool untestable — `d9deedf`
+- [ ] `businesses.slug` column — `/go/{id}` takes a UUID because there is no slug to take
+- [ ] Retire the privileged connection in `lead_store.resolve` for a `SECURITY DEFINER` function (SQL is written, in the module)
+- [ ] Wire `resolver_can_bypass_rls()` into a startup check — a deployment whose owner lacks BYPASSRLS 404s every link with green tests
+- [ ] Refund the per-email rate counter on success — an attacker can otherwise lock a victim out
+- [ ] Body-size limit middleware — login hashes an unbounded password
+- [ ] `--proxy-headers --forwarded-allow-ips` is a DEPLOYMENT REQUIREMENT, not optional: without it every client shares one rate-limit bucket
+- [ ] `docs/CHANNELS.md` §5 still lists `ua_hash`; no UA is stored
 
 ## Deferred (recorded so they are not rediscovered)
 - [ ] `analytics` engine — GSC/GA4 cut from Track A: two OAuth flows for a metric that cannot move inside a project timeline
