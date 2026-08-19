@@ -488,3 +488,36 @@ def test_a_provider_protocol_stub_satisfies_the_protocol() -> None:
     """Structural typing check, so the stubs above stay honest."""
     provider: Provider = StubProvider("alpha")
     assert provider.name == "alpha"
+
+
+async def test_every_tier_chain_spans_more_than_one_vendor() -> None:
+    """The chain comment's own rule, enforced instead of merely stated.
+
+    STRONG shipped with two entries that were both Anthropic -- first party and
+    via OpenRouter -- so a single vendor-wide refusal took out the whole tier.
+    That happened for real on 2026-08-19: an OpenRouter data policy that refused
+    every full-size model left `--tier strong` with nothing to call. EMBED is
+    exempt: one embedding vendor is a deliberate choice, because mixing vector
+    spaces across providers would silently corrupt every stored embedding.
+    """
+    for tier, chain in TIER_CHAINS.items():
+        if tier is ModelTier.EMBED:
+            continue
+        vendors = {_vendor_of(entry.model) for entry in chain}
+        assert len(vendors) > 1, (
+            f"{tier.value} chain reaches only {vendors}: a second route to one "
+            "vendor is not a fallback, because the failures worth falling back "
+            "over tend to be vendor-wide"
+        )
+
+
+def _vendor_of(model: str) -> str:
+    """The vendor behind a model id, however it is routed.
+
+    `anthropic/claude-opus-4.8` (OpenRouter) and `claude-opus-5` (first party)
+    are the same vendor by two roads, which is exactly the case this has to see
+    through -- so a bare `claude-*` id counts as Anthropic.
+    """
+    if "/" in model:
+        return model.split("/", 1)[0]
+    return "anthropic" if model.startswith("claude") else model

@@ -70,6 +70,11 @@ PRICE_TABLE: Mapping[str, ModelPrice] = dict(
         _price("google/gemini-2.5-flash", "0.30", "2.50"),
         _price("anthropic/claude-sonnet-4.5", "3.00", "15.00"),
         _price("anthropic/claude-opus-4.8", "5.00", "25.00"),
+        # Verified against the OpenRouter models API on 2026-08-19, as the note
+        # above instructs. Present so the STRONG chain has a non-Anthropic entry
+        # (see `router.TIER_CHAINS`).
+        _price("openai/gpt-5.1", "1.25", "10.00"),
+        _price("google/gemini-2.5-pro", "1.25", "10.00"),
         # Embeddings: output tokens do not exist on an embedding call, so the
         # output rate is a true zero rather than an unknown.
         _price("openai/text-embedding-3-small", "0.02", "0.00"),

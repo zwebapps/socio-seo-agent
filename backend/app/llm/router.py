@@ -106,9 +106,18 @@ TIER_CHAINS: Final[Mapping[ModelTier, tuple[RouteEntry, ...]]] = {
         RouteEntry(ANTHROPIC, "claude-sonnet-5"),
         RouteEntry(OPENROUTER, "openai/gpt-4.1"),
     ),
+    # Both of the original entries were Anthropic -- first party and via
+    # OpenRouter -- which broke the vendor-diversity rule stated directly above,
+    # and it was not theoretical: on 2026-08-19 an OpenRouter account whose data
+    # policy refused every full-size model took out the ENTIRE strong tier, and
+    # `--tier strong` could not run at all. Two Anthropic routes are two ways to
+    # reach one vendor, not a fallback. A non-Anthropic third entry is what makes
+    # this a chain; unreachable entries cost nothing, because a provider with no
+    # credential is filtered out before the attempt and a 403/404 falls through.
     ModelTier.STRONG: (
         RouteEntry(ANTHROPIC, "claude-opus-5"),
         RouteEntry(OPENROUTER, "anthropic/claude-opus-4.8"),
+        RouteEntry(OPENROUTER, "openai/gpt-5.1"),
     ),
     ModelTier.EMBED: (RouteEntry(OPENROUTER, "openai/text-embedding-3-small"),),
 }
