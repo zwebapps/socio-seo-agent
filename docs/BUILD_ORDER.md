@@ -2,7 +2,7 @@
 
 Supersedes ROADMAP.md §8 Track A. Same scope, **re-sequenced so the product is demoable from day two instead of day fourteen.**
 
-Strategy lives in [../ROADMAP.md](../ROADMAP.md) · value in [../FEATURES.md](../FEATURES.md) · design in [ARCHITECTURE.md](ARCHITECTURE.md) · grading evidence in [CRITERIA_MAP.md](CRITERIA_MAP.md).
+Strategy lives in [ROADMAP.md](ROADMAP.md) · value in [FEATURES.md](FEATURES.md) · design in [ARCHITECTURE.md](ARCHITECTURE.md) · grading evidence in [CRITERIA_MAP.md](CRITERIA_MAP.md).
 
 ---
 

@@ -15,7 +15,20 @@ can never need retrofitting.
 import ast
 from pathlib import Path
 
-ENGINES_DIR = Path(__file__).resolve().parents[1] / "backend" / "app" / "engines"
+
+#: Anchored by walking up to the directory holding pyproject.toml rather than by
+#: counting parents. Counting broke the moment tests/ moved under backend/, and it
+#: broke by pointing at a directory that does not exist -- which this test reports
+#: as "engines are missing" rather than as its own misconfiguration.
+def _repo_root() -> Path:
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    raise RuntimeError("could not locate the repo root (no pyproject.toml above this file)")
+
+
+REPO_ROOT = _repo_root()
+ENGINES_DIR = REPO_ROOT / "backend" / "app" / "engines"
 
 # An engine may not reach any of these. The reason differs per group, so they are
 # grouped rather than flattened into one opaque list.
@@ -94,14 +107,14 @@ def test_engines_import_nothing_forbidden() -> None:
         try:
             imported = _imported_modules(path.read_text(encoding="utf-8"))
         except SyntaxError as exc:
-            relative = path.relative_to(ENGINES_DIR.parents[3])
+            relative = path.relative_to(REPO_ROOT)
             violations.append(f"{relative} does not parse: line {exc.lineno}: {exc.msg}")
             continue
 
         for module_name in sorted(imported):
             reason = _violation(module_name)
             if reason is not None:
-                relative = path.relative_to(ENGINES_DIR.parents[3])
+                relative = path.relative_to(REPO_ROOT)
                 violations.append(f"{relative} imports {module_name} ({reason})")
 
     assert not violations, (

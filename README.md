@@ -34,8 +34,8 @@ marketers, and small agencies running several clients.
 
 | Document | What it answers |
 |---|---|
-| [ROADMAP.md](ROADMAP.md) | Strategy, scope, honest constraints |
-| [FEATURES.md](FEATURES.md) | Every feature, and how each one produces a lead |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Strategy, scope, honest constraints |
+| [docs/FEATURES.md](docs/FEATURES.md) | Every feature, and how each one produces a lead |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical design; architecture → business benefit |
 | [docs/DIAGRAMS.md](docs/DIAGRAMS.md) | All 14 diagrams: context, request flow, state machine, data model, deployment |
 | [docs/AGENT_RUNTIME.md](docs/AGENT_RUNTIME.md) | How the agents work: state, nodes, tool loop, prompts, memory, caps |
@@ -85,14 +85,51 @@ installed before the first engine existed, so it can never need retrofitting.
 ## Layout
 
 ```
-backend/app/
-├─ api/          FastAPI routes (thin)
-├─ core/         config, security, budgets
-└─ engines/      deterministic computation — guarded
-tests/           pytest; every external call faked, no network in CI
-frontend/        Next.js 16 · React 19 · Tailwind 4
-docs/            design and planning
+backend/                     everything Python
+├─ app/
+│  ├─ asgi.py                process entry point — the ONLY place that loads .env
+│  ├─ main.py                app factory (no import-time side effects)
+│  ├─ api/                   FastAPI routes (thin)
+│  ├─ agents/                the graph: state, driver, nodes
+│  ├─ core/                  config, security
+│  ├─ db/                    models, migrations, adapters
+│  ├─ engines/               deterministic computation — guarded by a test
+│  ├─ llm/                   model router, providers, pricing
+│  └─ services/              impure orchestration over engines + router
+└─ tests/                    pytest; every external call faked, no network in CI
+
+frontend/                    Next.js 16 · React 19 · Tailwind 4
+docs/                        ROADMAP · FEATURES · ARCHITECTURE · DIAGRAMS ·
+                             AGENT_RUNTIME · BUILD_ORDER · CHANNELS ·
+                             FREE_CHANNELS · CRITERIA_MAP
 ```
+
+### Why anything is at the repo root
+
+Everything at root is there because a tool requires it, not by accident. Moving these
+costs a flag on every command and buys nothing:
+
+| File | Why it cannot move |
+|---|---|
+| `pyproject.toml`, `uv.lock` | `uv` resolves the project from the root |
+| `.gitignore`, `.dockerignore` | git and docker only read them at the root |
+| `Makefile` | the entry point people actually type |
+| `README.md` | rendered by the forge |
+| `BACKLOG.md` | the work queue; `/next` reads it |
+| `docker-compose.yml` | conventional; moving it means `-f path` on every command |
+| `alembic.ini` | conventional; moving it means `-c path` on every command |
+| `.env` | dotenv's default location, and the backend's secrets live here |
+
+### Two env files, and the split is a security boundary
+
+| File | Read by | Holds |
+|---|---|---|
+| `.env` (root) | backend, via `asgi.py` | **all secrets** — model keys, database URL, session secret |
+| `frontend/.env.local` | Next.js | **only** `NEXT_PUBLIC_API_URL` |
+
+Next.js does not read the root `.env`, and that is deliberate: anything named
+`NEXT_PUBLIC_*` is compiled into the browser bundle and shipped to every visitor. A
+model key placed there would be a published key.
 
 ## Technical decisions
 

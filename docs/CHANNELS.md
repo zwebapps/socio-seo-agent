@@ -2,7 +2,7 @@
 
 Answers two questions honestly: **can we publish to these platforms?** and **how is content generated per platform?**
 
-Companion to [ARCHITECTURE.md](ARCHITECTURE.md) · [BUILD_ORDER.md](BUILD_ORDER.md) · [../FEATURES.md](../FEATURES.md).
+Companion to [ARCHITECTURE.md](ARCHITECTURE.md) · [BUILD_ORDER.md](BUILD_ORDER.md) · [FEATURES.md](FEATURES.md).
 
 > **Free platforms — presence, citations and entity resolution (Google Business Profile, directories, NAP consistency, Reddit question mining, and why Wikipedia is excluded) are in [FREE_CHANNELS.md](FREE_CHANNELS.md).** Start there: for a local business those channels outperform everything in this document.
 

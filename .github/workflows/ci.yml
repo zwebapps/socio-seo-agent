@@ -53,7 +53,7 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Mypy (strict)
-        run: uv run mypy backend tests
+        run: uv run mypy backend
 
       # Creates the schema, the RLS policies, and the restricted sma_app role.
       - name: Migrate
@@ -66,7 +66,7 @@ jobs:
       # A skipped db test in CI would hide the isolation proof, so fail if any
       # test was skipped rather than run.
       - name: Assert the database tests actually ran
-        run: uv run pytest tests/db -q --no-header -p no:randomly | tee /tmp/db.txt && ! grep -q "skipped" /tmp/db.txt
+        run: uv run pytest backend/tests/db -q --no-header -p no:randomly | tee /tmp/db.txt && ! grep -q "skipped" /tmp/db.txt
 
   web:
     name: Web — types, build

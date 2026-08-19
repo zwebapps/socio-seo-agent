@@ -40,7 +40,7 @@ from backend.app.llm.router import (
 # The OpenRouter adapter is driven over an injected httpx2 mock transport rather
 # than respx, because the `openai` SDK rides httpx2 and respx cannot see it. The
 # reasoning, and the live request that proved it, are in test_providers.py.
-from tests.llm.test_providers import openrouter_body, openrouter_stub, usage_block
+from backend.tests.llm.test_providers import openrouter_body, openrouter_stub, usage_block
 
 PROMPT: Final = [Message(role=Role.USER, content="Write the Notdienst page.")]
 

@@ -1,6 +1,6 @@
 # Architecture — Production-Grade Growth Agent
 
-Companion to [../ROADMAP.md](../ROADMAP.md) (what to build, in order) and [../FEATURES.md](../FEATURES.md) (what it does for a customer). **This document is the technical design.**
+Companion to [ROADMAP.md](ROADMAP.md) (what to build, in order) and [FEATURES.md](FEATURES.md) (what it does for a customer). **This document is the technical design.**
 
 Everything lives inside `Social-Marketing-Agent/`. Nothing in the parent `TuringCollege/` folder is read, written, or depended on.
 

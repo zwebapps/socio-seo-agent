@@ -45,7 +45,7 @@ format:
 	uv run ruff format .
 
 typecheck:
-	uv run mypy backend tests
+	uv run mypy backend
 	cd frontend && pnpm typecheck
 
 check: lint typecheck test
