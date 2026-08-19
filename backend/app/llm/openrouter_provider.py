@@ -45,6 +45,7 @@ from backend.app.llm.contract import (
     Completion,
     InvalidToolArgumentsError,
     Message,
+    ModelUnavailableError,
     ProviderRateLimitError,
     ProviderRequestError,
     ProviderServerError,
@@ -210,6 +211,10 @@ def parse_tool_calls(*, provider: str, model: str, raw: Sequence[Any] | None) ->
     return calls
 
 
+#: 4xx codes that mean "not this model", not "not this request".
+_MODEL_ACCESS_STATUSES = frozenset({403, 404})
+
+
 class OpenRouterProvider:
     """OpenRouter, via the OpenAI-compatible SDK. Satisfies `contract.Provider`."""
 
@@ -266,11 +271,21 @@ class OpenRouterProvider:
     def _status_error(
         self, model: str, exc: APIStatusError
     ) -> ProviderServerError | ProviderRequestError:
-        """Split a non-2xx into retryable (5xx) and not (other 4xx)."""
+        """Split a non-2xx three ways: retryable 5xx, retryable 403/404, fatal 4xx.
+
+        403/404 mean *this model* is closed to this credential, which says
+        nothing about the next model in the chain, so they are raised as
+        `ModelUnavailableError` and fall through. 401/402 stay fatal: a bad key
+        or an empty balance fails every entry identically.
+        """
         status = exc.status_code
         if status >= 500:
             return ProviderServerError(
                 self.name, model, f"server error {status}: {exc}", status_code=status
+            )
+        if status in _MODEL_ACCESS_STATUSES:
+            return ModelUnavailableError(
+                self.name, model, f"model unavailable ({status}): {exc}", status_code=status
             )
         return ProviderRequestError(
             self.name, model, f"request rejected ({status}): {exc}", status_code=status

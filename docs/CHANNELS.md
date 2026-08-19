@@ -156,7 +156,7 @@ Values below are **starting values to verify against provider documentation at b
 Because two major channels can't carry a clickable link, attribution cannot depend on publishing. Three owned components:
 
 **1. Short-link service — `/l/{code}`**
-Every generated CTA gets a short link that 302s to the destination and records `{channel, content_piece_id, campaign, ts, ua_hash}`. It works whether we published the post or the owner pasted the caption by hand. **This is what makes attribution independent of publishing**, and it's the single highest-leverage thing in this document.
+Every generated CTA gets a short link that 302s to the destination and records `{short_link_id, channel, content_piece_id, campaign, ts, referrer_host, is_bot}` — deliberately **no IP and no user-agent**, hashed or otherwise. A UA hash is re-identifying enough to be personal data while adding nothing to attribution, so `LinkClick` stores a bot verdict instead of the string it was derived from. It works whether we published the post or the owner pasted the caption by hand. **This is what makes attribution independent of publishing**, and it's the single highest-leverage thing in this document.
 
 **2. Link hub — `/go/{business_slug}`**
 A fast, zero-JS page listing the business's current CTAs, used as the Instagram/TikTok bio link. Each entry is a tracked short link, so "link in bio" becomes measurable rather than a black hole.

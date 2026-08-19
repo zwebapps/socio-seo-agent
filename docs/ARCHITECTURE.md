@@ -505,6 +505,8 @@ Alerts worth having on day one, and no more: any duplicate Actuator execution, r
 | Next.js | Streamlit / Gradio | production UX, and the course grades front-end work |
 | Self-hosted Langfuse | LangSmith | EU-hostable, cheaper at eval volume, no vendor coupling |
 | RLS + repo scoping | app-level checks only | the database should guarantee isolation, not a convention |
+| Fallback on 403/404 (`ModelUnavailableError`) | treating every non-429 4xx as fatal | a 403/404 is scoped to one *model*, and a chain entry is a (provider, model) pair, so the next entry may be fine. Found live: an OpenRouter account whose data-policy guardrails served `claude-haiku-4.5` and refused `claude-opus-4.8` with a 404, which the router read as a total outage. 401/402 stay fatal — they are credential-scoped, so falling through buries "bad key" under N identical failures |
+| `--live` loads `.env` then asserts a real provider | trusting the flag | the flag printed "This spends money" while the router silently served `FakeProvider`, because the runner deliberately never loaded `.env`. A report that *looks* live is worse than no report, so `--live` now exits non-zero rather than measure canned responses |
 
 ---
 

@@ -34,6 +34,7 @@ from openai import AsyncOpenAI
 
 from backend.app.llm.contract import (
     Message,
+    ModelUnavailableError,
     ProviderRequestError,
     ProviderServerError,
     ProviderTimeoutError,
@@ -371,7 +372,10 @@ async def test_a_slow_local_model_that_never_answers_is_a_timeout() -> None:
 @pytest.mark.parametrize(
     ("status", "expected"),
     [
-        (404, ProviderRequestError),  # the model was never `ollama pull`ed
+        # Still a ProviderRequestError by type (ModelUnavailableError subclasses
+        # it) but retryable: the next chain entry names a *different* model,
+        # which may well be pulled on this host.
+        (404, ModelUnavailableError),  # the model was never `ollama pull`ed
         (400, ProviderRequestError),
         (500, ProviderServerError),
     ],

@@ -292,9 +292,13 @@ class ProviderServerError(ProviderError):
 class ProviderRequestError(ProviderError):
     """Provider 4xx other than 429 -- our request was wrong.
 
-    Deliberately *not* retryable: a malformed request, an unknown model id, or
-    a rejected parameter will fail identically on the next provider, so falling
-    back would just spend latency to produce the same error.
+    Deliberately *not* retryable: a malformed request or a rejected parameter
+    will fail identically on the next chain entry, so falling back would just
+    spend latency to produce the same error.
+
+    Access failures are the exception and are raised as `ModelUnavailableError`
+    (a subclass) instead, because those are scoped to one model rather than to
+    the request. See that class for why the distinction earns its keep.
     """
 
     def __init__(
@@ -307,6 +311,29 @@ class ProviderRequestError(ProviderError):
     ) -> None:
         self.status_code = status_code
         super().__init__(provider, model, message)
+
+
+class ModelUnavailableError(ProviderRequestError):
+    """A 403/404: this *model* is unreachable for this credential.
+
+    Retryable, unlike its parent, and the distinction is load-bearing. A chain
+    entry is a (provider, model) *pair*, so the next entry names a different
+    model -- and "this model is not available to you" says nothing about that
+    one. Observed cases: an OpenRouter account whose data-policy guardrails
+    admit `anthropic/claude-haiku-4.5` but refuse `anthropic/claude-opus-4.8`
+    with a 404 (`No endpoints available matching your guardrail restrictions`),
+    and an Ollama host that has pulled one model but not another.
+
+    Treating those as fatal defeated the whole point of having a chain: one
+    unreachable model read as a total outage. Note what stays fatal -- 401 and
+    402 are credential- and account-scoped, so *every* entry fails and falling
+    through would only bury "your key is bad" or "you are out of credit" under
+    N identical failures.
+
+    It subclasses `ProviderRequestError` because it is still, literally, a 4xx
+    saying our request was wrong about the world -- so callers that catch the
+    parent keep working, and only the retry policy sees the finer grain.
+    """
 
 
 class InvalidToolArgumentsError(ProviderError):
@@ -352,12 +379,18 @@ class AllProvidersFailedError(LlmError):
 
 
 #: Failures that justify trying the next entry in the fallback chain. Anything
-#: else (a bad request, unparseable tool arguments) would fail the same way on
-#: the next provider, so it is raised straight through.
+#: else (a bad request, unparseable tool arguments, a bad credential, an
+#: exhausted account) would fail the same way on the next entry, so it is
+#: raised straight through.
+#:
+#: `ModelUnavailableError` is listed while its parent `ProviderRequestError` is
+#: not: `except` matches on the specific classes named here, so a 403/404 falls
+#: through the chain and a 400 still does not.
 RETRYABLE_ERRORS: tuple[type[LlmError], ...] = (
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderServerError,
+    ModelUnavailableError,
 )
 
 

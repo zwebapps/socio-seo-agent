@@ -420,6 +420,26 @@ async def login(
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_INVALID_CREDENTIALS)
 
+    # The password was right, so this attempt was the account owner. Refund the
+    # per-email counter: the 10-per-15-minutes budget exists to ration guessing,
+    # and without this a user who signs in from a few devices, or reconnects a few
+    # times, spends it on themselves and is locked out of their own account.
+    #
+    # The per-IP counter is deliberately NOT refunded. It is the flood defence, and
+    # refunding it would make one valid credential an unlimited enumeration budget:
+    # a stuffing run that finds a single live account would top itself up on every
+    # hit. Refunding the email dimension has no equivalent, because a success there
+    # is by definition the owner of that address.
+    #
+    # What this does NOT fix, stated plainly so it is not mistaken for closed: an
+    # attacker who knows the address can still burn its window with 10 wrong
+    # passwords and lock the owner out for up to 15 minutes. Closing that needs the
+    # per-email window to stop being a pre-hash block -- and it is a pre-hash block
+    # on purpose, because the cost being rationed is the 64 MiB argon2 hash, which
+    # a refusal issued after it would not ration at all. The residual is bounded,
+    # self-clearing, and cheaper than the alternative.
+    await limiter.give_back({rate_limit.DIMENSION_EMAIL: payload.email})
+
     # Stamped with `session_issued_at`, not a bare `now()`. A login that lands in
     # the same second as a revocation -- signing in right after signing out is the
     # ordinary way to do that -- would otherwise mint a token its own watermark

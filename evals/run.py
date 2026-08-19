@@ -65,11 +65,14 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 # anywhere.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Note what is deliberately absent: `load_dotenv`. The scripts in `scripts/` load
-# `.env` because they need a database URL; this one must NOT, because `.env` holds a
-# real provider key and a default-live eval runner would bill it on every run.
-from backend.app.llm.contract import BudgetState, Message, Role, TaskClass
-from backend.app.llm.router import ModelRouter, config_status
+# Note what is deliberately absent at import time: `load_dotenv`. The scripts in
+# `scripts/` load `.env` because they need a database URL; this one must not do it
+# here, because `.env` holds a real provider key and an eval runner that picked it up
+# by default would bill every run. `--live` loads it explicitly inside `main()` -- and
+# then asserts it actually got a provider, so the flag cannot claim to spend money
+# while quietly measuring FakeProvider.
+from backend.app.llm.contract import BudgetState, Message, ModelTier, Role, TaskClass
+from backend.app.llm.router import TASK_TIERS, TIER_CHAINS, ModelRouter, config_status
 from backend.app.obs import Tracer, get_tracer, llm_span_fields, tracing_status
 from backend.app.services.kb_service import (
     RetrievedChunk,
@@ -134,6 +137,18 @@ class RunConfig:
     budget_usd: Decimal = DEFAULT_BUDGET_USD
     #: Restrict to these case ids. Empty means all 20.
     only: tuple[str, ...] = ()
+    #: Route GENERATE to this tier instead of its default (STRONG).
+    #:
+    #: Two honest uses. Comparing tiers is the point of an eval harness: "is the
+    #: strong model worth 40x the cheap one on our rubric" is answerable only by
+    #: running both. And a credential may simply not reach every tier -- an
+    #: OpenRouter account's data-policy guardrails can admit the cheap chain and
+    #: refuse the strong one -- in which case the choice is a labelled cheap-tier
+    #: run or no live measurement at all.
+    #:
+    #: Whatever it is set to, the report header names the tier and the models that
+    #: actually served, so a cheap-tier run can never be read as a strong-tier one.
+    tier: ModelTier | None = None
 
     @property
     def env(self) -> Mapping[str, str] | None:
@@ -731,8 +746,19 @@ def render_report(
             "",
         ]
 
+    tier = config.tier or TASK_TIERS[TaskClass.GENERATE]
+    chain = ", ".join(f"`{entry.provider}/{entry.model}`" for entry in TIER_CHAINS[tier])
+    tier_note = (
+        f"**{tier.value}**"
+        + (" (default for GENERATE)" if config.tier is None else " (overridden by `--tier`)")
+        + f" — chain in preference order: {chain}"
+    )
+
     lines += [
         f"- **Model providers:** {providers.message}",
+        f"- **Generation tier:** {tier_note}. Entries whose provider has no credential are "
+        "skipped, and a 403/404 on one model falls through to the next, so the model that "
+        "served is not always the first listed — the per-case rows carry the actual model.",
         f"- **Tracing:** {tracing.message}",
         f"- **Ragas faithfulness / answer relevancy:** {RAGAS_NOTE}. The columns are "
         "reserved and rendered empty; no value is estimated from the deterministic "
@@ -980,6 +1006,16 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
             "two model calls plus retrieval per case, over 20 cases."
         ),
     )
+    parser.add_argument(
+        "--tier",
+        choices=[tier.value for tier in ModelTier if tier is not ModelTier.EMBED],
+        default=None,
+        help=(
+            "route GENERATE to this tier instead of its default (strong). Use to "
+            "compare tiers, or when the configured credential cannot reach the "
+            "strong chain. The report header names the tier either way."
+        ),
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_REPORT_PATH, help="report path")
     parser.add_argument(
         "--case",
@@ -989,12 +1025,20 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         help="run only this case id (repeatable)",
     )
     parsed = parser.parse_args(argv)
-    return RunConfig(live=bool(parsed.live), out_path=parsed.out, only=tuple(parsed.case))
+    return RunConfig(
+        live=bool(parsed.live),
+        out_path=parsed.out,
+        only=tuple(parsed.case),
+        tier=None if parsed.tier is None else ModelTier(parsed.tier),
+    )
 
 
 async def run(config: RunConfig) -> tuple[str, list[CaseRow]]:
     """Run the configured cases and render the report."""
-    router = ModelRouter(env=config.env)
+    # `task_tiers` is a constructor argument the router already exposes for tests,
+    # so a tier override needs no production change at all.
+    task_tiers = None if config.tier is None else {**TASK_TIERS, TaskClass.GENERATE: config.tier}
+    router = ModelRouter(env=config.env, task_tiers=task_tiers)
     tracer = get_tracer(env=config.env)
 
     cases = [case for case in CASES if not config.only or case.case_id in config.only]
@@ -1017,8 +1061,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = parse_args(list(sys.argv[1:] if argv is None else argv))
 
     if config.live:
+        # --live has to LOAD the credentials it intends to spend, and then PROVE it got
+        # them, because the first version did neither.
+        #
+        # It read the ambient environment only, and this project keeps its key in `.env`
+        # (loaded at process start by backend/app/asgi.py, which an eval script does not
+        # import). So `--live` found no credential, the router fell back to FakeProvider,
+        # and the run printed "This spends money" while spending nothing and producing
+        # numbers identical to a fake run. The report header was honest about the actual
+        # provider — which is the only reason this was not a silent lie — but the flag
+        # was doing nothing.
+        #
+        # Now: load `.env` (without overriding a real environment variable, so a
+        # container still wins), then REFUSE to continue if the router still resolves to
+        # the fake. A live report produced on canned responses is worse than no report,
+        # so this fails loudly rather than measuring nothing under a --live banner.
+        from dotenv import load_dotenv
+
+        load_dotenv(override=False)
+
+        status = config_status()
+        if status.using_fake_provider:
+            print(
+                "--live was requested but no model provider is configured, so every call "
+                "would be served by FakeProvider and the numbers would measure the "
+                "harness rather than the models.\n\n"
+                f"  {status.message}\n\n"
+                "Set OPENROUTER_API_KEY (or ANTHROPIC_API_KEY) in .env or the "
+                "environment, or drop --live to run the hermetic evaluation.",
+                file=sys.stderr,
+            )
+            return 2
+
+        tier = config.tier or TASK_TIERS[TaskClass.GENERATE]
         print(
-            "--live: calling real providers with the ambient environment. This spends money.",
+            "--live: calling real providers. THIS SPENDS MONEY. "
+            f"Available: {', '.join(status.available_providers)}. "
+            f"GENERATE tier: {tier.value}.",
             file=sys.stderr,
         )
 

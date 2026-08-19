@@ -250,6 +250,9 @@ async def test_the_raw_email_never_appears_in_a_counter_key() -> None:
             recorded.append(key)
             return 1
 
+        async def give_back(self, key: str, window_seconds: int) -> None:
+            return None
+
     limiter = _limiter(email=RateLimitRule(limit=5, window_seconds=LONG_WINDOW), counter=Recorder())
     await limiter.check({rate_limit.DIMENSION_EMAIL: "victim@example.test"})
 
@@ -516,3 +519,59 @@ def test_signup_is_throttled_at_least_as_hard_as_login() -> None:
         login = rate_limit.LOGIN_RULES[dimension]
         signup = rate_limit.SIGNUP_RULES[dimension]
         assert signup.limit / signup.window_seconds <= login.limit / login.window_seconds
+
+
+# --------------------------------------------------------------------------- #
+# Refunds -- so honest traffic does not spend a hostile-traffic budget
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_refund_frees_one_attempt_in_the_same_window() -> None:
+    """The behaviour the login path depends on."""
+    counter = InMemoryWindowCounter()
+    limiter = _limiter(email=RateLimitRule(limit=2, window_seconds=LONG_WINDOW), counter=counter)
+    values = {rate_limit.DIMENSION_EMAIL: "owner@example.test"}
+
+    assert (await limiter.check(values)).allowed is True
+    assert (await limiter.check(values)).allowed is True
+    await limiter.give_back(values)
+
+    # Without the refund this third attempt would be the one over the limit.
+    assert (await limiter.check(values)).allowed is True
+    assert (await limiter.check(values)).allowed is False
+
+
+async def test_a_refund_cannot_push_a_counter_below_zero() -> None:
+    """Otherwise repeated refunds would mint budget rather than return it."""
+    counter = InMemoryWindowCounter()
+    limiter = _limiter(email=RateLimitRule(limit=1, window_seconds=LONG_WINDOW), counter=counter)
+    values = {rate_limit.DIMENSION_EMAIL: "owner@example.test"}
+
+    await limiter.check(values)
+    for _ in range(5):
+        await limiter.give_back(values)
+
+    # One attempt was counted and one refunded, so exactly one is available again --
+    # not six.
+    assert (await limiter.check(values)).allowed is True
+    assert (await limiter.check(values)).allowed is False
+
+
+async def test_a_refund_for_an_unknown_key_creates_no_window() -> None:
+    """A refund must not hold memory for a key that was never counted."""
+    counter = InMemoryWindowCounter()
+    limiter = _limiter(email=RateLimitRule(limit=1, window_seconds=LONG_WINDOW), counter=counter)
+
+    await limiter.give_back({rate_limit.DIMENSION_EMAIL: "never-seen@example.test"})
+
+    assert counter.tracked_keys == 0
+
+
+async def test_a_refund_ignores_dimensions_with_no_rule() -> None:
+    """The limiter is configured per policy; an unknown dimension is not an error."""
+    counter = InMemoryWindowCounter()
+    limiter = _limiter(email=RateLimitRule(limit=1, window_seconds=LONG_WINDOW), counter=counter)
+
+    await limiter.give_back({"nonsense": "value"})
+
+    assert counter.tracked_keys == 0

@@ -1,12 +1,13 @@
 # Evaluation report
 
-Generated 2026-08-19 12:20 UTC · `uv run python evals/run.py`
+Generated 2026-08-19 13:06 UTC · `uv run python evals/run.py --live`
 
 ## What produced these numbers
 
-> **Every number below was produced against the FAKE provider.** No model was called: `FakeProvider` returns a canned string chosen by hashing the prompt, so this report measures **the harness and the rubric, not the models**. Treat it as evidence that the evaluation machinery works and is honest, not as evidence that the generated copy is good. Run `uv run python evals/run.py --live` with `OPENROUTER_API_KEY` set to measure models — that spends real money.
+> **Live run.** Real providers were called and real money was spent. Model providers configured: openrouter.
 
-- **Model providers:** No model provider is configured, so every model call is served by FakeProvider (deterministic, no network). Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY to use a real model.
+- **Model providers:** Model providers configured: openrouter.
+- **Generation tier:** **cheap** (overridden by `--tier`) — chain in preference order: `openrouter/openai/gpt-4.1-mini`, `anthropic/claude-haiku-4-5`, `openrouter/google/gemini-2.5-flash`. Entries whose provider has no credential are skipped, and a 403/404 on one model falls through to the next, so the model that served is not always the first listed — the per-case rows carry the actual model.
 - **Tracing:** Tracing is not configured, so every span is served by the no-op tracer and nothing leaves the process. Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY to send traces to Langfuse.
 - **Ragas faithfulness / answer relevancy:** n/a (ragas not installed). The columns are reserved and rendered empty; no value is estimated from the deterministic scores, because a faithfulness number that is really a rubric average would be a fabrication.
 - **Cases:** 20 of 20 in the eval set.
@@ -18,46 +19,46 @@ One row per case per arm. **`—`** means the dimension does not apply to the ch
 
 | case | channel | arm | seo | brand | format | grounding | coverage | mean | ragas faithfulness | ragas relevancy |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `plumber-01` | blog_article | rag_off | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `plumber-01` | blog_article | rag_on | 0.83 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.57** | — | — |
-| `plumber-02` | linkedin | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `plumber-02` | linkedin | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `plumber-03` | instagram_caption | rag_off | — | 1.00 | 0.75 | 1.00 n/e | 0.00 | **0.69** | — | — |
-| `plumber-03` | instagram_caption | rag_on | — | 1.00 | 0.75 | 1.00 n/e | 0.00 | **0.69** | — | — |
-| `plumber-04` | facebook_post | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `plumber-04` | facebook_post | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `dentist-01` | blog_article | rag_off | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `dentist-01` | blog_article | rag_on | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `dentist-02` | facebook_post | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `dentist-02` | facebook_post | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `dentist-03` | instagram_caption | rag_off | — | 1.00 | 0.75 | 1.00 n/e | 0.00 | **0.69** | — | — |
-| `dentist-03` | instagram_caption | rag_on | — | 1.00 | 0.75 | 1.00 n/e | 0.00 | **0.69** | — | — |
-| `dentist-04` | email | rag_off | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `dentist-04` | email | rag_on | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `bakery-01` | blog_article | rag_off | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `bakery-01` | blog_article | rag_on | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `bakery-02` | instagram_caption | rag_off | — | 1.00 | 0.75 | 1.00 n/e | 0.00 | **0.69** | — | — |
-| `bakery-02` | instagram_caption | rag_on | — | 1.00 | 0.75 | 1.00 n/e | 0.00 | **0.69** | — | — |
-| `bakery-03` | facebook_post | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `bakery-03` | facebook_post | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `bakery-04` | email | rag_off | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `bakery-04` | email | rag_on | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `steuerberater-01` | linkedin | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `steuerberater-01` | linkedin | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `steuerberater-02` | blog_article | rag_off | 0.85 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.57** | — | — |
-| `steuerberater-02` | blog_article | rag_on | 0.85 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.57** | — | — |
-| `steuerberater-03` | email | rag_off | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `steuerberater-03` | email | rag_on | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `steuerberater-04` | facebook_post | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `steuerberater-04` | facebook_post | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `saas-01` | blog_article | rag_off | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `saas-01` | blog_article | rag_on | 0.78 | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.56** | — | — |
-| `saas-02` | linkedin | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `saas-02` | linkedin | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `saas-03` | email | rag_off | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `saas-03` | email | rag_on | — | 1.00 | 0.00 | 1.00 n/e | 0.00 | **0.50** | — | — |
-| `saas-04` | facebook_post | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
-| `saas-04` | facebook_post | rag_on | — | 1.00 | 1.00 | 1.00 n/e | 0.00 | **0.75** | — | — |
+| `plumber-01` | blog_article | rag_off | 0.89 | 1.00 | 1.00 | 0.00 | 1.00 | **0.78** | — | — |
+| `plumber-01` | blog_article | rag_on | 0.83 | 1.00 | 0.00 | 0.56 | 1.00 | **0.68** | — | — |
+| `plumber-02` | linkedin | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `plumber-02` | linkedin | rag_on | — | 1.00 | 0.00 | 0.50 | 1.00 | **0.62** | — | — |
+| `plumber-03` | instagram_caption | rag_off | — | 1.00 | 1.00 | 0.00 | 0.50 | **0.62** | — | — |
+| `plumber-03` | instagram_caption | rag_on | — | 1.00 | 1.00 | 0.00 | 0.50 | **0.62** | — | — |
+| `plumber-04` | facebook_post | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 1.00 | **1.00** | — | — |
+| `plumber-04` | facebook_post | rag_on | — | 1.00 | 0.00 | 0.67 | 1.00 | **0.67** | — | — |
+| `dentist-01` | blog_article | rag_off | 0.84 | 1.00 | 0.75 | 0.00 | 1.00 | **0.72** | — | — |
+| `dentist-01` | blog_article | rag_on | 0.84 | 1.00 | 0.00 | 0.50 | 1.00 | **0.67** | — | — |
+| `dentist-02` | facebook_post | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `dentist-02` | facebook_post | rag_on | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `dentist-03` | instagram_caption | rag_off | — | 1.00 | 1.00 | 1.00 n/e | 1.00 | **1.00** | — | — |
+| `dentist-03` | instagram_caption | rag_on | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `dentist-04` | email | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `dentist-04` | email | rag_on | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `bakery-01` | blog_article | rag_off | 0.83 | 1.00 | 0.75 | 0.00 | 0.67 | **0.65** | — | — |
+| `bakery-01` | blog_article | rag_on | 0.84 | 1.00 | 0.00 | 0.33 | 1.00 | **0.63** | — | — |
+| `bakery-02` | instagram_caption | rag_off | — | 1.00 | 1.00 | 0.00 | 0.67 | **0.67** | — | — |
+| `bakery-02` | instagram_caption | rag_on | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `bakery-03` | facebook_post | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `bakery-03` | facebook_post | rag_on | — | 1.00 | 0.00 | 0.67 | 1.00 | **0.67** | — | — |
+| `bakery-04` | email | rag_off | — | 1.00 | 1.00 | 0.00 | 0.67 | **0.67** | — | — |
+| `bakery-04` | email | rag_on | — | 1.00 | 0.00 | 0.00 | 1.00 | **0.50** | — | — |
+| `steuerberater-01` | linkedin | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `steuerberater-01` | linkedin | rag_on | — | 1.00 | 0.00 | 0.50 | 1.00 | **0.62** | — | — |
+| `steuerberater-02` | blog_article | rag_off | 0.91 | 1.00 | 0.75 | 0.00 | 1.00 | **0.73** | — | — |
+| `steuerberater-02` | blog_article | rag_on | 0.91 | 1.00 | 0.00 | 0.50 | 1.00 | **0.68** | — | — |
+| `steuerberater-03` | email | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `steuerberater-03` | email | rag_on | — | 1.00 | 0.00 | 0.25 | 1.00 | **0.56** | — | — |
+| `steuerberater-04` | facebook_post | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `steuerberater-04` | facebook_post | rag_on | — | 1.00 | 0.00 | 0.50 | 1.00 | **0.62** | — | — |
+| `saas-01` | blog_article | rag_off | 0.84 | 1.00 | 0.75 | 0.00 | 1.00 | **0.72** | — | — |
+| `saas-01` | blog_article | rag_on | 0.84 | 1.00 | 0.00 | 0.71 | 0.67 | **0.64** | — | — |
+| `saas-02` | linkedin | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `saas-02` | linkedin | rag_on | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `saas-03` | email | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `saas-03` | email | rag_on | — | 1.00 | 0.00 | 0.75 | 1.00 | **0.69** | — | — |
+| `saas-04` | facebook_post | rag_off | — | 1.00 | 1.00 | 0.00 | 1.00 | **0.75** | — | — |
+| `saas-04` | facebook_post | rag_on | — | 1.00 | 1.00 | 0.50 | 1.00 | **0.88** | — | — |
 
 ## Aggregate
 
@@ -65,18 +66,18 @@ One row per case per arm. **`—`** means the dimension does not apply to the ch
 
 | arm | cases | mean | dimensions passed | failed | not exercised |
 |---|---|---|---|---|---|
-| rag_off | 20 | **0.64** | 52 | 33 | 20 |
-| rag_on | 20 | **0.64** | 52 | 33 | 20 |
+| rag_off | 20 | **0.75** | 60 | 25 | 2 |
+| rag_on | 20 | **0.67** | 46 | 39 | 0 |
 
 Per dimension:
 
 | dimension | rag_off | rag_on |
 |---|---|---|
 | brand | 1.00 | 1.00 |
-| coverage | 0.00 | 0.00 |
-| format | 0.51 | 0.51 |
-| grounding | 1.00 | 1.00 |
-| seo | 0.79 | 0.80 |
+| coverage | 0.93 | 0.96 |
+| format | 0.95 | 0.35 |
+| grounding | 0.10 | 0.35 |
+| seo | 0.86 | 0.85 |
 
 ## RAG off vs RAG on vs oracle
 
@@ -86,28 +87,28 @@ The oracle column is the honest part: without it, a two-column table cannot dist
 
 | case | retrieval outcome | kept | generated off | generated on | generated oracle | reference off | reference on | reference oracle |
 |---|---|---|---|---|---|---|---|---|
-| `plumber-01` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `plumber-02` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `plumber-03` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `plumber-04` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `dentist-01` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `dentist-02` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `dentist-03` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `dentist-04` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `bakery-01` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.67 | 1.00 |
-| `bakery-02` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `bakery-03` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `bakery-04` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `steuerberater-01` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `steuerberater-02` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.50 | 1.00 |
-| `steuerberater-03` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `steuerberater-04` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `saas-01` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `saas-02` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
-| `saas-03` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 0.33 | 1.00 |
-| `saas-04` | sufficient | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 |
+| `plumber-01` | sufficient | 3 | 0.00 | 0.56 | 0.56 | 0.00 | 1.00 | 1.00 |
+| `plumber-02` | sufficient | 2 | 0.00 | 0.50 | 0.50 | 0.00 | 1.00 | 1.00 |
+| `plumber-03` | fallback_to_web | 1 | 0.00 | 0.00 | 1.00 | 0.00 | 1.00 | 1.00 |
+| `plumber-04` | sufficient | 2 | 1.00 | 0.67 | 0.67 | 0.00 | 1.00 | 1.00 |
+| `dentist-01` | sufficient | 1 | 0.00 | 0.50 | 0.50 | 0.00 | 0.50 | 1.00 |
+| `dentist-02` | sufficient | 1 | 0.00 | 0.00 | 1.00 | 0.00 | 1.00 | 1.00 |
+| `dentist-03` | sufficient | 1 | 1.00 | 0.00 | 1.00 | 0.00 | 1.00 | 1.00 |
+| `dentist-04` | sufficient | 1 | 0.00 | 0.00 | 1.00 | 0.00 | 0.50 | 1.00 |
+| `bakery-01` | fallback_to_web | 2 | 0.00 | 0.33 | 0.33 | 0.00 | 1.00 | 1.00 |
+| `bakery-02` | sufficient | 1 | 0.00 | 0.00 | 1.00 | 0.00 | 1.00 | 1.00 |
+| `bakery-03` | sufficient | 1 | 0.00 | 0.67 | 0.67 | 0.00 | 1.00 | 1.00 |
+| `bakery-04` | sufficient | 2 | 0.00 | 0.00 | 0.75 | 0.00 | 1.00 | 1.00 |
+| `steuerberater-01` | sufficient | 1 | 0.00 | 0.50 | 0.50 | 0.00 | 0.50 | 1.00 |
+| `steuerberater-02` | fallback_to_web | 1 | 0.00 | 0.50 | 0.50 | 0.00 | 0.50 | 1.00 |
+| `steuerberater-03` | sufficient | 1 | 0.00 | 0.25 | 0.25 | 0.00 | 1.00 | 1.00 |
+| `steuerberater-04` | fallback_to_web | 1 | 0.00 | 0.50 | 0.50 | 0.00 | 1.00 | 1.00 |
+| `saas-01` | sufficient | 1 | 0.00 | 0.71 | 0.71 | 0.00 | 1.00 | 1.00 |
+| `saas-02` | not_needed | 0 | 0.00 | 0.00 | 1.00 | 0.00 | 0.00 | 1.00 |
+| `saas-03` | sufficient | 1 | 0.00 | 0.75 | 0.75 | 0.00 | 0.67 | 1.00 |
+| `saas-04` | fallback_to_web | 1 | 0.00 | 0.50 | 0.50 | 0.00 | 1.00 | 1.00 |
 
-Retrieval kept **20 chunk(s) across 20 case(s)**, grounding 20 of them.
+Retrieval kept **25 chunk(s) across 20 case(s)**, grounding 19 of them.
 
 ## Rubric self-check
 
@@ -122,24 +123,24 @@ SEO and format discrimination are covered by unit tests (`backend/tests/evals/te
 
 Listed separately from the averages on purpose: a banned claim, a channel that would reject the post, or a citation to a chunk that was never retrieved cannot be averaged away.
 
-- `plumber-01` / rag_off / format: too short to be a blog_article: 90 chars against a 2500-char minimum
-- `plumber-01` / rag_on / format: too short to be a blog_article: 105 chars against a 2500-char minimum
-- `dentist-01` / rag_off / format: too short to be a blog_article: 115 chars against a 2500-char minimum
-- `dentist-01` / rag_on / format: too short to be a blog_article: 90 chars against a 2500-char minimum
-- `dentist-04` / rag_off / format: too short to be a email: 85 chars against a 300-char minimum
-- `dentist-04` / rag_on / format: too short to be a email: 85 chars against a 300-char minimum
-- `bakery-01` / rag_off / format: too short to be a blog_article: 85 chars against a 2500-char minimum
-- `bakery-01` / rag_on / format: too short to be a blog_article: 90 chars against a 2500-char minimum
-- `bakery-04` / rag_off / format: too short to be a email: 90 chars against a 300-char minimum
-- `bakery-04` / rag_on / format: too short to be a email: 90 chars against a 300-char minimum
-- `steuerberater-02` / rag_off / format: too short to be a blog_article: 85 chars against a 2500-char minimum
-- `steuerberater-02` / rag_on / format: too short to be a blog_article: 115 chars against a 2500-char minimum
-- `steuerberater-03` / rag_off / format: too short to be a email: 115 chars against a 300-char minimum
-- `steuerberater-03` / rag_on / format: too short to be a email: 105 chars against a 300-char minimum
-- `saas-01` / rag_off / format: too short to be a blog_article: 115 chars against a 2500-char minimum
-- `saas-01` / rag_on / format: too short to be a blog_article: 90 chars against a 2500-char minimum
-- `saas-03` / rag_off / format: too short to be a email: 85 chars against a 300-char minimum
-- `saas-03` / rag_on / format: too short to be a email: 115 chars against a 300-char minimum
+- `plumber-01` / rag_on / format: 6 hashtags exceed the maximum of 0 for blog_article
+- `plumber-01` / rag_on / format: too short: 2058 chars against a 2500-char minimum
+- `plumber-02` / rag_on / format: 5 hashtags exceed the maximum of 3 for linkedin
+- `plumber-04` / rag_on / format: 5 hashtags exceed the maximum of 3 for facebook_post
+- `dentist-01` / rag_on / format: 1 hashtags exceed the maximum of 0 for blog_article
+- `dentist-01` / rag_on / format: too short: 1377 chars against a 2500-char minimum
+- `bakery-01` / rag_on / format: 4 hashtags exceed the maximum of 0 for blog_article
+- `bakery-01` / rag_on / format: too short: 1951 chars against a 2500-char minimum
+- `bakery-03` / rag_on / format: 4 hashtags exceed the maximum of 3 for facebook_post
+- `bakery-04` / rag_on / format: 3 hashtags exceed the maximum of 0 for email
+- `steuerberater-01` / rag_on / format: 4 hashtags exceed the maximum of 3 for linkedin
+- `steuerberater-02` / rag_on / format: 1 hashtags exceed the maximum of 0 for blog_article
+- `steuerberater-02` / rag_on / format: too short: 1895 chars against a 2500-char minimum
+- `steuerberater-03` / rag_on / format: 1 hashtags exceed the maximum of 0 for email
+- `steuerberater-04` / rag_on / format: 4 hashtags exceed the maximum of 3 for facebook_post
+- `saas-01` / rag_on / format: 1 hashtags exceed the maximum of 0 for blog_article
+- `saas-01` / rag_on / format: too short: 1923 chars against a 2500-char minimum
+- `saas-03` / rag_on / format: 1 hashtags exceed the maximum of 0 for email
 
 ## What this harness cannot measure
 

@@ -16,6 +16,7 @@ from backend.app.llm.contract import (
     LlmError,
     Message,
     ModelTier,
+    ModelUnavailableError,
     Provider,
     ProviderRateLimitError,
     ProviderRequestError,
@@ -232,6 +233,52 @@ async def test_exhausted_chain_raises_carrying_every_cause() -> None:
     assert "beta" in message
     assert "503 overloaded" in message
     assert caught.value.task == TaskClass.GENERATE.value
+
+
+async def test_an_unavailable_model_falls_through_to_the_next_chain_entry() -> None:
+    """A 403/404 is about one model, so the chain must absorb it.
+
+    This is the failure that motivated `ModelUnavailableError`: an OpenRouter
+    account whose data policy refused `anthropic/claude-opus-4.8` with a 404
+    while happily serving `anthropic/claude-haiku-4.5`. The chain existed
+    precisely for that, and read it as a total outage instead.
+    """
+    first = StubProvider(
+        "alpha",
+        error=ModelUnavailableError("alpha", "m", "404 no endpoints", status_code=404),
+    )
+    second = StubProvider("beta")
+    router, _, _ = _two_provider_router(first, second)
+
+    completion = await router.complete(TaskClass.GENERATE, PROMPT)
+
+    assert completion.text == "stub answer"
+    assert second.calls != [], "the second entry names a different model and must be tried"
+
+
+async def test_an_unavailable_model_is_still_a_request_error_by_type() -> None:
+    """Narrowing, not replacing: existing `except ProviderRequestError` still catches it."""
+    error = ModelUnavailableError("alpha", "m", "404", status_code=404)
+    assert isinstance(error, ProviderRequestError)
+    assert error.status_code == 404
+
+
+async def test_a_bad_credential_is_not_retried_on_the_next_provider() -> None:
+    """401/402 are account-scoped: every entry fails, so fail fast and say why.
+
+    Falling through here would bury "your key is bad" under N identical
+    failures, which is the opposite of useful.
+    """
+    first = StubProvider(
+        "alpha", error=ProviderRequestError("alpha", "m", "401 bad key", status_code=401)
+    )
+    second = StubProvider("beta")
+    router, _, _ = _two_provider_router(first, second)
+
+    with pytest.raises(ProviderRequestError):
+        await router.complete(TaskClass.GENERATE, PROMPT)
+
+    assert second.calls == []
 
 
 async def test_a_bad_request_is_not_retried_on_the_next_provider() -> None:

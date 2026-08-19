@@ -36,9 +36,11 @@ from backend.app.llm.anthropic_provider import (
     split_system,
 )
 from backend.app.llm.contract import (
+    RETRYABLE_ERRORS,
     Completion,
     InvalidToolArgumentsError,
     Message,
+    ModelUnavailableError,
     ProviderRateLimitError,
     ProviderRequestError,
     ProviderServerError,
@@ -457,16 +459,38 @@ async def test_a_missing_usage_block_is_estimated_and_flagged() -> None:
         (529, ProviderServerError),
         (400, ProviderRequestError),
         (401, ProviderRequestError),
-        (404, ProviderRequestError),
+        # 403/404 stay ProviderRequestError by type -- ModelUnavailableError is a
+        # subclass -- but the retry policy keys on that subclass, asserted below.
+        (403, ModelUnavailableError),
+        (404, ModelUnavailableError),
     ],
 )
 async def test_openrouter_maps_http_status_to_a_typed_error(
     status: int, expected: type[Exception]
 ) -> None:
-    """Retryable (429, 5xx) and not (other 4xx) must be distinguishable."""
+    """Retryable (429, 5xx, 403/404) and not (other 4xx) must be distinguishable."""
     stub = openrouter_stub(status=status, body={"error": {"message": "nope"}})
     with pytest.raises(expected):
         await stub.provider.complete(PROMPT, model=OPENROUTER_MODEL)
+
+
+@pytest.mark.parametrize("status", [401, 402])
+async def test_openrouter_account_failures_are_not_model_unavailable(status: int) -> None:
+    """The boundary of the retryable set, pinned from the other side.
+
+    A bad key or an empty balance must NOT be mistaken for "try another model":
+    every entry would fail the same way, and the operator needs the real reason.
+    """
+    stub = openrouter_stub(status=status, body={"error": {"message": "nope"}})
+    with pytest.raises(ProviderRequestError) as caught:
+        await stub.provider.complete(PROMPT, model=OPENROUTER_MODEL)
+    assert not isinstance(caught.value, ModelUnavailableError)
+
+
+async def test_the_retryable_set_contains_model_unavailable_but_not_its_parent() -> None:
+    """`except RETRYABLE_ERRORS` matches listed classes, so the grain matters."""
+    assert ModelUnavailableError in RETRYABLE_ERRORS
+    assert ProviderRequestError not in RETRYABLE_ERRORS
 
 
 @pytest.mark.parametrize(

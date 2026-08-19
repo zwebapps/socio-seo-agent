@@ -63,6 +63,7 @@ from pydantic import BaseModel
 from backend.app.llm.contract import (
     Completion,
     Message,
+    ModelUnavailableError,
     ProviderRateLimitError,
     ProviderRequestError,
     ProviderServerError,
@@ -121,6 +122,10 @@ def ollama_root(base_url: str) -> str:
     if trimmed.endswith("/v1"):
         trimmed = trimmed[: -len("/v1")]
     return trimmed
+
+
+#: 4xx codes that mean "not this model", not "not this request".
+_MODEL_ACCESS_STATUSES = frozenset({403, 404})
 
 
 class OllamaStatus(BaseModel):
@@ -273,17 +278,25 @@ class OllamaProvider:
     def _status_error(
         self, model: str, exc: APIStatusError
     ) -> ProviderServerError | ProviderRequestError:
-        """Split a non-2xx into retryable (5xx) and not (other 4xx).
+        """Split a non-2xx three ways: retryable 5xx, retryable 403/404, fatal 4xx.
 
-        A 404 from Ollama almost always means the model has not been pulled. That
-        is our request being wrong about the world, not a transient fault, so it
-        is a `ProviderRequestError`: the next provider would reject the same id
-        just as fast.
+        A 404 from Ollama almost always means the model has not been pulled --
+        our request being wrong about the world rather than a transient fault,
+        so it stays a `ProviderRequestError` by type. But it is raised as the
+        `ModelUnavailableError` subclass so the router falls through, because a
+        chain entry is a (provider, model) *pair*: the next entry names a
+        *different* model, which may well be pulled. (An earlier version of this
+        docstring claimed the next provider "would reject the same id just as
+        fast" -- it would not, since it is not asked for the same id.)
         """
         status = exc.status_code
         if status >= 500:
             return ProviderServerError(
                 self.name, model, f"server error {status}: {exc}", status_code=status
+            )
+        if status in _MODEL_ACCESS_STATUSES:
+            return ModelUnavailableError(
+                self.name, model, f"model unavailable ({status}): {exc}", status_code=status
             )
         return ProviderRequestError(
             self.name,

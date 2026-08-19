@@ -95,7 +95,7 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] Langfuse seam, no-op without keys, redaction inside the tracer — `d9deedf`
 - [x] 20 cases + 5 deterministic scorers (Ragas absent, marked so, not invented) — `d9deedf`
 - [x] `evals/report.md` with RAG off vs on vs oracle — `d9deedf`
-- [ ] prompt v1-vs-v2 and cheap-vs-strong comparison (needs a live key)
+- [ ] prompt v1-vs-v2 comparison (needs a live key). Cheap-vs-strong is now runnable: `evals/run.py --tier {cheap,mid,strong}` overrides the GENERATE tier and the report header names it. Blocked for THIS credential only — its OpenRouter data policy refuses the mid and strong chains (404 `no endpoints matching your guardrail restrictions`), so only `--tier cheap` can run live until that account setting changes
 - [ ] ⛔ Langfuse keys
 
 ## Phase 13 — Feedback → learned preferences
@@ -108,10 +108,10 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] `businesses.slug` column — `/go/{id}` takes a UUID because there is no slug to take
 - [ ] Retire the privileged connection in `lead_store.resolve` for a `SECURITY DEFINER` function (SQL is written, in the module)
 - [ ] Wire `resolver_can_bypass_rls()` into a startup check — a deployment whose owner lacks BYPASSRLS 404s every link with green tests
-- [ ] Refund the per-email rate counter on success — an attacker can otherwise lock a victim out
+- [x] Refund the per-email rate counter on success — `WindowCounter.give_back` on both backends (Redis guards with EXISTS so DECR cannot resurrect an expired key, and clamps at 0); `login` refunds the EMAIL dimension only, never IP (refunding IP would make one valid credential an unlimited enumeration budget). Residual, deliberately open and now pinned by a test: an attacker who knows an address can still burn its 15-minute window, because the check must stay *before* argon2 to ration it at all
 - [ ] Body-size limit middleware — login hashes an unbounded password
 - [ ] `--proxy-headers --forwarded-allow-ips` is a DEPLOYMENT REQUIREMENT, not optional: without it every client shares one rate-limit bucket
-- [ ] `docs/CHANNELS.md` §5 still lists `ua_hash`; no UA is stored
+- [x] `docs/CHANNELS.md` §5 still lists `ua_hash`; no UA is stored — §5 now names the real columns and says why no UA is kept (a hash is re-identifying and adds nothing to attribution)
 
 ## Deferred (recorded so they are not rediscovered)
 - [ ] `analytics` engine — GSC/GA4 cut from Track A: two OAuth flows for a metric that cannot move inside a project timeline

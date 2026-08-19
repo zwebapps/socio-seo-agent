@@ -46,6 +46,7 @@ from anthropic.types import (
 from backend.app.llm.contract import (
     Completion,
     Message,
+    ModelUnavailableError,
     ProviderRateLimitError,
     ProviderRequestError,
     ProviderServerError,
@@ -166,6 +167,10 @@ def split_system(
     return ("\n\n".join(system_parts) if system_parts else None), params
 
 
+#: 4xx codes that mean "not this model", not "not this request".
+_MODEL_ACCESS_STATUSES = frozenset({403, 404})
+
+
 class AnthropicProvider:
     """Anthropic Messages API. Satisfies `contract.Provider`."""
 
@@ -230,11 +235,21 @@ class AnthropicProvider:
     def _status_error(
         self, model: str, exc: APIStatusError
     ) -> ProviderServerError | ProviderRequestError:
-        """Split a non-2xx into retryable (5xx, 529 overloaded) and not."""
+        """Split a non-2xx three ways: retryable 5xx/529, retryable 403/404, fatal 4xx.
+
+        403/404 mean *this model* is closed to this credential (an unreleased
+        or un-entitled model id), which says nothing about the next entry in the
+        chain, so they fall through as `ModelUnavailableError`. 401/402 stay
+        fatal: a bad key or an empty balance fails every entry identically.
+        """
         status = exc.status_code
         if status >= 500:
             return ProviderServerError(
                 self.name, model, f"server error {status}: {exc}", status_code=status
+            )
+        if status in _MODEL_ACCESS_STATUSES:
+            return ModelUnavailableError(
+                self.name, model, f"model unavailable ({status}): {exc}", status_code=status
             )
         return ProviderRequestError(
             self.name, model, f"request rejected ({status}): {exc}", status_code=status

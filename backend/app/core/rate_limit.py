@@ -80,6 +80,7 @@ import hashlib
 import hmac
 import time
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Final, Protocol
@@ -165,6 +166,16 @@ class WindowCounter(Protocol):
 
     async def bump(self, key: str, window_seconds: int) -> int: ...
 
+    async def give_back(self, key: str, window_seconds: int) -> None:
+        """Undo one :meth:`bump`, never dropping below zero.
+
+        Exists so an attempt that turned out to be legitimate can stop counting
+        against a budget meant for hostile traffic. Never creates a window: if the
+        key has already expired there is nothing to refund, and inventing a
+        zero-count window would only hold memory.
+        """
+        ...
+
 
 @dataclass(slots=True)
 class _Window:
@@ -201,6 +212,13 @@ class InMemoryWindowCounter:
             self._windows[key] = window
         window.count += 1
         return window.count
+
+    async def give_back(self, key: str, window_seconds: int) -> None:
+        """Decrement, clamped at zero. A missing or elapsed window is a no-op."""
+        window = self._windows.get(key)
+        if window is None or window.expires_at <= time.monotonic():
+            return
+        window.count = max(0, window.count - 1)
 
     def _prune(self, now: float) -> None:
         """Drop elapsed windows; if that frees nothing, drop everything.
@@ -274,6 +292,31 @@ class RedisWindowCounter:
         except (TimeoutError, RedisError, OSError, ValueError) as exc:
             self._blocked_until = time.monotonic() + self._cooldown
             raise RateLimitBackendError(f"{type(exc).__name__}: {exc}") from exc
+
+    async def give_back(self, key: str, window_seconds: int) -> None:
+        """Decrement without resurrecting an expired key, and without going negative.
+
+        ``DECR`` on a missing key creates it at ``-1``, which would hand the next
+        caller a free window and hold a key with no TTL -- so the decrement is
+        guarded by ``EXISTS`` inside the transaction, and clamped after.
+
+        A refund is a courtesy, not a security control: if Redis refuses, the
+        counter stays one higher than ideal, which fails in the safe direction. So
+        this swallows backend errors rather than raising, and deliberately does
+        *not* trip the cooldown -- a failed refund must never make the next
+        ``bump`` fail open.
+        """
+        if self.is_cooling_down:
+            return
+        try:
+            client = self._client()
+            if not await client.exists(key):
+                return
+            remaining = int(await client.decr(key))
+            if remaining < 0:
+                await client.set(key, 0, xx=True, keepttl=True)
+        except (TimeoutError, RedisError, OSError, ValueError):
+            return
 
     async def aclose(self) -> None:
         """Close this loop's client. For tests and for an orderly shutdown."""
@@ -388,6 +431,32 @@ class FixedWindowRateLimiter:
                 )
 
         return worst if worst is not None else RateLimitDecision(allowed=True)
+
+    async def give_back(self, values: Mapping[str, str]) -> None:
+        """Refund one counted attempt on the given dimensions.
+
+        Call this when an attempt proved legitimate, so honest traffic does not
+        spend a budget that exists to ration hostile traffic. It recomputes the
+        same bucket :meth:`check` used; if the window has since rolled over the
+        refund lands on nothing, which is correct -- the old budget is already gone.
+
+        **Refund the email dimension, not the IP dimension.** The per-IP window is
+        the flood defence, and refunding it would let one valid credential buy an
+        unlimited enumeration budget: a stuffing run that finds a single live
+        account would reset its own allowance on every hit. The per-email window
+        has no such property, because a success there is by definition the owner.
+        """
+        for dimension, raw in values.items():
+            rule = self._rules.get(dimension)
+            if rule is None:
+                continue
+            bucket = int(time.time()) // rule.window_seconds
+            key = self._key(dimension, self._normalise(dimension, raw), bucket)
+            with suppress(RateLimitBackendError):
+                await self._counter.give_back(key, rule.window_seconds)
+            fallback = self._fallback
+            if fallback is not None:
+                await fallback.give_back(key, rule.window_seconds)
 
 
 # --------------------------------------------------------------------------- #

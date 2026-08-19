@@ -755,6 +755,53 @@ async def test_the_login_rate_limit_is_per_email_independently_of_the_ip(
     assert statuses == [401, 401, 401, 429, 429], statuses
 
 
+async def test_successful_logins_do_not_spend_the_per_email_budget(db: AsyncSession) -> None:
+    """A user must not be able to lock themselves out by signing in.
+
+    The per-email window rations password *guessing*. Before the refund, a handful
+    of ordinary sign-ins -- several devices, a flaky connection -- consumed the same
+    budget and answered the account owner 429.
+    """
+    email = _email()
+    limiter = _limiter(email=RateLimitRule(limit=3, window_seconds=LONG_WINDOW))
+
+    async with _client(db, login_limiter=limiter) as client:
+        assert (await _signup(client, email)).status_code == 201
+        statuses = [
+            (
+                await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
+            ).status_code
+            for _ in range(6)
+        ]
+
+    assert statuses == [200] * 6, statuses
+
+
+async def test_a_successful_login_does_not_refund_the_per_ip_budget(db: AsyncSession) -> None:
+    """The boundary: one valid credential must not buy an enumeration budget.
+
+    A stuffing run that happens to find a live account would otherwise top its own
+    per-IP allowance back up on every hit, which is the opposite of a flood defence.
+    """
+    email = _email()
+    limiter = _limiter(
+        ip=RateLimitRule(limit=4, window_seconds=LONG_WINDOW),
+        email=RateLimitRule(limit=1000, window_seconds=LONG_WINDOW),
+    )
+
+    async with _client(db, login_limiter=limiter) as client:
+        # Signup uses its own limiter, so all four of these are login attempts.
+        assert (await _signup(client, email)).status_code == 201
+        statuses = [
+            (
+                await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
+            ).status_code
+            for _ in range(6)
+        ]
+
+    assert statuses == [200, 200, 200, 200, 429, 429], statuses
+
+
 async def test_a_rate_limited_login_never_says_which_limit_tripped(db: AsyncSession) -> None:
     """Naming the dimension tells an attacker which one to route around.
 
@@ -796,8 +843,18 @@ async def test_a_rate_limited_login_never_says_which_limit_tripped(db: AsyncSess
 async def test_a_rate_limited_login_never_reaches_argon2(db: AsyncSession) -> None:
     """The refusal has to come BEFORE the hash, or it rations nothing.
 
-    Asserted by giving a real account its real password: a throttled request must
-    be refused anyway, and must not set a session cookie.
+    Asserted by giving a real account its real password once the window is full: a
+    throttled request must be refused anyway, and must not set a session cookie. If
+    the check ran after `authenticate`, the correct password would return 200.
+
+    The window is filled with a WRONG password, which matters twice over. It is the
+    only way to fill it now that a success is refunded (see
+    `test_successful_logins_do_not_spend_the_per_email_budget`) -- an earlier
+    version of this test used two valid logins, which the refund made impossible.
+    And it states the residual risk that refund deliberately does not close: an
+    attacker who knows an address can burn its window and the owner is refused for
+    the rest of it. Bounded, self-clearing, and the price of rationing argon2 before
+    spending it.
     """
     email = _email()
     limiter = _limiter(email=RateLimitRule(limit=1, window_seconds=LONG_WINDOW))
@@ -805,14 +862,14 @@ async def test_a_rate_limited_login_never_reaches_argon2(db: AsyncSession) -> No
         await _signup(client, email)
         client.cookies.clear()
 
-        first = await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
-        second = await client.post(
-            "/api/v1/auth/login", json={"email": email, "password": PASSWORD}
+        burned = await client.post(
+            "/api/v1/auth/login", json={"email": email, "password": "wrong entirely"}
         )
+        owner = await client.post("/api/v1/auth/login", json={"email": email, "password": PASSWORD})
 
-    assert first.status_code == 200
-    assert second.status_code == 429
-    assert not second.headers.get_list("set-cookie")
+    assert burned.status_code == 401
+    assert owner.status_code == 429, "the correct password proves the check ran before argon2"
+    assert not owner.headers.get_list("set-cookie")
 
 
 async def test_signup_is_rate_limited_too(db: AsyncSession) -> None:
