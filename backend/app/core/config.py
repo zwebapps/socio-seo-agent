@@ -9,6 +9,11 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+#: The obviously-unsafe default. Named rather than inlined so `create_app` can
+#: refuse to boot on it outside local development, comparing against the same
+#: constant the field defaults to instead of a duplicated literal that drifts.
+DEFAULT_SESSION_SECRET = "insecure-local-development-secret-change-me"  # noqa: S105
+
 Environment = Literal["local", "ci", "staging", "production"]
 
 
@@ -46,6 +51,18 @@ class Settings(BaseSettings):
 
     # Browser origins allowed to call the API.
     cors_origins: tuple[str, ...] = ("http://localhost:3100",)
+
+    # HMAC key for session cookies. The default below is deliberately obvious
+    # rubbish so that a machine which forgot to set it is caught by reading the
+    # value, not by a subtle failure later: anyone holding this string can mint a
+    # session for any user id. MUST be overridden in staging and production with
+    # a high-entropy value (`openssl rand -hex 32`). Rotating it logs everyone
+    # out, which is also how you revoke every session at once.
+    # ruff's S105 fires here and is right in general: this IS a hardcoded
+    # credential. It is silenced rather than removed because a required setting
+    # would make `pytest` and `make dev` fail on a fresh checkout, and the usual
+    # workaround for that is a shared secret in a committed .env -- which is worse.
+    session_secret: str = DEFAULT_SESSION_SECRET
 
 
 @lru_cache
