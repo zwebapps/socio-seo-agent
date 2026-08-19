@@ -52,7 +52,9 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 
 ## Phase 7 — Memory
 - [x] Business memory read at INTAKE and rendered one rule per line — `d9deedf`
-- [ ] "What I remember about your business" panel, editable
+- [x] "What I remember about your business" panel, editable — `/memory`: the exact prompt
+  lines the next run receives, plus add / reword-in-place / remove over new session-scoped
+  `GET·POST·PUT·DELETE /api/v1/memory[/preferences[/{id}]]`. Swept into `045bec1`
 - [x] A remembered preference asserted present in the assembled prompt — `d9deedf`
 
 ## Phase 8 — Lead loop
@@ -63,7 +65,9 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 
 ## Phase 9 — UI completion
 - [x] Run timeline screen, resumable with a polling fallback — `3163123`
-- [ ] Review tabs: draft · SEO findings · social · AI blocks
+- [x] Review tabs: draft · SEO findings · social · AI blocks — `GET /api/v1/runs/{id}/review`
+  projects the checkpoint; every tab has an honest empty state naming the node that fills it.
+  AI blocks are `outline.answer_blocks`. Swept into `045bec1`
 - [x] `/developer/models`: model picker, provider toggles, Ollama address, behind a server-side role check — `1e5f4c5`, `a8b541f`
 - [ ] `/developer` extras: temperature and max-token sliders, prompt-version selector, tool toggles, cost dashboard
 
@@ -147,6 +151,22 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] Distil at 3+ occurrences into PROPOSED rules, applied only on approval — `d9deedf`
 
 ## Found while building, still open
+- [ ] **`GET /api/v1/runs/{id}` and `/events` and `/review` 404 for EVERY run against the real
+  store.** `PostgresRunStore._business_for` reads `runs` through the UNSCOPED `session()`,
+  whose docstring calls it "the OWNER session" — but `session()` uses `app_database_url`, the
+  restricted role, so the tenant policy sees no GUC, returns zero rows (null-safe since
+  `5b532c05f131`), and the run reads as absent. Verified against the live DB: the row is there,
+  `select count(*) from runs` as `sma_app` with no GUC returns 0 and returns 1 with it. So the
+  Phase 9 timeline screen has never worked outside tests. Fix is a narrow `SECURITY DEFINER`
+  resolver in the `7c1e4a90b2d5` pattern (needs a migration), or thread `business_id` through
+  the `RunStore` protocol from `current_business`, which needs none
+- [ ] **Nothing executes the graph.** `run_graph`, `build_nodes` and `RunService.checkpoint` are
+  called only from tests, so `POST /api/v1/runs` creates a `queued` row that never advances and
+  `runs.checkpoint` stays `{}`. The review tabs therefore show their empty states for every real
+  run today — correctly, but that is the only thing they can show until an executor exists
+- [ ] **REPACK discards the hashtags it asked the model for.** `REPACK_TOOL` accepts
+  `posts[].hashtags`, but the node stores only `renderings[channel] = body`, so they never reach
+  the checkpoint and the social tab cannot show them
 - [x] RLS policies were not null-safe: an emptied tenant GUC RAISED instead of returning zero rows — `d9deedf`
 - [x] `FakeProvider` returned empty arrays/objects, making every list-shaped tool untestable — `d9deedf`
 - [x] `businesses.slug` column — migration `9a4f21c7de83` (unique, NOT NULL, no server default: a public address has no sensible default and an expression default would report alembic drift forever). `/go/{handle}` accepts the slug OR the old UUID, permanently — that string may already be in an Instagram bio, and for IG/TikTok the hub IS the conversion path. Slugs transliterate German properly (ü→ue, ß→ss) and fall back to `b-<id>` for a name with nothing slugifiable

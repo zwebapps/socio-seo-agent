@@ -165,7 +165,9 @@ Same libraries you've used before, installed fresh here — nothing inherited fr
 Social-Marketing-Agent/          ← repo root; nothing above this line is ours
 ├─ pyproject.toml  uv.lock       own dependency set (uv)
 ├─ .venv/  .env  .env.example  .gitignore  README.md  ROADMAP.md
-├─ docs/            PROBLEM.md ARCHITECTURE.md DECISIONS.md EVALUATION.md DEMO.md
+├─ docs/            ARCHITECTURE.md ROADMAP.md FEATURES.md BUILD_ORDER.md
+│                   CHANNELS.md FREE_CHANNELS.md DIAGRAMS.md CRITERIA_MAP.md
+│                   AGENT_RUNTIME.md   (PROBLEM.md is at the repo root)
 ├─ backend/app/
 │  ├─ main.py                    FastAPI app, routers, SSE
 │  ├─ core/                      config, security, rate_limit, budget, idempotency, errors
