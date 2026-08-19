@@ -21,7 +21,7 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] `crawl` engine: fetch, parse, SSRF guard, robots — `dd6eb06`
 - [x] Onboarding service: URL → draft Business DNA, TDD — `bea58bd`
 - [x] Onboarding API + `/onboard` UI, end to end in a browser — `d554969`
-- [ ] Replace the last stub: `GENERATE` writing a real article from the draft DNA
+- [x] `GENERATE` writes a real article from the outline, with SEO fix hints on retry — `5c9409c`
 
 ## Phase 2 — Seams
 - [x] Model router, two provider adapters, cost ledger, budget guard — `edede91`
@@ -47,7 +47,7 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 ## Phase 6 — The graph
 - [x] `AgentState`, run caps, JSON checkpoint round trip — `731670a`
 - [x] Graph driver: retry loop, early exits, interrupt, resume, events — `731670a`
-- [ ] Wire the real nodes: HARVEST → engines, OPPORTUNITY/PLAN/GENERATE/REPACK → router
+- [x] Wire the real nodes: 8 nodes, injected deps, HARVEST+VALIDATE call no model — `5c9409c`
 - [ ] Persist runs and run_events; SSE endpoint for the timeline
 
 ## Phase 7 — Memory
@@ -64,7 +64,8 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 ## Phase 9 — UI completion
 - [ ] Run timeline screen consuming SSE
 - [ ] Review tabs: draft · SEO findings · social · AI blocks
-- [ ] `/developer` behind a server-side role check: model picker, sliders, prompt version, tool toggles, cost dashboard
+- [x] `/developer/models`: model picker, provider toggles, Ollama address, behind a server-side role check — `1e5f4c5`, `a8b541f`
+- [ ] `/developer` extras: temperature and max-token sliders, prompt-version selector, tool toggles, cost dashboard
 
 ## Phase 10 — Auth and tenancy
 - [x] RLS on every business-scoped table + isolation suite that derives its own table list — `26684dc`
@@ -72,6 +73,17 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] Refuse to boot on the default `SESSION_SECRET` outside local — `6061732`
 - [ ] Server-side revocation: `users.sessions_valid_from` folded into the signed token
 - [ ] Rate-limit `/login` and `/signup` on Redis — argon2 at 64 MiB × 4 lanes makes login a memory-amplification DoS
+
+## Runtime configuration (added 2026-08-19, not in the original plan)
+- [x] `model_routes` + `provider_settings` tables; empty config behaves as the code defaults — `9a9c3bc`
+- [x] Admin API for routes and providers, with an unknown-provider guard — `9a9c3bc`
+- [x] App-wide redaction of validation errors — a 422 was echoing a submitted API key — `9a9c3bc`
+- [x] Ollama adapter + model catalogue; runs with no paid API at all — `5162efa`
+- [x] Soft-UI design system and the admin screen — `1e5f4c5`
+- [x] Login/signup page — `1e5f4c5`
+- [x] `users.role` + platform-admin gate + out-of-band grant script — `a8b541f`
+- [x] CORS allowlist derived-then-explicit, with an OpenAPI guard test (PUT was blocked) — `1e5f4c5`
+- [ ] Per-business model override (`model_routes.business_id`) — one nullable column, no demand yet
 
 ## Phase 11 — Security hardening
 - [ ] 10-payload prompt-injection corpus as a test
@@ -91,6 +103,6 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 
 ## Deferred (recorded so they are not rediscovered)
 - [ ] `analytics` engine — GSC/GA4 cut from Track A: two OAuth flows for a metric that cannot move inside a project timeline
-- [ ] Verify the OpenRouter model slugs against openrouter.ai/models before live keys
+- [x] Verified the OpenRouter slugs — a real call returned and the catalogue lists 415 models — `5162efa`
 - [ ] `geo_results.run_id` column — run identity is currently a `probed_at` window
 - [ ] Password denylist is 26 entries; a HIBP k-anonymity range check is the real answer
