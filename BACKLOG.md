@@ -95,7 +95,7 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   projects the checkpoint; every tab has an honest empty state naming the node that fills it.
   AI blocks are `outline.answer_blocks`. Swept into `045bec1`
 - [x] `/developer/models`: model picker, provider toggles, Ollama address, behind a server-side role check — `1e5f4c5`, `a8b541f`
-- [ ] `/developer` extras: temperature and max-token sliders, prompt-version selector, tool toggles, cost dashboard
+- [x] `/developer` extras — sliders bounded by arithmetic (temperature 0–1 because that is the MINIMUM our adapters accept, so a control able to emit 1.7 would 400 on an Anthropic fallback; max tokens floored at 1024 from a computed 905), tool toggles that can only NARROW and are now enforced at runtime, a cost dashboard on real `model_usage` rows, and a prompt-version INVENTORY rather than a dropdown — there is one runtime version per surface, so a one-entry dropdown pretending to be a choice would have been the dishonest answer — `08a95a5`
 
 ## Phase 10 — Auth and tenancy
 - [x] RLS on every business-scoped table + isolation suite that derives its own table list — `26684dc`
@@ -177,19 +177,8 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] Distil at 3+ occurrences into PROPOSED rules, applied only on approval — `d9deedf`
 
 ## Found while building, still open
-- [ ] **`GET /api/v1/runs/{id}` and `/events` and `/review` 404 for EVERY run against the real
-  store.** `PostgresRunStore._business_for` reads `runs` through the UNSCOPED `session()`,
-  whose docstring calls it "the OWNER session" — but `session()` uses `app_database_url`, the
-  restricted role, so the tenant policy sees no GUC, returns zero rows (null-safe since
-  `5b532c05f131`), and the run reads as absent. Verified against the live DB: the row is there,
-  `select count(*) from runs` as `sma_app` with no GUC returns 0 and returns 1 with it. So the
-  Phase 9 timeline screen has never worked outside tests. Fix is a narrow `SECURITY DEFINER`
-  resolver in the `7c1e4a90b2d5` pattern (needs a migration), or thread `business_id` through
-  the `RunStore` protocol from `current_business`, which needs none
-- [ ] **Nothing executes the graph.** `run_graph`, `build_nodes` and `RunService.checkpoint` are
-  called only from tests, so `POST /api/v1/runs` creates a `queued` row that never advances and
-  `runs.checkpoint` stays `{}`. The review tabs therefore show their empty states for every real
-  run today — correctly, but that is the only thing they can show until an executor exists
+- [x] **`GET /api/v1/runs/{id}`, `/events` and `/review` 404'd for EVERY run against the real store** — fixed in `c8ee697`; see the fuller entry below. The tenant is now constructor-injected from the `current_business` dependency every route already had, so there was never a chicken-and-egg, and it exposed a second bug: `update`/`append_event` double-began a transaction, so checkpointing could never have worked either
+- [x] **Nothing executed the graph** — `services/run_executor.py`, `f287b2b`; see the fuller entry below for the four things it has to get right and the in-process limitation
 - [ ] **REPACK discards the hashtags it asked the model for.** `REPACK_TOOL` accepts
   `posts[].hashtags`, but the node stores only `renderings[channel] = body`, so they never reach
   the checkpoint and the social tab cannot show them
@@ -331,7 +320,6 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   Consequence: the regulated-claim guard has no claims to enforce for a real tenant.
 - [ ] `/auth/me` exposes no `businessId`, which is why the memory routes derive the tenant from the
   session instead of taking a path id like their `proposals` sibling.
-- [ ] REPACK discards hashtags — `REPACK_TOOL` asks the model for them, the node stores only `body`.
 
 ## Closed after the developer console landed (2026-08-19)
 
