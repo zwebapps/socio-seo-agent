@@ -184,11 +184,20 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   value to leak and a fresh clone needs no manual setup to be honest. Also widened CI's mypy from
   `backend` to `backend evals` — the eval harness decides whether the product works and was unchecked.
   Verified by running the full suite under CI's exact environment.
-- [ ] **The test suite is not safe against two concurrent runs on one database.**
-  `test_auth_api`'s teardown does `DELETE FROM users WHERE email LIKE 'authapi-test-%'`, so parallel
-  runs delete each other's rows mid-test. It cost two false failure reports during this session's
-  parallel work. Harmless in CI (each job gets its own Postgres service) and would flake immediately
-  in any parallel CI. Fix: per-run unique prefixes, or a schema/transaction per test.
+- [x] **The test suite was not safe against two concurrent runs on one database.**
+  `test_auth_api`'s teardown did `DELETE FROM users WHERE email LIKE 'authapi-test-%'` — a shared
+  namespace, so parallel runs could delete each other's rows mid-test. It cost two rounds of false
+  failure reports during this session's parallel agent work. `EMAIL_PREFIX` now carries the pid plus a
+  random suffix, so the delete can only reach rows this process created.
+  **Honest note on the verification:** two concurrent runs pass after the fix — but they also passed
+  once WITH the shared prefix, because the race needs one run's teardown to fire while the other is
+  mid-test, and it did not reproduce on demand in a two-run race. So the fix is sound by construction
+  (a shared-prefix DELETE can only ever be a cross-run delete) rather than proven by a failing test.
+  A deterministic reproduction would need the teardown held open against a known point in the other
+  run, which is more machinery than the fix.
+  Still open, and larger: every other `db` test file writes to the same shared tables, so the same
+  class of interference exists wherever teardown is by pattern rather than by transaction rollback.
+  The real answer is a transaction-per-test or a schema-per-run.
 - [ ] **`docs/AGENT_RUNTIME.md` documents four tools that are granted but not wired**
   (`geo.probe`, `nap.audit` on HARVEST; `kb.search` on OPPORTUNITY/PLAN/GENERATE; `web_search` on
   GENERATE). `NodeToolbox.available()` now distinguishes "not granted" (design) from "not wired"

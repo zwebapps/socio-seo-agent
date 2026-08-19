@@ -39,6 +39,7 @@ belongs to the event loop that created it, and pytest-asyncio gives every test a
 fresh loop.
 """
 
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -78,7 +79,16 @@ COOKIE = session_cookie_name(get_settings())
 #: sent no ``Origin`` at all, which no browser does.
 TEST_ORIGIN = "https://test"
 
-EMAIL_PREFIX = "authapi-test-"
+#: Unique to THIS process, not shared across runs.
+#:
+#: The teardown below deletes by prefix, so a constant here means two concurrent
+#: runs against one database delete each other's users mid-test. That is not
+#: hypothetical: it happened during this project's parallel agent work and produced
+#: two rounds of false failure reports before the cause was found -- and it would
+#: flake immediately in any CI that runs jobs in parallel against a shared instance.
+#: A per-process suffix makes the prefix a namespace, so the delete can only ever
+#: reach rows this process created.
+EMAIL_PREFIX = f"authapi-test-{os.getpid()}-{uuid4().hex[:8]}-"
 PASSWORD = "correct horse battery"
 
 # Long, for the reason spelled out in tests/core/test_rate_limit.py: every
@@ -112,6 +122,8 @@ async def db() -> AsyncIterator[AsyncSession]:
             yield session
         finally:
             await session.rollback()
+            # Scoped to this process's own prefix -- see EMAIL_PREFIX. A shared
+            # prefix here is a cross-run delete, not a cleanup.
             await session.execute(
                 text("DELETE FROM users WHERE email LIKE :prefix"),
                 {"prefix": f"{EMAIL_PREFIX}%"},
