@@ -40,6 +40,7 @@ from backend.app.agents.nodes.prompts import (
     LANDING_TOOL,
     OPPORTUNITY_TOOL,
     PLAN_TOOL,
+    PROMPT_VERSION,
     REPACK_TOOL,
     fence,
     system,
@@ -253,6 +254,16 @@ async def _ask(
         # Current Claude models reject `temperature` outright, and every node here
         # wants the provider default anyway.
         temperature=None,
+        # Nothing passed this before, so EVERY llm span was recorded with an empty
+        # run_id, business_id and node -- `llm_span_fields` defaults them to "" and the
+        # no-op tracer meant nobody saw it. It is also what a `model_usage` row needs to
+        # be attributable to anything, so the ledger could not have been written
+        # correctly even once a writer existed.
+        trace={
+            "business_id": str(state.get("business_id") or ""),
+            "node": box.node,
+            "prompt_version": PROMPT_VERSION,
+        },
     )
     return _tool_arguments(completion, tool.name, box), Decimal(str(completion.usage.usd))
 

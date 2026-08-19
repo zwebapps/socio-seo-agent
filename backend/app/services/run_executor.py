@@ -48,8 +48,9 @@ from uuid import UUID
 from backend.app.agents.graph import run_graph
 from backend.app.agents.nodes import NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
-from backend.app.llm.router import ModelRouter
+from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
+from backend.app.services.usage_recorder import UsageRecorder
 
 logger: Final = logging.getLogger(__name__)
 
@@ -83,7 +84,10 @@ MAX_HEADINGS_PER_PAGE: Final = 8
 EXECUTOR_NODE: Final = "EXECUTOR"
 
 
-DepsFactory = Callable[[UUID], Awaitable[NodeDeps]]
+#: Builds the node dependencies for one run. Takes the usage sink so the router it
+#: constructs can report what each call cost -- the router is per-run for exactly
+#: this reason, since a process-wide one could not know which run to bill.
+DepsFactory = Callable[[UUID, UsageSink | None], Awaitable[NodeDeps]]
 
 
 def summarise_crawl(result: Any) -> dict[str, Any]:
@@ -152,7 +156,7 @@ async def _load_revocations() -> Mapping[str, frozenset[str]]:
     return {record.node: frozenset(record.revoked) for record in stored}
 
 
-async def build_real_deps(business_id: UUID) -> NodeDeps:
+async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None) -> NodeDeps:
     """Wire the nodes to the real engines and services.
 
     Anything unconfigured is left as ``None`` rather than stubbed. That is not
@@ -164,7 +168,7 @@ async def build_real_deps(business_id: UUID) -> NodeDeps:
     from backend.app.engines.crawl import crawl_site as _crawl_site
     from backend.app.engines.serp import get_serp_provider, serp_config_status
 
-    router = ModelRouter()
+    router = ModelRouter(usage_sink=usage_sink)
 
     async def crawl_site(url: str) -> dict[str, Any]:
         return summarise_crawl(await _crawl_site(url))
@@ -302,7 +306,8 @@ class RunExecutor:
         resume: bool,
     ) -> None:
         state = await self._initial_state(run_id, business_id, goal, service=service, resume=resume)
-        deps = await self._deps_factory(business_id)
+        recorder = UsageRecorder(run_id=run_id, business_id=business_id)
+        deps = await self._deps_factory(business_id, recorder.sink)
         await self._record_provider_status(run_id, deps, service=service)
 
         queue: asyncio.Queue[tuple[str, str, dict[str, Any]] | None] = asyncio.Queue()
@@ -313,7 +318,7 @@ class RunExecutor:
             # has no way to handle an exception raised by its own event sink.
             queue.put_nowait((node, status, dict(payload)))
 
-        drain = asyncio.create_task(self._drain_events(run_id, queue, service))
+        drain = asyncio.create_task(self._drain_events(run_id, queue, service, recorder))
         try:
             result = await run_graph(state, nodes=build_nodes(deps), on_event=sink, resume=resume)
         finally:
@@ -321,6 +326,10 @@ class RunExecutor:
             # raised -- otherwise a failed run leaks a task that waits forever.
             queue.put_nowait(None)
             await drain
+
+        # Whatever the last node emitted after its final event, plus anything a failure
+        # path left buffered.
+        await recorder.flush()
 
         final = result.state
         await service.checkpoint(run_id, state=final, current_node=_last_visited(final))
@@ -404,6 +413,7 @@ class RunExecutor:
         run_id: UUID,
         queue: asyncio.Queue[tuple[str, str, dict[str, Any]] | None],
         service: RunService,
+        recorder: UsageRecorder,
     ) -> None:
         """Persist events one at a time, in the order the graph emitted them.
 
@@ -421,6 +431,13 @@ class RunExecutor:
             if item is None:
                 return
             node, status, payload = item
+            if status in {"done", "failed"}:
+                # Flush on the node boundary. The router's sink is synchronous (it is on
+                # every node's hot path), so the buffered rows need an async moment to be
+                # written, and this drain is already one. Per node rather than per run so
+                # a run that dies mid-flight still has a ledger for the nodes that
+                # finished -- which is when the spend question is most likely to be asked.
+                await recorder.flush()
             try:
                 await service.record_event(
                     run_id, node=node, status=_event_status(status), payload=payload

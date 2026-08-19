@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Final
@@ -43,6 +43,7 @@ from backend.app.llm.contract import (
     ProviderUnavailableError,
     TaskClass,
     ToolSpec,
+    Usage,
 )
 from backend.app.llm.fake_provider import FakeProvider
 from backend.app.llm.pricing import compute_usd, conservative_token_estimate
@@ -59,6 +60,11 @@ FAKE: Final = "fake"
 #: ceiling. Matches the adapters' own default so the estimate and the request
 #: cannot disagree.
 DEFAULT_MAX_OUTPUT_TOKENS: Final = 2048
+
+#: Receives every completed call's usage, plus whatever trace context the caller
+#: passed. Synchronous by design: the router is on the hot path of every node, and
+#: awaiting a database write here would put request latency behind a ledger insert.
+UsageSink = Callable[[Usage, Mapping[str, str]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +253,7 @@ class ModelRouter:
         default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         resolver: object | None = None,
         tracer: Tracer | None = None,
+        usage_sink: UsageSink | None = None,
     ) -> None:
         """Build a router.
 
@@ -275,6 +282,14 @@ class ModelRouter:
         # other provider here. Redaction lives inside the tracer, so no call site can
         # leak prompt text by forgetting.
         self._tracer = tracer if tracer is not None else get_tracer(env)
+        # Where each call's usage goes to be PERSISTED, as opposed to traced.
+        #
+        # A callback rather than a store, because this module must not reach the
+        # database: `model_usage` is business-scoped and this router is a process-wide
+        # object with no tenant, so it cannot write the row correctly even if it wanted
+        # to. The caller that knows the run supplies the sink -- see
+        # `services/run_executor`.
+        self._usage_sink = usage_sink
 
     @property
     def providers(self) -> Mapping[str, Provider]:
@@ -511,6 +526,14 @@ class ModelRouter:
                 ),
             ):
                 pass
+
+            if self._usage_sink is not None:
+                # After the budget and the span, and deliberately not before: the sink
+                # persists what was actually charged. A failure here must not lose a
+                # completion that has already been paid for, so the sink owns its own
+                # error handling and this call site does not guard it -- see the sink in
+                # `run_executor`, which logs and drops.
+                self._usage_sink(completion.usage, context)
 
             return completion
 

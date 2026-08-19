@@ -9,7 +9,7 @@ failure is recorded rather than swallowed by a task nobody awaits.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from uuid import UUID
 
 import pytest
@@ -87,7 +87,7 @@ def patched(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(executor_module, "build_nodes", lambda deps: {})
 
 
-async def _deps(business_id: UUID) -> NodeDeps:
+async def _deps(business_id: UUID, usage_sink: object = None) -> NodeDeps:
     return NodeDeps(router=object())
 
 
@@ -490,3 +490,86 @@ async def test_only_one_event_write_is_ever_in_flight(
     seqs = [e.seq for e in await service.events(run.id)]
     assert seqs == sorted(seqs)
     assert len(seqs) == len(set(seqs))
+
+
+# --------------------------------------------------------------------------- #
+# The cost ledger is actually flushed
+# --------------------------------------------------------------------------- #
+
+
+class _SpyRecorder:
+    """Stands in for `UsageRecorder`, counting flushes instead of writing rows."""
+
+    instances: ClassVar[list[_SpyRecorder]] = []
+
+    def __init__(self, *, run_id: UUID, business_id: UUID) -> None:
+        self.run_id = run_id
+        self.business_id = business_id
+        self.flushes = 0
+        self.sunk: list[tuple[Any, Any]] = []
+        _SpyRecorder.instances.append(self)
+
+    def sink(self, usage: Any, context: Any) -> None:
+        self.sunk.append((usage, context))
+
+    async def flush(self) -> None:
+        self.flushes += 1
+
+
+async def test_the_usage_ledger_is_flushed_on_every_node_boundary(
+    service: RunService, patched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This wiring was NOT covered until this test existed.
+
+    Removing the executor's per-node `flush()` broke nothing: the recorder's own tests
+    call `flush()` directly, and the other executor tests never look at usage. So the one
+    line joining the router's sink to the database had no guard at all -- exactly the
+    shape of the gap that left `model_usage` unwritten in the first place.
+
+    Per node rather than only at the end, so a run that dies mid-flight still has a
+    ledger for the nodes that finished -- which is when somebody is most likely to ask
+    what it spent.
+    """
+    _SpyRecorder.instances.clear()
+    monkeypatch.setattr(executor_module, "UsageRecorder", _SpyRecorder)
+    graph = _Graph(events=[("INTAKE", "started"), ("INTAKE", "done"), ("HARVEST", "done")])
+    ex = _executor(service, graph, monkeypatch)
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+
+    ex.submit(run.id, BUSINESS, run.goal)
+    await ex.drain()
+
+    assert len(_SpyRecorder.instances) == 1, "one recorder per run"
+    recorder = _SpyRecorder.instances[0]
+    assert recorder.run_id == run.id
+    assert recorder.business_id == BUSINESS
+    # Two node completions ("done"), plus the final flush after the graph returns. The
+    # "started" event must NOT trigger one -- there is nothing to write yet.
+    assert recorder.flushes == 3
+
+
+async def test_the_router_gets_the_recorders_sink(
+    service: RunService, patched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Otherwise the router has nowhere to report a call and the ledger stays empty.
+
+    Asserted through the deps factory, because that is the seam: the router is built per
+    run precisely so it can be handed a sink that knows which run to bill.
+    """
+    _SpyRecorder.instances.clear()
+    monkeypatch.setattr(executor_module, "UsageRecorder", _SpyRecorder)
+    seen: list[object] = []
+
+    async def capturing_deps(business_id: UUID, usage_sink: object = None) -> NodeDeps:
+        seen.append(usage_sink)
+        return NodeDeps(router=object())
+
+    monkeypatch.setattr(executor_module, "run_graph", _Graph())
+    ex = RunExecutor(service_factory=lambda _bid: service, deps_factory=capturing_deps)
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+
+    ex.submit(run.id, BUSINESS, run.goal)
+    await ex.drain()
+
+    assert len(seen) == 1
+    assert seen[0] == _SpyRecorder.instances[0].sink, "the sink must be the recorder's"

@@ -63,6 +63,11 @@ class StubRouter:
         budget: Any = None,
         temperature: Any = None,
         max_tokens: Any = None,
+        # The nodes now pass trace context (business_id, node, prompt_version) so that
+        # llm spans and `model_usage` rows are attributable. Accepted here to keep this
+        # double matching the real signature; the tests that care about the VALUE assert
+        # on it explicitly.
+        trace: Any = None,
     ) -> Completion:
         self.calls.append(task)
         payload = self.answers.get(task)
@@ -1111,6 +1116,11 @@ class _ToolRouter(StubRouter):
         budget: Any = None,
         temperature: Any = None,
         max_tokens: Any = None,
+        # The nodes now pass trace context (business_id, node, prompt_version) so that
+        # llm spans and `model_usage` rows are attributable. Accepted here to keep this
+        # double matching the real signature; the tests that care about the VALUE assert
+        # on it explicitly.
+        trace: Any = None,
     ) -> Completion:
         name = next(iter(tools)).name if tools else "unknown"
         self.offered.append(name)

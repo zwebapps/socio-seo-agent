@@ -332,3 +332,36 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] `/auth/me` exposes no `businessId`, which is why the memory routes derive the tenant from the
   session instead of taking a path id like their `proposals` sibling.
 - [ ] REPACK discards hashtags — `REPACK_TOOL` asks the model for them, the node stores only `body`.
+
+## Closed after the developer console landed (2026-08-19)
+
+- [x] **Tool revocations were stored, displayed and computed but NOT enforced.** `tool_policy` shipped
+  `RUNTIME_ENFORCED = False` with a docstring naming the one call site that would change it, and the
+  screen said so out loud — correct, because a UI implying a live kill switch that does nothing is
+  worse than no UI. `agents/nodes._toolbox` now passes the revocations into
+  `NodeToolbox(revoked=...)`, so revoking `publish`+`notify` from EXPORT is a deploy-free stop on
+  every outward side effect. The un-widenable direction is structural, not validated: `allowed` is a
+  set DIFFERENCE, so no stored value can add a capability. Loaded once per run (a switch thrown
+  mid-run would give a run whose first half could publish and whose second half could not), and a
+  read failure degrades to the code allowlist — the narrower answer — so a settings-table outage
+  cannot become an inability to work. The test that pinned `RUNTIME_ENFORCED is False` is replaced by
+  one asserting the flag AGREES WITH THE BEHAVIOUR, so the two cannot drift.
+- [x] **`model_usage` was written by nothing.** The table called itself "the cost ledger" from the
+  Phase 1 schema and had no writer, so it was structurally empty and the cost dashboard had to report
+  its figures as unavailable rather than a confident `$0.00`. `services/usage_recorder.py` + a
+  `usage_sink` on the router now write real rows. The sink is synchronous because it sits on every
+  node's hot path, so it buffers and the executor flushes on each node boundary — per node, not per
+  run, so a run that dies mid-flight still has a ledger for the nodes that finished. A failed flush
+  logs and DROPS, clearing the buffer first: losing a row under-reports, retrying one over-reports
+  spend, and over-reporting is the error an operator would act on. Proven against real Postgres with
+  RLS on, including that B cannot see A's spend.
+- [x] **Every LLM span was recorded with an empty run_id, business_id and node.** Found while wiring
+  the ledger: nothing passed `trace` to `router.complete`, so `llm_span_fields` defaulted all three
+  to `""`. Invisible because the tracer is a no-op without Langfuse keys — and it also meant a
+  `model_usage` row could not have been attributed to anything even once a writer existed. The one
+  node call site now passes business_id, node and prompt_version.
+- [ ] **The ledger cannot be demonstrated end to end on the current credential.** A live run's only
+  model call is at OPPORTUNITY, which routes to the MID tier and is refused by this OpenRouter
+  account's data policy — and a failed call has no usage to record, correctly. So `model_usage` fills
+  in the DB tests but stays empty on a real run here. Unblocked by the same account setting as the
+  strong-tier eval.
