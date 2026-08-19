@@ -40,6 +40,12 @@
   --primary-ink: #ffffff;
   --accent: #ef7215;
   --accent-soft: #fbe4d2;
+  /* Ink for text sitting ON --accent, and it is DARK rather than white on purpose.
+     White on #ef7215 measures 2.96:1, which fails the 4.5:1 AA needs for normal text --
+     so an orange button with white text would look right and be unreadable to some
+     people. #241206 measures 6.09:1 and keeps the brand orange exactly, where darkening
+     the orange to carry white text would have changed the colour instead. */
+  --accent-ink: #241206;
 
   --ok: #14513f;
   --warn: #a35c07;
@@ -97,6 +103,8 @@
     --primary-ink: #0d1a16;
     --accent: #f4863a;
     --accent-soft: #3a2a1d;
+    /* 7.14:1 on #f4863a. Same reasoning as the light palette. */
+    --accent-ink: #241206;
 
     --ok: #5cbb9c;
     --warn: #d9a24a;
@@ -131,6 +139,7 @@
   --primary-ink: #0d1a16;
   --accent: #f4863a;
   --accent-soft: #3a2a1d;
+  --accent-ink: #241206;
   --ok: #5cbb9c;
   --warn: #d9a24a;
   --err: #e0796b;

@@ -66,7 +66,8 @@ export function SoftButton({
   children: ReactNode;
   onClick?: () => void;
   type?: "button" | "submit";
-  variant?: "plain" | "primary" | "quiet";
+  /** `primary` is the deep green, `accent` the orange. Both are filled and raised. */
+  variant?: "plain" | "primary" | "accent" | "quiet";
   disabled?: boolean;
   className?: string;
   /**
@@ -77,19 +78,24 @@ export function SoftButton({
   ariaLabel?: string;
 }) {
   const primary = variant === "primary";
+  const accent = variant === "accent";
+  // Both filled variants drop the outline border, because a filled surface already
+  // has an edge; keeping `soft-edge` would draw a hairline inside the fill.
+  const filled = primary || accent;
   return (
     <button
       type={type}
       onClick={onClick}
       disabled={disabled}
       aria-label={ariaLabel}
-      className={`soft-press ${primary ? "" : "soft-raised soft-edge"} px-4 py-2 text-sm font-medium disabled:opacity-45 ${className}`}
+      className={`soft-press ${filled ? "" : "soft-raised soft-edge"} px-4 py-2 text-sm font-medium disabled:opacity-45 ${className}`}
       style={{
         borderRadius: R.pill,
-        ...(primary
+        ...(filled
           ? {
-              background: "var(--primary)",
-              color: "var(--primary-ink)",
+              background: primary ? "var(--primary)" : "var(--accent)",
+              // --accent-ink, not white: white on the orange is 2.96:1 and fails AA.
+              color: primary ? "var(--primary-ink)" : "var(--accent-ink)",
               boxShadow: "-4px -4px 10px var(--shadow-light), 5px 5px 14px var(--shadow-dark)",
             }
           : { color: variant === "quiet" ? "var(--text-muted)" : "var(--text)" }),
