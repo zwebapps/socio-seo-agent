@@ -4,6 +4,7 @@ Every value is environment-driven. No secret is ever hardcoded here, and no
 secret is ever exposed to the browser -- see docs/ARCHITECTURE.md section 9.
 """
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -21,7 +22,9 @@ class Settings(BaseSettings):
     """Runtime settings, loaded from the environment or a local .env file."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # ENV_FILE lets the test suite point this at a file that does not exist,
+        # so a developer's real .env cannot leak into a test run.
+        env_file=os.environ.get("ENV_FILE", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

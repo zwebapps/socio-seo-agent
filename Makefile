@@ -26,7 +26,7 @@ logs:
 	docker compose logs -f
 
 api:
-	uv run uvicorn backend.app.main:app --reload --port 8100
+	uv run uvicorn backend.app.asgi:app --reload --port 8100
 
 web:
 	cd frontend && pnpm dev
