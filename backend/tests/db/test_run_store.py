@@ -227,3 +227,107 @@ async def test_a_reason_longer_than_the_column_still_records_the_terminal_state(
     assert finished.finished_reason.startswith("Opportunity selection could not run"), (
         "the human sentence is written first precisely so it survives truncation"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Listing runs: RLS is the scoping, not a WHERE clause
+# --------------------------------------------------------------------------- #
+
+
+async def test_listing_returns_this_businesss_runs_newest_first(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The owner's way back to a run they started, so it has to work on the real role.
+
+    Ordering is asserted rather than assumed: `created_at DESC` is what makes "the run I
+    just started" the first row, and a list ordered the other way is unusable by the
+    twenty-first run.
+    """
+    store = PostgresRunStore(business_a)
+    older = await store.create(_run(business_a, goal="older"))
+    newer = await store.create(_run(business_a, goal="newer"))
+
+    listed = await store.list_runs()
+
+    ids = [r.id for r in listed]
+    assert older.id in ids and newer.id in ids
+    assert ids.index(newer.id) < ids.index(older.id), "newest first"
+    assert {r.business_id for r in listed} == {business_a}
+
+
+async def test_listing_does_not_see_another_businesss_runs(
+    scoped_sessions: None, business_a: UUID, business_b: UUID
+) -> None:
+    """The point of the whole adapter, on the surface most likely to get it wrong.
+
+    `list_runs` carries NO `WHERE business_id = ...`: it opens `business_session` and lets
+    row-level security answer. That is the same choice as `get`, and it is what the
+    store's docstring argues for -- so this test is the proof that RLS really is doing it,
+    because a broken scope here would return every tenant's goals rather than a 404 for
+    one id.
+    """
+    a_store = PostgresRunStore(business_a)
+    await a_store.create(_run(business_a, goal="A's private goal"))
+
+    listed = await PostgresRunStore(business_b).list_runs()
+
+    assert all(r.business_id == business_b for r in listed)
+    assert not any(r.goal == "A's private goal" for r in listed)
+
+
+async def test_a_listed_run_carries_its_terminal_state_and_reason(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """A `partial` run with no explanation reads as a broken product rather than as a
+    credential that cannot reach the mid tier, so the reason travels with the state."""
+    from backend.app.services.run_service import RunService
+
+    store = PostgresRunStore(business_a)
+    service = RunService(store)
+    run = await store.create(_run(business_a, goal="needs an explanation"))
+    await service.finish(run.id, outcome="partial", reason="No mid-tier credential.")
+
+    listed = [r for r in await store.list_runs() if r.id == run.id]
+
+    assert [(r.state, r.finished_reason) for r in listed] == [
+        ("partial", "No mid-tier credential.")
+    ]
+
+
+async def test_listing_refuses_a_limit_outside_the_band(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """`limit` reaches the store from a query parameter. The route bounds it too, but a
+    bound enforced in exactly one place stops existing the moment something else calls in.
+    """
+    from backend.app.services.run_service import MAX_RUN_LIST_LIMIT
+
+    store = PostgresRunStore(business_a)
+
+    with pytest.raises(ValueError, match="limit"):
+        await store.list_runs(limit=MAX_RUN_LIST_LIMIT + 1)
+    with pytest.raises(ValueError, match="limit"):
+        await store.list_runs(limit=0)
+
+
+async def test_listing_never_reads_the_checkpoint_column(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The list selects named columns, so the biggest thing a run produces is never even
+    fetched -- not merely omitted from the response afterwards.
+
+    Asserted through the record's own shape: `RunSummaryRecord` has no `checkpoint`
+    field, so a draft cannot ride along however large the stored state grows.
+    """
+    from backend.app.services.run_service import RunSummaryRecord
+
+    store = PostgresRunStore(business_a)
+    run = await store.create(_run(business_a))
+    run.checkpoint = {"draft": {"html": "<h1>the unpublished draft</h1>"}}
+    await store.update(run)
+
+    listed = [r for r in await store.list_runs() if r.id == run.id]
+
+    assert len(listed) == 1
+    assert "checkpoint" not in RunSummaryRecord.model_fields
+    assert "unpublished draft" not in listed[0].model_dump_json()

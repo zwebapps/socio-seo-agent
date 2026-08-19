@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -32,7 +32,12 @@ from backend.app.api.auth import CurrentUser
 from backend.app.db.adapters.run_store import PostgresRunStore
 from backend.app.services.review_service import RunReview, project_review
 from backend.app.services.run_executor import RunExecutor
-from backend.app.services.run_service import RunRecord, RunService
+from backend.app.services.run_service import (
+    DEFAULT_RUN_LIST_LIMIT,
+    MAX_RUN_LIST_LIMIT,
+    RunRecord,
+    RunService,
+)
 
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
 
@@ -149,6 +154,32 @@ class RunOut(CamelModel):
     events: list[EventOut]
 
 
+class RunSummaryOut(CamelModel):
+    """One row of the runs list.
+
+    ``RunOut`` minus the timeline and plus the time it started. The events are what make a
+    single run's page worth loading and what make a LIST of runs expensive: twenty runs of
+    forty events each is eight hundred rows fetched to render twenty lines of text.
+
+    ``finished_reason`` is on it deliberately. A run here can legitimately end ``partial``
+    -- the configured credential cannot reach the mid tier -- and a list that showed the
+    state without the reason would report a terminal state the owner cannot account for,
+    which reads as a broken product rather than as a missing credential.
+    """
+
+    run_id: UUID
+    goal: str
+    state: str
+    current_node: str | None
+    resumed_count: int
+    finished_reason: str | None
+    created_at: str
+
+
+class RunListResponse(CamelModel):
+    runs: list[RunSummaryOut]
+
+
 async def _require_own_run(run_id: UUID, business_id: UUID, service: RunService) -> RunRecord:
     """The run, or 404.
 
@@ -179,6 +210,60 @@ async def start_run(
     # started run stayed `queued` forever and the timeline had nothing to show.
     executor.submit(run.id, business_id, payload.goal)
     return StartRunResponse(run_id=run.id, state=run.state)
+
+
+@router.get(
+    "",
+    response_model=RunListResponse,
+    response_model_by_alias=True,
+    summary="This business's runs, newest first",
+)
+async def list_runs(
+    business_id: Annotated[UUID, Depends(current_business)],
+    service: Annotated[RunService, Depends(get_run_service)],
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=MAX_RUN_LIST_LIMIT)] = DEFAULT_RUN_LIST_LIMIT,
+) -> RunListResponse:
+    """The list an owner reaches a run from.
+
+    Its absence was a hole rather than a simplification: ``POST /api/v1/runs`` returned an
+    id, and nothing else in the product could tell you what ids existed -- so a run whose
+    page you navigated away from was gone, and the timeline screen was reachable only by
+    pasting an id in by hand.
+
+    **Newest first, and that is part of the contract.** A run takes minutes and its id is
+    not memorable, so "the one I just started" has to be the top row.
+
+    **No timeline, no checkpoint.** The store selects named columns, so the draft is never
+    even read -- see :meth:`PostgresRunStore.list_runs`. A single run's events are a
+    separate request because that is the one worth paying for.
+
+    ``no-store``, because the goals are the customer's own words about their business and
+    this sits behind a session cookie. Same rule as the leads list.
+
+    Runs are filtered against the caller's business here as well as by RLS in the store,
+    for the same reason ``_require_own_run`` compares owners on the single-run routes: this
+    is the one endpoint that returns many rows and therefore the one where a scoping
+    mistake leaks a set rather than a single guessed id.
+    """
+    response.headers["Cache-Control"] = "no-store"
+
+    runs = await service.recent(limit=limit)
+    return RunListResponse(
+        runs=[
+            RunSummaryOut(
+                run_id=run.id,
+                goal=run.goal,
+                state=run.state,
+                current_node=run.current_node,
+                resumed_count=run.resumed_count,
+                finished_reason=run.finished_reason,
+                created_at=run.created_at.isoformat(),
+            )
+            for run in runs
+            if run.business_id == business_id
+        ]
+    )
 
 
 @router.get("/{run_id}", response_model=RunOut, response_model_by_alias=True)

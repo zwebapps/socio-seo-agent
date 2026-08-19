@@ -17,7 +17,13 @@ from sqlalchemy import func, select
 
 from backend.app.db.models import Run, RunEvent
 from backend.app.db.session import business_session
-from backend.app.services.run_service import RunEventRecord, RunRecord
+from backend.app.services.run_service import (
+    DEFAULT_RUN_LIST_LIMIT,
+    RunEventRecord,
+    RunRecord,
+    RunSummaryRecord,
+    check_list_limit,
+)
 
 
 class PostgresRunStore:
@@ -126,6 +132,64 @@ class PostgresRunStore:
                     payload=event.payload,
                 )
             )
+
+    async def list_runs(self, *, limit: int = DEFAULT_RUN_LIST_LIMIT) -> Sequence[RunSummaryRecord]:
+        """This business's runs, newest first.
+
+        **There is no ``WHERE business_id = ...`` here, and that is the design.** The
+        session is opened under this request's tenant, so row-level security is what
+        decides whose runs come back -- the same choice as :meth:`get`, and the reason the
+        constructor takes the id at all. A filter in the query as well would work today
+        and would quietly become the thing doing the isolation, which is how the bug in
+        this class's docstring happened: an ``if`` in application code standing in for a
+        policy in the database, right up until it did not.
+
+        Named columns rather than ``select(Run)``, because ``runs.checkpoint`` is the whole
+        serialised agent state and this is a list. Selecting the entity would read, decode
+        and discard a draft per row to render a column of goals -- and the largest thing a
+        run produces would be sitting in the query result of the most frequently loaded
+        screen in the product.
+        """
+        check_list_limit(limit)
+        async with business_session(self._business_id) as s:
+            rows = (
+                await s.execute(
+                    select(
+                        Run.id,
+                        Run.business_id,
+                        Run.goal,
+                        Run.state,
+                        Run.current_node,
+                        Run.resumed_count,
+                        Run.finished_reason,
+                        Run.created_at,
+                    )
+                    # `id` breaks the tie, so two runs created in the same microsecond
+                    # come back in a stable order across requests rather than in whatever
+                    # order the plan happens to produce -- a list that reshuffles between
+                    # two polls looks like runs appearing and disappearing.
+                    .order_by(Run.created_at.desc(), Run.id.desc())
+                    .limit(limit)
+                )
+            ).all()
+        return [
+            RunSummaryRecord(
+                id=row.id,
+                business_id=row.business_id,
+                goal=row.goal,
+                # No `type: ignore` here, unlike `get` above: a named-column `select`
+                # gives back a Row whose attributes are `Any`, so the `RunState` literal
+                # is satisfied without one -- and mypy flags an unnecessary ignore.
+                # Pydantic still validates the value against the literal at runtime, so a
+                # state the enum does not know raises here rather than reaching a screen.
+                state=row.state,
+                current_node=row.current_node,
+                resumed_count=row.resumed_count,
+                finished_reason=row.finished_reason,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
 
     async def next_seq(self, run_id: UUID) -> int:
         async with business_session(self._business_id) as s:

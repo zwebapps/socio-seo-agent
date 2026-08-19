@@ -16,6 +16,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pill, SoftCard, SoftWell } from "../../components/soft";
+// Shared with the dashboard panel and the /runs list. Three private copies of "what colour
+// is `partial`" is three chances for the screens to disagree about whether a run that
+// produced nothing looks like a success.
+import { runStateLabel, runStateTone } from "../../lib/runs-api";
 import { RunReviewTabs } from "./review";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
@@ -176,7 +180,7 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
       </h1>
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
-        {run && <Pill tone={toneFor(run.state)}>{run.state.replace(/_/g, " ")}</Pill>}
+        {run && <Pill tone={runStateTone(run.state)}>{runStateLabel(run.state)}</Pill>}
         {live && <Pill tone="accent">live</Pill>}
         {events.length > 0 && (
           <Pill tone="muted">
@@ -248,14 +252,6 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
       {runId && run && <RunReviewTabs runId={runId} runState={run.state} />}
     </main>
   );
-}
-
-function toneFor(state: string): "ok" | "warn" | "err" | "accent" | "muted" {
-  if (state === "done") return "ok";
-  if (state === "awaiting_approval") return "accent";
-  if (state === "failed") return "err";
-  if (state === "partial") return "warn";
-  return "muted";
 }
 
 function Step({

@@ -353,3 +353,39 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   account's data policy — and a failed call has no usage to record, correctly. So `model_usage` fills
   in the DB tests but stays empty on a real run here. Unblocked by the same account setting as the
   strong-tier eval.
+
+## The owner journey, closed (2026-08-19)
+
+- [x] **A normal user could do almost nothing from the UI.** Three breaks, all now fixed:
+  the website URL was previewed and thrown away (nothing persisted it); nothing in the
+  frontend called `POST /api/v1/runs`, so a run could only be started by curl and
+  `/runs/[runId]` was unreachable; and `GET /api/v1/leads` had no screen at all, despite
+  the docs calling attribution "how the customer BELIEVES the leads are real".
+  Now: `POST /api/v1/onboarding/confirm` persists the confirmed DNA (merging, so it cannot
+  wipe business memory, and writing `website` where HARVEST reads it), a dashboard starts
+  runs, `GET /api/v1/runs` lists them, and `/leads` shows the attribution.
+- [x] **Two text tokens failed WCAG 1.4.3 AA across every screen** — measured
+  `--text-muted` 3.79:1 and `--text-faint` 2.28:1 against `--bg` in the light theme, and
+  `--text-faint` 3.95:1 in dark. Fixed by walking lightness at the same hue until the
+  WORST of bg/raised/sunken cleared 4.5 (the first candidates passed on the page and
+  failed inside a recessed well, which is passing nowhere that matters). Now 4.75/4.74
+  light and 6.78/4.89 dark.
+  **The cost, recorded rather than hidden:** once both clear 4.5:1 on a light ground they
+  land on nearly the same colour, so the muted/faint TIERS COLLAPSE. Three legible greys
+  do not fit. Hierarchy below `--text` now has to come from size and weight; a genuinely
+  distinct faint tier needs larger type (AA allows 3:1 at >=24px) or a darker surface.
+- [x] **`--border` was referenced by several screens and defined NOWHERE**, so
+  `borderColor: var(--border)` silently fell back to `currentColor` — a border that took
+  the text colour. Aliased to `--edge`.
+- [ ] **`Pill` with `tone="accent"`** renders `--accent` as text at ~2.54:1 on the surface,
+  failing AA for its 11px label. Pre-existing (the run timeline already used it). No
+  information is lost — the pill always shows text as well as colour — only legibility.
+  Needs either `--accent-ink` on a filled pill or a darkened text-only variant.
+- [ ] **`POST /api/v1/runs/{id}/resume` still has no UI caller.** A run stranded `running`
+  by a dead process is recoverable only by curl. The runs list is its natural home.
+- [ ] **No frontend test framework exists** (no vitest/jest in `package.json`), so none of
+  the React code has automated tests — the backend half of this work has 18, the UI half
+  has none. Worth an explicit decision rather than drift.
+- [ ] **`GET /api/v1/runs` has a cap, not pagination.** The page says "showing N (the most
+  recent 50)" rather than claiming a total, so it is honest, but a business past 50 runs
+  cannot reach the older ones.

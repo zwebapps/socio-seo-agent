@@ -20,6 +20,7 @@ import json
 import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from itertools import islice
 from typing import Any, Final, Literal, Protocol
 from uuid import UUID, uuid4
 
@@ -55,6 +56,57 @@ class RunRecord(BaseModel):
     checkpoint: dict[str, Any] = Field(default_factory=dict)
 
 
+#: How many runs a list returns when the caller does not say, and the most it may ask
+#: for. Twenty is about a screenful; the ceiling exists because `limit` arrives from a
+#: query parameter, and an unbounded one is a request to serialise every run a business
+#: has ever made. Same shape and same reasoning as `DEFAULT_LEAD_LIMIT` next door.
+DEFAULT_RUN_LIST_LIMIT: Final = 20
+MAX_RUN_LIST_LIMIT: Final = 100
+
+
+class RunSummaryRecord(BaseModel):
+    """One run as a LIST needs it: enough to choose between runs, and no checkpoint.
+
+    Deliberately not :class:`RunRecord`. That model carries ``checkpoint``, which is the
+    entire serialised agent state -- the draft HTML included -- so a list of twenty of
+    them is megabytes of JSONB read, decoded and discarded in order to render a column of
+    goals. It is the same rule that keeps the draft out of the polled timeline payload,
+    applied at the surface where it would cost the most.
+
+    ``business_id`` stays on it because the route compares it to the caller's, exactly as
+    ``_require_own_run`` does for a single run: the database's scoping is the guarantee,
+    and that comparison is the defence in depth behind it.
+
+    ``state`` and ``finished_reason`` are both here on purpose. A run on a deployment
+    whose credential cannot reach the mid tier legitimately ends ``partial``, and a list
+    that could show only the state would leave every screen built on it announcing a
+    terminal state with no account of why.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: UUID
+    business_id: UUID
+    goal: str
+    state: RunState
+    current_node: str | None = None
+    resumed_count: int = 0
+    finished_reason: str | None = None
+    created_at: datetime
+
+
+def check_list_limit(limit: int) -> None:
+    """Refuse a limit outside the band, in the STORE rather than only at the route.
+
+    The route in front of this today declares the same bounds to FastAPI, so a bad value
+    is normally a 422 and never arrives. This is here for the caller that is not that
+    route -- a script, a future endpoint, the executor -- because a bound enforced in
+    exactly one place is a bound that disappears the first time something else calls in.
+    """
+    if not 1 <= limit <= MAX_RUN_LIST_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_RUN_LIST_LIMIT}, got {limit}")
+
+
 class RunEventRecord(BaseModel):
     """One line in the timeline."""
 
@@ -85,17 +137,34 @@ class RunStore(Protocol):
         self, run_id: UUID, *, after_seq: int = 0
     ) -> Sequence[RunEventRecord]: ...
 
+    async def list_runs(
+        self, *, limit: int = DEFAULT_RUN_LIST_LIMIT
+    ) -> Sequence[RunSummaryRecord]: ...
+
 
 class InMemoryRunStore:
-    """For tests and for a process with no database."""
+    """For tests and for a process with no database.
 
-    def __init__(self) -> None:
+    ``business_id`` is OPTIONAL, and the asymmetry with :class:`PostgresRunStore` -- where
+    it is required -- is deliberate. The real store is constructed per request and leaves
+    tenant isolation to row-level security; passing the same id here lets the fake model
+    that shape, so a test can exercise "a scoped store lists only its own runs" without a
+    database. Left unset, the fake holds runs for every business at once, which is how the
+    existing route tests check that a caller cannot reach another business's run by
+    knowing its id -- and it is why :func:`list_runs` on THIS class cannot be the only
+    thing standing between the route and a cross-tenant read.
+    """
+
+    def __init__(self, business_id: UUID | None = None) -> None:
         self._runs: dict[UUID, RunRecord] = {}
         self._events: dict[UUID, list[RunEventRecord]] = {}
+        self._created_at: dict[UUID, datetime] = {}
+        self._scope = business_id
 
     async def create(self, run: RunRecord) -> RunRecord:
         self._runs[run.id] = run
         self._events[run.id] = []
+        self._created_at[run.id] = datetime.now(UTC)
         return run
 
     async def get(self, run_id: UUID) -> RunRecord | None:
@@ -118,6 +187,33 @@ class InMemoryRunStore:
 
     async def list_events(self, run_id: UUID, *, after_seq: int = 0) -> Sequence[RunEventRecord]:
         return [e for e in self._events.get(run_id, []) if e.seq > after_seq]
+
+    async def list_runs(self, *, limit: int = DEFAULT_RUN_LIST_LIMIT) -> Sequence[RunSummaryRecord]:
+        """Newest first, by INSERTION order rather than by the stamp.
+
+        The Postgres store orders by ``created_at DESC``, which is the same intent; here
+        insertion order is used because two runs started in the same test land on the same
+        clock reading often enough to make a timestamp sort flap. The stamp is still
+        carried, because the screen renders it -- it is just not what the order rests on.
+        """
+        check_list_limit(limit)
+        newest_first = reversed(list(self._runs.values()))
+        in_scope = (
+            run for run in newest_first if self._scope is None or run.business_id == self._scope
+        )
+        return [
+            RunSummaryRecord(
+                id=run.id,
+                business_id=run.business_id,
+                goal=run.goal,
+                state=run.state,
+                current_node=run.current_node,
+                resumed_count=run.resumed_count,
+                finished_reason=run.finished_reason,
+                created_at=self._created_at[run.id],
+            )
+            for run in islice(in_scope, limit)
+        ]
 
 
 def _clean_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -181,6 +277,20 @@ class RunService:
         places is a public API with the wrong name on it.
         """
         return await self._store.get(run_id)
+
+    async def recent(self, *, limit: int = DEFAULT_RUN_LIST_LIMIT) -> list[RunSummaryRecord]:
+        """This store's runs, newest first.
+
+        Named ``recent`` rather than ``list``: the word describes the ORDER, which is the
+        part a caller has to know, and it does not shadow the builtin at a call site.
+
+        There is no ``business_id`` argument and there must not be one. The store already
+        knows its tenant -- ``PostgresRunStore`` takes it in the constructor precisely so
+        that row-level security answers "whose runs are these", rather than a lookup
+        carved out from under RLS. Accepting one here would put that question back in the
+        caller's hands, which is the bug the store's docstring exists to describe.
+        """
+        return list(await self._store.list_runs(limit=limit))
 
     async def record_event(
         self,
@@ -272,7 +382,9 @@ class RunService:
 
 __all__ = [
     "ALLOWED_PAYLOAD_KEYS",
+    "DEFAULT_RUN_LIST_LIMIT",
     "MAX_FINISHED_REASON",
+    "MAX_RUN_LIST_LIMIT",
     "EventStatus",
     "InMemoryRunStore",
     "RunEventRecord",
@@ -280,5 +392,7 @@ __all__ = [
     "RunService",
     "RunState",
     "RunStore",
+    "RunSummaryRecord",
+    "check_list_limit",
     "clamp_reason",
 ]

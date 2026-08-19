@@ -32,8 +32,27 @@
   --shadow-dark: rgba(155, 175, 167, 0.55);
 
   --text: #1d2b26;
-  --text-muted: #6a7c76;
-  --text-faint: #93a29c;
+  /* `--border` was referenced by several screens and DEFINED NOWHERE, so
+     `borderColor: var(--border)` silently fell back to `currentColor` -- a border
+     that took the text colour. Aliased to --edge, which is the token that carries
+     the measured 3:1 non-text contrast this design depends on. */
+  --border: var(--edge);
+
+  /* WCAG 1.4.3 AA: normal-size text needs 4.5:1. Measured, not assumed -- the previous
+     values were --text-muted 3.79:1 and --text-faint 2.28:1 against --bg, so BOTH failed
+     across every screen in the app. Chosen by walking lightness down at the same hue and
+     saturation until the WORST of --bg / --surface-raised / --surface-sunken cleared 4.5,
+     because a value that passes on the page but fails inside a recessed well passes
+     nowhere that matters.
+
+     Note what this costs, stated rather than hidden: once both must clear 4.5:1 on a
+     light ground they land on nearly the same colour, so the muted/faint TIERS COLLAPSE.
+     Three legible greys do not fit between #ecefec and 4.5:1. Hierarchy below --text
+     therefore has to come from size and weight, not from a third grey -- and --text-faint
+     is kept only so its call sites need no churn. A genuinely distinct faint tier would
+     need larger type (AA allows 3:1 at >=24px, or >=18.66px bold) or a darker surface. */
+  --text-muted: #5c6c66;
+  --text-faint: #5d6c66;
 
   --primary: #14513f;
   --primary-hover: #0f3f31;
@@ -96,7 +115,9 @@
 
     --text: #e9efec;
     --text-muted: #9fb0aa;
-    --text-faint: #74857f;
+    /* 3.95:1 before, which failed. #85958f measures 4.54-5.20 across the dark
+       surfaces. --text-muted was already 6.78:1 and is untouched. */
+    --text-faint: #85958f;
 
     --primary: #3f9e81;
     --primary-hover: #4fb494;
@@ -133,7 +154,7 @@
   --shadow-dark: rgba(0, 0, 0, 0.5);
   --text: #e9efec;
   --text-muted: #9fb0aa;
-  --text-faint: #74857f;
+  --text-faint: #85958f;
   --primary: #3f9e81;
   --primary-hover: #4fb494;
   --primary-ink: #0d1a16;

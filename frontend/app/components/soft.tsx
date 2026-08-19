@@ -192,6 +192,8 @@ export function SoftInput({
   className = "",
   autoFocus = false,
   describedBy,
+  controlId,
+  maxLength,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -206,13 +208,33 @@ export function SoftInput({
   autoFocus?: boolean;
   /** Id of the element describing this field, e.g. a live character counter. */
   describedBy?: string;
+  /**
+   * DOM id, supplied by the CALLER — the same contract, and for the same reason, as
+   * `SoftRange`'s `controlId`: a component cannot know how many of itself are on a page,
+   * so it cannot safely derive an id, and two identical ids bind one `<label>` to the
+   * wrong field.
+   *
+   * Set it whenever the field has a VISIBLE `<label>`. `aria-label` alone gives the input
+   * an accessible name but leaves the visible text inert — clicking it does not focus the
+   * field, which is a real loss for anyone with a tremor or a trackpad, and the label is
+   * not part of the field's click target.
+   */
+  controlId?: string;
+  /**
+   * Client-side ceiling, set to whatever the API enforces. It saves a round trip that
+   * comes back 422, and — more usefully — it stops a person typing another 200 characters
+   * that were never going to be accepted.
+   */
+  maxLength?: number;
 }) {
   return (
     <input
+      id={controlId}
       aria-label={label}
       aria-describedby={describedBy}
       value={value}
       placeholder={placeholder}
+      maxLength={maxLength}
       // eslint-disable-next-line jsx-a11y/no-autofocus -- see the prop's docstring
       autoFocus={autoFocus}
       onChange={(e) => onChange(e.target.value)}

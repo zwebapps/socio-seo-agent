@@ -16,7 +16,7 @@ from backend.app.agents.state import new_state
 from backend.app.api import runs as runs_api
 from backend.app.db.models import Role, User
 from backend.app.main import create_app
-from backend.app.services.run_service import InMemoryRunStore, RunService
+from backend.app.services.run_service import MAX_RUN_LIST_LIMIT, InMemoryRunStore, RunService
 
 BUSINESS = uuid4()
 
@@ -435,3 +435,153 @@ async def test_a_run_left_running_by_a_dead_process_can_still_be_resumed() -> No
 
     assert response.status_code == 202
     assert executor.submitted == [(run.id, BUSINESS, "more leads", True)]
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/v1/runs -- the list the owner reaches a run from
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_runs_list_returns_this_businesss_runs_newest_first() -> None:
+    """Without this route a started run is unreachable.
+
+    `POST /api/v1/runs` hands back an id and nothing persisted it anywhere a person could
+    see, so an owner who navigated away had no way back to their own run -- the timeline
+    screen was reachable only by pasting an id from curl.
+    """
+    service = RunService(InMemoryRunStore())
+    first = await service.start(business_id=BUSINESS, goal="first goal")
+    second = await service.start(business_id=BUSINESS, goal="second goal")
+
+    async with _client(service) as client:
+        response = await client.get("/api/v1/runs")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [r["goal"] for r in body["runs"]] == ["second goal", "first goal"]
+    assert [r["runId"] for r in body["runs"]] == [str(second.id), str(first.id)]
+
+
+async def test_the_runs_list_is_camel_case_like_the_rest_of_the_api() -> None:
+    """A client reading `finished_reason` or `current_node` renders nothing, silently.
+
+    The same trap the review endpoint has a test for: snake_case on the wire would not
+    fail anything server-side, it would just leave the reason a run stopped invisible.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="g")
+    await service.checkpoint(
+        run.id, state=new_state(business_id=BUSINESS, goal="g"), current_node="HARVEST"
+    )
+
+    async with _client(service) as client:
+        row = (await client.get("/api/v1/runs")).json()["runs"][0]
+
+    assert set(row) == {
+        "runId",
+        "goal",
+        "state",
+        "currentNode",
+        "resumedCount",
+        "finishedReason",
+        "createdAt",
+    }
+    assert row["currentNode"] == "HARVEST"
+
+
+async def test_a_partial_run_carries_the_reason_it_stopped() -> None:
+    """The honesty requirement this product cares most about.
+
+    A run here legitimately ends `partial` because the configured credential cannot reach
+    the mid tier. An owner reading a terminal state with no explanation concludes the
+    product is broken; the reason is what makes the state truthful, so the list has to
+    carry it and not just the word.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more local leads")
+    await service.finish(
+        run.id,
+        outcome="partial",
+        reason="Opportunity selection could not run: the configured credential "
+        "cannot reach the mid tier.",
+    )
+
+    async with _client(service) as client:
+        row = (await client.get("/api/v1/runs")).json()["runs"][0]
+
+    assert row["state"] == "partial"
+    assert "cannot reach the mid tier" in row["finishedReason"]
+
+
+async def test_the_runs_list_does_not_show_another_businesss_run() -> None:
+    """Same rule as every other route here, on the surface that returns MANY rows.
+
+    `_require_own_run` protects the single-run reads by comparing the owner. A list has no
+    id to check, so if the comparison were left out the one endpoint that returns every
+    row would be the one endpoint with no owner check on it. The in-memory store is
+    deliberately unscoped, exactly as the cross-business timeline test uses it, so this
+    asserts the ROUTE's filter rather than the fake's.
+    """
+    service = RunService(InMemoryRunStore())
+    await service.start(business_id=BUSINESS, goal="mine")
+    await service.start(business_id=uuid4(), goal="someone else's goal")
+
+    async with _client(service) as client:
+        body = (await client.get("/api/v1/runs")).json()
+
+    assert [r["goal"] for r in body["runs"]] == ["mine"]
+
+
+async def test_the_runs_list_never_carries_the_draft() -> None:
+    """A list of twenty runs is where a checkpoint would cost the most.
+
+    The timeline has the same assertion for the same reason; this is the surface that
+    multiplies it by the number of rows.
+    """
+    service = RunService(InMemoryRunStore())
+    await _reviewable_run(service)
+
+    async with _client(service) as client:
+        body = (await client.get("/api/v1/runs")).json()
+
+    assert "checkpoint" not in json.dumps(body)
+    assert "<h1>" not in json.dumps(body, ensure_ascii=False)
+
+
+async def test_the_runs_list_honours_a_limit_and_refuses_a_silly_one() -> None:
+    """An unbounded `limit` is a request to serialise every run a business ever made."""
+    service = RunService(InMemoryRunStore())
+    for i in range(4):
+        await service.start(business_id=BUSINESS, goal=f"g{i}")
+
+    async with _client(service) as client:
+        assert [r["goal"] for r in (await client.get("/api/v1/runs?limit=2")).json()["runs"]] == [
+            "g3",
+            "g2",
+        ]
+        assert (await client.get("/api/v1/runs?limit=0")).status_code == 422
+        assert (await client.get(f"/api/v1/runs?limit={MAX_RUN_LIST_LIMIT + 1}")).status_code == 422
+
+
+async def test_the_runs_list_is_not_cacheable() -> None:
+    """The goals are the customer's own words about their business, and the list sits
+    behind a session cookie -- it must not land in a shared cache. Same rule as the
+    leads list, which carries named people and phone numbers."""
+    service = RunService(InMemoryRunStore())
+    await service.start(business_id=BUSINESS, goal="g")
+
+    async with _client(service) as client:
+        response = await client.get("/api/v1/runs")
+
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_an_owner_with_no_runs_gets_an_empty_list_not_an_error() -> None:
+    """The first thing a new owner's dashboard does is ask this question, and the honest
+    answer is "none yet" -- a 404 would send the screen down an error path and make an
+    empty account look like a broken one."""
+    async with _client(RunService(InMemoryRunStore())) as client:
+        response = await client.get("/api/v1/runs")
+
+    assert response.status_code == 200
+    assert response.json() == {"runs": []}
