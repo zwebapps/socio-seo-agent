@@ -6,6 +6,8 @@ user id — so outside local development, booting with it must be impossible rat
 than merely inadvisable. A comment is not a control.
 """
 
+from typing import cast
+
 import pytest
 
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings
@@ -45,3 +47,35 @@ def test_a_short_secret_is_refused_outside_local() -> None:
 def test_a_real_secret_boots_anywhere() -> None:
     secret = "x" * 48
     assert create_app(settings=_settings(environment="production", session_secret=secret))
+
+
+def test_cors_allows_every_method_the_app_actually_serves() -> None:
+    """A CORS allowlist that omits a method breaks that endpoint from a browser ONLY,
+    and it breaks it at the preflight — the server logs nothing and the UI shows a
+    generic network error. That happened here with PUT: every admin save failed while
+    every test passed, because tests call the ASGI app directly and never preflight.
+
+    Methods come from the OpenAPI schema rather than `app.routes`: this FastAPI version
+    wraps included routers in objects that expose no `methods`, so walking app.routes
+    finds only the docs endpoints and the check would pass vacuously.
+    """
+    app = create_app(settings=_settings())
+
+    # openapi() is typed loosely enough that mypy cannot see into the nested dicts,
+    # so the shape is asserted once, here, rather than ignored at each access.
+    paths = cast("dict[str, dict[str, object]]", app.openapi()["paths"])
+    served = {method.upper() for operations in paths.values() for method in operations}
+    assert {"GET", "POST", "PUT", "DELETE"} <= served, (
+        "the schema walk found almost nothing, so this test would prove nothing"
+    )
+
+    cors = next(m for m in app.user_middleware if "CORSMiddleware" in repr(m))
+    # Middleware kwargs are `object` to the checker, so narrow once at the boundary.
+    configured = cast("list[str]", cors.kwargs["allow_methods"])
+    allowed = {method.upper() for method in configured}
+
+    missing = served - allowed
+    assert not missing, (
+        f"these methods are served but blocked by CORS: {sorted(missing)}. "
+        "A browser cannot call them; a test calling the ASGI app directly will not notice."
+    )

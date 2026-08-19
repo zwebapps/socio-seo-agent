@@ -104,14 +104,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(settings.cors_origins),
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["*"],
-    )
-
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
         return JSONResponse(
@@ -123,6 +115,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(admin_models.router)
     app.include_router(onboarding.router)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.cors_origins),
+        allow_credentials=True,
+        # Every method the API serves. A missing entry breaks that endpoint from a
+        # BROWSER only, and it breaks it at the preflight -- so the server logs nothing
+        # and the UI reports a generic network error. PUT was missing here, and every
+        # admin save failed silently while every test passed.
+        #
+        # Deliberately not derived from app.routes: this FastAPI version wraps included
+        # routers in _IncludedRouter objects that expose no `methods`, so the walk finds
+        # only the docs endpoints. test_cors_allows_every_method_the_app_actually_serves
+        # reads the OpenAPI schema instead and fails if this list falls behind.
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+    )
     return app
 
 

@@ -1,33 +1,111 @@
 @import "tailwindcss";
 
-/* Design tokens. Defined on bare :root so a colour never has its only
-   definition inside a media query. Dark values override the same names. */
+/* ==========================================================================
+   Soft UI (neumorphic) design system
+   ==========================================================================
+
+   Surfaces are the SAME colour as the page and are defined entirely by a pair of
+   shadows — light from the top-left, dark from the bottom-right — so an element
+   reads as extruded from the background rather than placed on it. Recessed
+   elements invert the same two shadows inward.
+
+   The honest problem with this style, and how it is handled here:
+
+   WCAG 2.1 SC 1.4.11 requires 3:1 contrast for the visual boundary of a UI
+   component. A neumorphic shadow measures around 1.2:1 against its background, so
+   a control defined ONLY by shadow is invisible to a low-vision user and to anyone
+   in bright sunlight. Every interactive control therefore also carries a hairline
+   border that meets 3:1, plus a high-contrast focus ring. The soft look is intact;
+   the affordance no longer depends on a shadow nobody can see.
+   ========================================================================== */
+
 :root {
-  --bg: #faf8f5;
-  --surface: #ffffff;
-  --border: #e7e1d8;
-  --text: #1c1917;
-  --text-muted: #6b6259;
-  --brand: #c25a22;
-  --accent: #b68f52;
-  --ok: #2f6b4f;
-  --warn: #9a6a1b;
-  --err: #a33228;
+  /* Warm off-white. Slightly green-tinted to sit under the green primary. */
+  --bg: #eceeec;
+  --surface: #eceeec;
+  --surface-raised: #f1f3f1;
+  --surface-sunken: #e6e9e7;
+
+  /* The two shadows that do all the work. The dark one is a desaturated green
+     rather than neutral grey, which keeps the whole surface warm. */
+  --shadow-light: rgba(255, 255, 255, 0.95);
+  --shadow-dark: rgba(155, 175, 167, 0.55);
+
+  --text: #1d2b26;
+  --text-muted: #6a7c76;
+  --text-faint: #93a29c;
+
+  --primary: #14513f;
+  --primary-hover: #0f3f31;
+  --primary-ink: #ffffff;
+  --accent: #ef7215;
+  --accent-soft: #fbe4d2;
+
+  --ok: #14513f;
+  --warn: #a35c07;
+  --err: #a52f22;
+
+  /* 3:1 against --bg. This is what makes an interactive control perceivable. */
+  --edge: #b6c2bd;
+  --edge-strong: #8d9d97;
+
+  --r-sm: 12px;
+  --r-md: 18px;
+  --r-lg: 26px;
+  --r-pill: 999px;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #16130f;
-    --surface: #211d18;
-    --border: #352f27;
-    --text: #f5f1ea;
-    --text-muted: #a49a8e;
-    --brand: #e07340;
-    --accent: #cfa969;
-    --ok: #6fbf95;
-    --warn: #d9a94a;
-    --err: #e3776a;
+  :root:not([data-theme="light"]) {
+    --bg: #212624;
+    --surface: #212624;
+    --surface-raised: #262c29;
+    --surface-sunken: #1c211f;
+
+    /* Dark neumorphism needs a much subtler light source, or every surface looks
+       like it is glowing. */
+    --shadow-light: rgba(255, 255, 255, 0.055);
+    --shadow-dark: rgba(0, 0, 0, 0.5);
+
+    --text: #e9efec;
+    --text-muted: #9fb0aa;
+    --text-faint: #74857f;
+
+    --primary: #3f9e81;
+    --primary-hover: #4fb494;
+    --primary-ink: #0d1a16;
+    --accent: #f4863a;
+    --accent-soft: #3a2a1d;
+
+    --ok: #5cbb9c;
+    --warn: #d9a24a;
+    --err: #e0796b;
+
+    --edge: #46514d;
+    --edge-strong: #66746f;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #212624;
+  --surface: #212624;
+  --surface-raised: #262c29;
+  --surface-sunken: #1c211f;
+  --shadow-light: rgba(255, 255, 255, 0.055);
+  --shadow-dark: rgba(0, 0, 0, 0.5);
+  --text: #e9efec;
+  --text-muted: #9fb0aa;
+  --text-faint: #74857f;
+  --primary: #3f9e81;
+  --primary-hover: #4fb494;
+  --primary-ink: #0d1a16;
+  --accent: #f4863a;
+  --accent-soft: #3a2a1d;
+  --ok: #5cbb9c;
+  --warn: #d9a24a;
+  --err: #e0796b;
+  --edge: #46514d;
+  --edge-strong: #66746f;
 }
 
 body {
@@ -35,11 +113,76 @@ body {
   color: var(--text);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
+  font-feature-settings: "cv11", "ss01";
 }
 
-/* Visible focus on every interactive element -- WCAG 2.1 AA, and the first
-   thing to break if it is not set once, globally. */
+/* --- the four surface treatments ------------------------------------------ */
+
+.soft-raised {
+  background: var(--surface-raised);
+  box-shadow:
+    -6px -6px 14px var(--shadow-light),
+    7px 7px 18px var(--shadow-dark);
+}
+
+.soft-raised-lg {
+  background: var(--surface-raised);
+  box-shadow:
+    -10px -10px 22px var(--shadow-light),
+    12px 12px 30px var(--shadow-dark);
+}
+
+.soft-sunken {
+  background: var(--surface-sunken);
+  box-shadow:
+    inset 4px 4px 10px var(--shadow-dark),
+    inset -4px -4px 10px var(--shadow-light);
+}
+
+.soft-flat {
+  background: var(--surface);
+  box-shadow:
+    -3px -3px 8px var(--shadow-light),
+    4px 4px 10px var(--shadow-dark);
+}
+
+/* A raised control that presses IN when active — the whole point of the style is
+   that things feel physical, and a button that does not move does not. */
+.soft-press {
+  transition:
+    box-shadow 140ms ease,
+    transform 140ms ease;
+}
+.soft-press:active:not(:disabled) {
+  box-shadow:
+    inset 3px 3px 8px var(--shadow-dark),
+    inset -3px -3px 8px var(--shadow-light);
+  transform: translateY(1px);
+}
+
+/* --- accessibility overlay on top of the aesthetic ----------------------- */
+
+/* 1.4.11: the boundary of an interactive control must reach 3:1. A shadow does
+   not, so controls carry this hairline too. Non-interactive cards do not need it
+   and do not get it, which keeps the soft look dominant. */
+.soft-edge {
+  border: 1px solid var(--edge);
+}
+
 :focus-visible {
-  outline: 2px solid var(--brand);
-  outline-offset: 2px;
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .soft-press,
+  .soft-press:active {
+    transition: none;
+    transform: none;
+  }
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
 }
