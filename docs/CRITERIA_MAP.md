@@ -15,7 +15,7 @@ Three jobs: show a grader **where** each criterion is satisfied, give the **corr
 | User interactions | onboarding, document upload, opportunity selection, edit, approve/reject, brand voice, tool toggles, model settings | `frontend/app/(app)/` | 2–12 |
 | User-friendly UI for **all** functionality | every backend capability has a screen; user mode vs `/developer` mode | `frontend/` | 2–13 |
 | Appropriate tools/libraries | LangGraph, FastAPI, Pydantic, pgvector, Next.js, Langfuse, Ragas | `pyproject.toml`, `ARCHITECTURE.md` §5 | — |
-| Error handling | typed engine errors, bounded retries, provider fallback, partial-failure degradation, reconciliation before retry, caps | `ARCHITECTURE.md` §7, `ROADMAP.md` §10 | 6, 9 |
+| Error handling | typed engine errors, bounded retries, provider fallback (403/404 falls through the chain, 401/402 fails fast), partial-failure degradation, caps, and two deliberate **fail-open** decisions with the reasoning recorded — a breach-lookup outage must not stop signups, and a rate-limit backend outage must not lock everyone out | `ARCHITECTURE.md` §7, §14, `ROADMAP.md` §10 | 6, 9 |
 | Real-world usage | resumable runs, idempotent actuators, budgets, rate limits, RLS, audit log | `ARCHITECTURE.md` §3, §6, §7 | 9 |
 | Documentation | 6 documents + in-app help assistant | `docs/`, `README.md` | 13 |
 | **Agent principles** | goal → plan → tool → observe → validate → act → measure → re-plan, with the LLM deciding and engines doing | §2 below | 3–11 |
@@ -24,8 +24,9 @@ Three jobs: show a grader **where** each criterion is satisfied, give the **corr
 | Code organisation | Engines / Actuators / Agents, layer direction enforced by test | `ARCHITECTURE.md` §3–4 | — |
 | Edge cases | 13 named scenarios with handling | `ROADMAP.md` §10 | 6, 9 |
 | Knowledge base / RAG | pgvector over the business's own documents, retrieved agentically | `engines/kb/`, §5 below | 5 |
-| Security | injection barriers, SSRF, RLS, tool allowlists, approval policy, audit | `ARCHITECTURE.md` §9 | 9 |
-| Reflection | known limits, weaknesses volunteered, improvement backlog | `ROADMAP.md` §11, `ARCHITECTURE.md` §15 | 13 |
+| Security | **request layer:** body-size cap enforced on the header AND every chunk (`core/body_limit.py`), Origin/Referer CSRF on cookie-bearing writes (`core/csrf.py`), `__Host-` session cookie with no `Domain`, ever (`core/cookies.py`), per-IP/per-email throttles with a refund on success (`core/rate_limit.py`), HIBP k-anonymity password check (`core/pwned.py`), proxy-trust detection (`core/proxy_trust.py`) · **agent layer:** per-node tool allowlist enforced at runtime and drift-tested against the docs (`agents/tools.py`), regulated-claim gate that blocks approval (`engines/claims/`), 10-mechanism prompt-injection corpus, escaped untrusted-content envelope · **data layer:** RLS on every business-scoped table with a cross-tenant test, anonymous reads through SECURITY DEFINER functions rather than a privileged connection, SSRF guard on crawling | `ARCHITECTURE.md` §9, §14; `tests/core/test_{body_limit,csrf,cookies,rate_limit,pwned,proxy_trust}.py`, `tests/agents/test_{tool_allowlist,prompt_injection}.py`, `tests/db/test_tenant_isolation.py` | 9 |
+| Measurement honesty | 20-case eval with a deterministic rubric (no LLM judge), an **oracle** column separating "retrieval found nothing" from "there was nothing to find", a report header that names the actual provider so a fake run cannot pass as a live one, `--live` that refuses to run if the router resolved to the fake, and `--prompt-version v1` kept executable so a prompt improvement is re-measurable rather than asserted | `evals/`, `evals/report.md` | 12 |
+| Reflection | known limits, weaknesses volunteered, improvement backlog — including the ones found by our own tooling: CI never ran a test, the rubric penalised the RAG arm for citing, text extraction is not a security boundary | `ROADMAP.md` §11, `ARCHITECTURE.md` §15, `BACKLOG.md` | 13 |
 | Prompt vs RAG vs agent | §6 below | — | — |
 
 ---
