@@ -6,7 +6,7 @@ speculative.
 
 Present here: users, businesses, documents, kb_chunks, crawl_pages, runs,
 run_events, model_usage, actions, opportunities, content_pieces, geo_prompts,
-geo_results.
+geo_results, model_routes, provider_settings.
 Still to come: keywords, competitors, social_posts, leads, feedback,
 learned_style, approvals.
 """
@@ -417,3 +417,80 @@ class GeoResult(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     )
     error: Mapped[str | None] = mapped_column(Text)
     probed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+# --------------------------------------------------------------------------- #
+# Runtime model configuration
+#
+# PLATFORM-level, deliberately: there is no business_id on either table, so neither
+# carries RLS. Which model serves which task is an operator decision about cost and
+# quality, not customer data -- and the router is a process-wide object, so making it
+# per-business would mean resolving a tenant at every model call.
+#
+# Per-business override is one nullable column away if an agency ever needs it. It is
+# not needed now, and adding it now would put a tenant lookup on the hot path of every
+# node for nobody.
+# --------------------------------------------------------------------------- #
+
+
+class ModelRoute(Base, UuidPkMixin, TimestampMixin):
+    """Which models serve one task class, in fallback order.
+
+    Rows OVERRIDE the code defaults in ``llm/router.py``; an empty table behaves
+    exactly as the code does. That is what makes this safe to ship: the feature adds a
+    way to change the routing without becoming the only way it works.
+    """
+
+    __tablename__ = "model_routes"
+
+    #: One row per task class. Unique, because two rows for GENERATE is an ambiguity
+    #: with no correct resolution.
+    task_class: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    tier: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    #: Ordered ``[{"provider": ..., "model": ...}]``. A list rather than one model
+    #: because a single provider outage must not stop a run, and the order IS the
+    #: fallback policy.
+    chain: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+
+    #: Who last changed it. Model choice moves cost and quality, so a change needs an
+    #: author -- "why is generation suddenly worse" has to be answerable.
+    updated_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("tier in ('cheap','mid','strong','embed')", name="tier_valid"),
+    )
+
+
+class ProviderSetting(Base, UuidPkMixin, TimestampMixin):
+    """Whether a provider may be used, and where to reach it.
+
+    ``base_url`` exists for Ollama: a local server has no API key, so availability is a
+    reachability question and the address is configuration rather than a secret. Hosted
+    providers leave it NULL and are gated by their key in the environment.
+
+    An API KEY IS NEVER STORED HERE. Keys stay in the injected environment
+    (see CLAUDE.md): a key in a database row is a key in every backup, every replica
+    and every screenshot of this table.
+    """
+
+    __tablename__ = "provider_settings"
+
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, unique=True)
+    enabled: Mapped[bool] = mapped_column(default=True, server_default=text("true"), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(512))
+    updated_by: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "provider in ('openrouter','anthropic','ollama','fake')", name="provider_valid"
+        ),
+    )

@@ -7,15 +7,53 @@ Layering rule (docs/ARCHITECTURE.md section 4):
 Routes stay thin. They never reach into an engine or an adapter directly.
 """
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from collections.abc import Mapping, Sequence
+from typing import Any
 
-from backend.app.api import auth, health, onboarding
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from backend.app.api import admin_models, auth, health, onboarding
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings, get_settings
 
 #: Below this length an HMAC key is brute-forceable, and the signature is only
 #: ever as good as the key behind it.
 MIN_SESSION_SECRET_LENGTH = 32
+
+
+#: Keys whose value must never appear in a response, however the request was shaped.
+_SENSITIVE_HINTS = ("password", "key", "secret", "token", "credential")
+
+
+def _redact_validation_errors(errors: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Strip the submitted value out of every validation error.
+
+    FastAPI's default 422 body includes `input` — the value that failed — and for a
+    `missing` error that is the WHOLE parent object. So a single constraint on one field
+    can put a password or an API key in the response body, and from there into any log
+    or error tracker that captures responses.
+
+    This was not hypothetical: the admin API refuses a request carrying an `apiKey`, and
+    the refusal echoed the key straight back. The auth module worked around the same
+    problem by declaring no field constraints at all; with this handler that workaround
+    is no longer the only defence.
+
+    `loc` and `msg` are kept, because a caller still needs to know WHICH field was wrong
+    and why. Only the value goes.
+    """
+    redacted: list[dict[str, Any]] = []
+    for error in errors:
+        cleaned: dict[str, Any] = {
+            k: v for k, v in error.items() if k not in ("input", "ctx", "url")
+        }
+        parts: Sequence[Any] = error.get("loc") or ()
+        loc = ".".join(str(part) for part in parts)
+        if any(hint in loc.lower() for hint in _SENSITIVE_HINTS):
+            cleaned["msg"] = "This field is not accepted here."
+        redacted.append(cleaned)
+    return redacted
 
 
 class InsecureConfigurationError(RuntimeError):
@@ -74,8 +112,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.exception_handler(RequestValidationError)
+    async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": _redact_validation_errors(exc.errors())},
+        )
+
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(admin_models.router)
     app.include_router(onboarding.router)
     return app
 

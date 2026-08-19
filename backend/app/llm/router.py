@@ -234,12 +234,20 @@ class ModelRouter:
         chains: Mapping[ModelTier, tuple[RouteEntry, ...]] | None = None,
         task_tiers: Mapping[TaskClass, ModelTier] | None = None,
         default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        resolver: object | None = None,
     ) -> None:
         """Build a router.
 
         `providers` / `chains` / `task_tiers` exist so a test can inject stub
         providers and a two-entry chain without monkeypatching module state.
         Production passes none of them.
+
+        `resolver` is an optional RouteResolver carrying admin-configured routing. It is
+        typed loosely to keep this module free of an import cycle -- route_config
+        imports TIER_CHAINS and TASK_TIERS from here. When absent, or when it has
+        nothing to say about a task, the code defaults below apply unchanged: that is
+        what lets the configuration feature ship without changing any behaviour until
+        someone configures something.
         """
         resolved = dict(providers) if providers is not None else build_providers(env)
         # The fake is always reachable: it is the floor the router degrades to,
@@ -250,23 +258,57 @@ class ModelRouter:
         self._chains = chains if chains is not None else TIER_CHAINS
         self._task_tiers = task_tiers if task_tiers is not None else TASK_TIERS
         self._default_max_tokens = default_max_tokens
+        self._resolver = resolver
 
     @property
     def providers(self) -> Mapping[str, Provider]:
         """The providers this router can reach, by name."""
         return self._providers
 
+    async def refresh_routes(self) -> None:
+        """Reload admin configuration, if this router has a resolver.
+
+        Called at startup and after an admin edit. A no-op without a resolver, so
+        callers need not know whether one is configured.
+        """
+        resolver = self._resolver
+        if resolver is not None:
+            await resolver.refresh()  # type: ignore[attr-defined]
+
+    def _usable(self, provider: str) -> bool:
+        """Whether this provider can serve a call right now.
+
+        Three separate questions, which is why this is not just a dict lookup:
+        the adapter exists (a credential was present at construction), an admin has not
+        switched it off, and -- for a KEYLESS provider like Ollama -- configuration has
+        given it an address. The environment cannot tell us anything about a local
+        server, so only the configuration can.
+        """
+        resolver = self._resolver
+        if resolver is not None and resolver.is_disabled(provider):  # type: ignore[attr-defined]
+            return False
+        if provider in self._providers:
+            return True
+        if resolver is not None:
+            return provider in resolver.keyless_available()  # type: ignore[attr-defined]
+        return False
+
     def resolve(self, task: TaskClass) -> ResolvedRoute:
         """Map a task to its tier and its *available* fallback chain.
 
-        Entries whose provider has no credential are filtered out rather than
-        attempted and failed: an unreachable provider is not a fallback, it is
-        latency. If nothing is left, the fake chain is used.
+        Entries whose provider cannot serve a call are filtered out rather than
+        attempted and failed: an unreachable provider is not a fallback, it is latency.
+        If nothing is left, the fake chain is used -- the floor, never an exception.
         """
-        tier = self._task_tiers[task]
-        chain = tuple(
-            entry for entry in self._chains.get(tier, ()) if entry.provider in self._providers
-        )
+        resolver = self._resolver
+        if resolver is not None:
+            tier = resolver.tier_for_task(task)  # type: ignore[attr-defined]
+            candidates = resolver.chain_for_task(task)  # type: ignore[attr-defined]
+        else:
+            tier = self._task_tiers[task]
+            candidates = self._chains.get(tier, ())
+
+        chain = tuple(entry for entry in candidates if self._usable(entry.provider))
         if chain:
             return ResolvedRoute(task=task, tier=tier, chain=chain, using_fake=False)
 
