@@ -6,9 +6,9 @@ speculative.
 
 Present here: users, businesses, documents, kb_chunks, crawl_pages, runs,
 run_events, model_usage, actions, opportunities, content_pieces, geo_prompts,
-geo_results, model_routes, provider_settings.
-Still to come: keywords, competitors, social_posts, leads, feedback,
-learned_style, approvals.
+geo_results, model_routes, provider_settings, short_links, link_clicks, leads,
+feedback, learned_style.
+Still to come: keywords, competitors, social_posts, approvals.
 """
 
 from datetime import datetime
@@ -78,6 +78,11 @@ class User(Base, UuidPkMixin, TimestampMixin):
     role: Mapped[str] = mapped_column(
         String(32), default=Role.OWNER, server_default=Role.OWNER.value, nullable=False
     )
+
+    #: Sessions issued before this instant are refused. The session token is stateless
+    #: HMAC, so without this column logout only clears the BROWSER's copy and a stolen
+    #: cookie stays valid for its full 30 days. Bumping this is the revocation.
+    sessions_valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     businesses: Mapped[list["Business"]] = relationship(back_populates="owner")
 
@@ -527,4 +532,135 @@ class ProviderSetting(Base, UuidPkMixin, TimestampMixin):
         CheckConstraint(
             "provider in ('openrouter','anthropic','ollama','fake')", name="provider_valid"
         ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The lead loop
+#
+# Attribution is deliberately decoupled from PUBLISHING: we own the short link, so a
+# click is measurable whether we posted the content or the owner pasted the caption by
+# hand. Two channels in this product cannot carry a clickable link at all (Instagram and
+# TikTok captions), which is exactly why the link hub exists.
+# --------------------------------------------------------------------------- #
+
+
+class ShortLink(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """A tracked redirect. ``code`` is what appears in /l/{code}."""
+
+    __tablename__ = "short_links"
+
+    code: Mapped[str] = mapped_column(String(16), nullable=False, unique=True)
+    target_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    content_piece_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("content_pieces.id", ondelete="SET NULL"), index=True
+    )
+    channel: Mapped[str | None] = mapped_column(String(32))
+    campaign: Mapped[str | None] = mapped_column(String(128))
+    #: Denormalised counter so a list view needs no aggregate over link_clicks.
+    click_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+
+class LinkClick(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """One click. No IP and no user agent are stored.
+
+    A hashed user-agent would be a weak fingerprint and an IP is personal data under
+    GDPR; neither is needed to attribute a lead to a piece of content, so neither is
+    kept. Bot filtering uses the UA in memory and discards it.
+    """
+
+    __tablename__ = "link_clicks"
+
+    short_link_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("short_links.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    referrer_host: Mapped[str | None] = mapped_column(String(255))
+    is_bot: Mapped[bool] = mapped_column(
+        default=False, server_default=text("false"), nullable=False
+    )
+
+
+class Lead(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """A form submission, attributed to the content that produced the link."""
+
+    __tablename__ = "leads"
+
+    content_piece_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("content_pieces.id", ondelete="SET NULL"), index=True
+    )
+    short_link_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("short_links.id", ondelete="SET NULL")
+    )
+    source: Mapped[str] = mapped_column(String(64), default="form", server_default="form")
+    utm: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    #: Whatever the form collected. JSONB because a landing page's fields are generated
+    #: per opportunity, so a fixed column set would be wrong by the second page.
+    fields: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default="new", server_default="new", nullable=False
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Feedback, and what the agent learns from it
+# --------------------------------------------------------------------------- #
+
+
+class Feedback(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """A rating on one produced piece.
+
+    Four axes rather than one score: "bad" is not actionable, while "on-brand 2,
+    accuracy 5" says which prompt to change.
+    """
+
+    __tablename__ = "feedback"
+
+    content_piece_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("content_pieces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)  # approved|rejected
+    axes: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    reject_reason: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (CheckConstraint("verdict in ('approved','rejected')", name="verdict_valid"),)
+
+
+class LearnedStyle(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """Preferences distilled from feedback, PENDING the owner's approval.
+
+    Never applied until approved. An agent that silently rewrote a business's brand
+    rules from a few rejections would be changing the product's voice without consent —
+    and the owner would have no way to see why the output drifted.
+    """
+
+    __tablename__ = "learned_style"
+
+    rule: Mapped[str] = mapped_column(Text, nullable=False)
+    derived_from: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="proposed", server_default="proposed", nullable=False
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("status in ('proposed','approved','rejected')", name="status_valid"),
     )

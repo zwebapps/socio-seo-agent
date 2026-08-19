@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.app.api import admin_models, auth, health, onboarding
+from backend.app.api import admin_models, auth, health, onboarding, runs
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings, get_settings
 
 #: Below this length an HMAC key is brute-forceable, and the signature is only
@@ -115,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(admin_models.router)
     app.include_router(onboarding.router)
+    app.include_router(runs.router)
 
     app.add_middleware(
         CORSMiddleware,
