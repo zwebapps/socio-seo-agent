@@ -60,7 +60,33 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 ## Phase 8 — Lead loop
 - [x] `short_links`, `link_clicks`, `leads` with RLS — `3163123`
 - [x] Short-link service `/l/{code}` + link hub `/go/{id}` — `d9deedf`
-- [ ] Landing page + CTA generation
+- [x] Landing page + CTA generation — CONVERSION was the missing link: a tracked short
+  link pointing at a page that does not exist earns nothing. Split as the project's one
+  rule dictates. **New `landing` engine** (pure, no LLM): a ten-rule deterministic
+  conversion audit with the same weighting model as `seo` (weights sum to 100, graded
+  severity, `passed = score >= 85 AND no error finding`) plus a total-function HTML
+  renderer — "is there a form, and can it be answered" is set membership, and "what
+  markup is this spec" is string building. **New `CONVERT` node**, between GENERATE and
+  VALIDATE rather than after them, because a landing page makes a promise directly above
+  a form and VALIDATE is where the regulated-claim gate runs; a node after VALIDATE would
+  emit unchecked copy on the worst possible surface. It writes only what cannot be
+  computed (headline, offer, sourced proof, per-channel CTA copy) and reads the business's
+  own documents through `kb.search` — no `web_search`, because a proof point sourced from
+  a page the business does not control is not proof of anything about the business.
+  VALIDATE gained `landing.check` and now folds the landing copy into the SAME
+  `claim_check`, so a banned claim in the conversion copy cannot reach REVIEW; the graph's
+  backward edge now targets the earliest node whose output failed, so a landing-only
+  failure re-runs CONVERT and not the strong-tier GENERATE. **Served** at
+  `GET /p/{piece_id}` — public, zero-cookie, zero-JavaScript, one 404 for every refusal —
+  over a third `SECURITY DEFINER` resolver (migration `4d2b7f9c1e83`; no table change,
+  the page is a `content_pieces` row with its spec in `meta`). The public form endpoint
+  now also accepts `application/x-www-form-urlencoded` and answers a browser with a 303
+  back to `?sent=1`, because a JSON-only endpoint refuses every no-script visitor's lead
+  AFTER they have typed it in; same schema, same honeypot, same size cap, same rate limit.
+  One tracked short link per channel CTA, retargeted with its own `?ref=<code>` once the
+  insert has minted it, so a lead names the exact link rather than only the channel. The
+  whole chain is asserted end to end over real SQL with RLS on in
+  `backend/tests/db/test_content_store.py`. (In the working tree, uncommitted.)
 - [x] Public form (honeypot, rate limit, size cap) + content→lead attribution — `d9deedf`
 
 ## Phase 9 — UI completion
@@ -262,12 +288,42 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   themes. Now 3.37 / 3.57 against `--bg` with the worst surface checked too, and the focus ring got
   its own `--focus-ring` token (3.89 light) so the brand `--accent` did not have to move. Ratios
   recomputed independently from the hex values, not taken on trust.
-- [ ] **Nothing in the application executes the graph.** `run_graph`, `build_nodes` and
-  `RunService.checkpoint` are called only from tests, so `POST /api/v1/runs` creates a `queued` row
-  that never advances and `runs.checkpoint` stays `{}`. Every real run's review therefore renders
-  the honest empty states, correctly, and that is all it can render. **This is the largest remaining
-  functional gap in the product** — the pieces all exist and pass tests individually; nothing joins
-  them at runtime.
+- [x] **Nothing in the application executed the graph.** `run_graph`, `build_nodes` and
+  `RunService.checkpoint` were called only from tests, so `POST /api/v1/runs` created a `queued` row
+  that never advanced. `services/run_executor.py` is the join. Verified end to end against the live
+  app + database: a run went `queued` → executed → `done` with 7 events at monotonic `seq`, INTAKE
+  and HARVEST completing.
+  Four things it gets right on purpose, each of which has a plausible wrong answer:
+  ordered event persistence (the sink is SYNCHRONOUS and `record_event` is async, and a task per
+  event races on `next_seq` — a duplicate is bad, a hole is worse because a resumed run reads it as
+  a node that never ran); failures that reach the database (a fire-and-forget task whose exception
+  nobody retrieves leaves the row saying `running` forever, indistinguishable from slow); strong
+  task references (`create_task` returns the only one, and dropping it lets a run be
+  garbage-collected mid-flight); and bounded concurrency (each run holds DB sessions AND calls a
+  provider, so unbounded exhausts both at once).
+  `serp_search` is wired ONLY when the provider is real — `get_serp_provider()` falls back to the
+  fake, and wiring that would suppress HARVEST's honest "no provider configured" gap and make a run
+  look researched. The executor emits its own timeline line naming what was actually wired, under
+  the `EXECUTOR` label rather than borrowing a node's.
+  Crawl results are summarised before entering state: the checkpoint is rewritten on EVERY node and
+  `PageFacts.main_text` is a whole page body, so the raw result would put megabytes into JSONB ten
+  times per run.
+  **Honest limitation:** it runs IN the API process, so a restart mid-run leaves the row `running`.
+  Runs were made resumable for exactly this, and `POST /runs/{id}/resume` is the recovery path — it
+  refuses a finished run (re-running would overwrite approved work) and one awaiting approval (that
+  is a person, not a stall). What is missing is a sweeper that finds stalled runs automatically,
+  which is a worker's job; `ROADMAP` names ARQ/Redis and it is not installed.
+- [ ] **A provider outage is reported to the customer as a business judgement.** In `graph.py`,
+  `if name == "OPPORTUNITY" and not state.get("opportunity")` returns "No opportunity met the bar
+  for this business" — but `opportunity` is ALSO None when the node could not run at all. Observed
+  live: OPPORTUNITY failed with `AllProvidersFailedError` (the MID tier is refused by this
+  credential's data policy) and the run finished `done`, telling the customer nothing about their
+  business was worth writing about. This is the same fabrication the project forbids elsewhere —
+  `no_answer` is excluded from the share-of-voice denominator precisely because "a model outage must
+  never be recorded as the brand being absent". The fix is to distinguish "ran and chose nothing"
+  (`done`, current message) from "could not run" (`partial`/`failed`, naming the failure), which
+  `state["errors"]` already carries. NOT fixed here only because `graph.py` was held by another
+  agent at the time.
 - [ ] `/api/v1/onboarding` has only `/preview` — nothing persists the drafted Business DNA, so
   `tone`/`audience`/`banned_claims` are empty for every business (created at signup with `dna = {}`).
   Consequence: the regulated-claim guard has no claims to enforce for a real tenant.

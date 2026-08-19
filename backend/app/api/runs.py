@@ -23,7 +23,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -31,6 +31,7 @@ from pydantic.alias_generators import to_camel
 from backend.app.api.auth import CurrentUser
 from backend.app.db.adapters.run_store import PostgresRunStore
 from backend.app.services.review_service import RunReview, project_review
+from backend.app.services.run_executor import RunExecutor
 from backend.app.services.run_service import RunRecord, RunService
 
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
@@ -72,6 +73,34 @@ async def current_business(user: CurrentUser) -> UUID:
             },
         )
     return business_id
+
+
+def get_executor(request: Request) -> RunExecutor:
+    """The application's ONE executor, cached on `app.state`.
+
+    One per application, not one per request: it owns the concurrency limit and the
+    set of in-flight tasks, and a fresh instance per request would enforce neither --
+    every caller would get its own allowance of four, which is no allowance at all,
+    and each new instance would drop the previous one's task references and let live
+    runs be garbage-collected.
+
+    Built lazily here rather than in `create_app` so this module owns its own
+    machinery: the executor needs nothing but a way to make a `RunService`, which is
+    right here, and wiring it into application startup would put a runs-specific
+    detail into the app factory for no gain. The cost is that a first request pays the
+    construction, which is a semaphore and an empty set.
+
+    Overridable in tests through the usual `dependency_overrides`.
+    """
+    executor = getattr(request.app.state, "run_executor", None)
+    if isinstance(executor, RunExecutor):
+        return executor
+
+    executor = RunExecutor(
+        service_factory=lambda business_id: RunService(PostgresRunStore(business_id))
+    )
+    request.app.state.run_executor = executor
+    return executor
 
 
 async def get_run_service(
@@ -142,8 +171,13 @@ async def start_run(
     payload: StartRunRequest,
     business_id: Annotated[UUID, Depends(current_business)],
     service: Annotated[RunService, Depends(get_run_service)],
+    executor: Annotated[RunExecutor, Depends(get_executor)],
 ) -> StartRunResponse:
     run = await service.start(business_id=business_id, goal=payload.goal)
+    # 202 and then work in the background. Before this, the row was created and
+    # nothing ever advanced it: `run_graph` was reachable only from tests, so a
+    # started run stayed `queued` forever and the timeline had nothing to show.
+    executor.submit(run.id, business_id, payload.goal)
     return StartRunResponse(run_id=run.id, state=run.state)
 
 
@@ -195,6 +229,56 @@ async def get_review(
     """
     run = await _require_own_run(run_id, business_id, service)
     return project_review(run.checkpoint)
+
+
+@router.post(
+    "/{run_id}/resume",
+    response_model=StartRunResponse,
+    response_model_by_alias=True,
+    status_code=202,
+    summary="Continue a run that stopped without finishing",
+)
+async def resume_run(
+    run_id: UUID,
+    business_id: Annotated[UUID, Depends(current_business)],
+    service: Annotated[RunService, Depends(get_run_service)],
+    executor: Annotated[RunExecutor, Depends(get_executor)],
+) -> StartRunResponse:
+    """Pick a run back up from its checkpoint.
+
+    This exists because the executor runs IN THE API PROCESS. If that process is
+    restarted or killed mid-run, the row is left saying `running` and nothing will
+    advance it — a distributed worker would notice and retry, and there isn't one.
+    Runs were made resumable for exactly this case, so the recovery path is real; what
+    is missing is something that walks stalled runs automatically.
+
+    Deliberately refuses a run that has already reached a terminal state. Re-running a
+    finished run would spend money to overwrite work somebody may have approved, and
+    "resume" is not a word anyone expects to mean that. A run awaiting approval is also
+    refused: it is not stalled, it is waiting for a person, and resuming it would step
+    past the review gate that exists to stop exactly that.
+    """
+    run = await _require_own_run(run_id, business_id, service)
+
+    if run.state in {"done", "failed", "partial"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_finished",
+                "message": f"This run already finished ({run.state}) and cannot be resumed.",
+            },
+        )
+    if run.state == "awaiting_approval":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_awaiting_approval",
+                "message": "This run is waiting for a human decision, not stalled.",
+            },
+        )
+
+    executor.submit(run.id, business_id, run.goal, resume=True)
+    return StartRunResponse(run_id=run.id, state="running")
 
 
 @router.get("/{run_id}/events")

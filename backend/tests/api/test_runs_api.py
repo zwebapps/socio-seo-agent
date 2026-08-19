@@ -6,9 +6,11 @@ whole run, and a stream that never terminates leaks a connection per reload.
 """
 
 import json
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 
 from backend.app.agents.state import new_state
 from backend.app.api import runs as runs_api
@@ -254,3 +256,130 @@ async def test_the_draft_html_is_not_carried_in_the_polled_timeline_payload() ->
     # The whole payload as one string, so "the draft is nowhere in here" is checkable
     # rather than only "there is no top-level draft key".
     assert "<h1>" not in json.dumps(body, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
+# The executor is actually reached, and resume refuses what it should
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingExecutor:
+    """Records submissions instead of running anything."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[UUID, UUID, str, bool]] = []
+
+    def submit(self, run_id: UUID, business_id: UUID, goal: str, *, resume: bool = False) -> None:
+        self.submitted.append((run_id, business_id, goal, resume))
+
+
+def _client_with_executor(service: RunService, executor: _RecordingExecutor) -> httpx.AsyncClient:
+    app = create_app()
+    app.dependency_overrides[runs_api.get_run_service] = lambda: service
+    app.dependency_overrides[runs_api.current_business] = lambda: BUSINESS
+    app.dependency_overrides[runs_api.get_executor] = lambda: executor
+    from backend.app.api.auth import current_user
+
+    app.dependency_overrides[current_user] = _user
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+async def test_starting_a_run_submits_it_for_execution() -> None:
+    """The gap this closes: the row used to be created and nothing ever advanced it.
+
+    202 was already correct and already returned; what was missing was anything behind
+    it. A test asserting only the status code passed throughout the entire period the
+    product could not run a single run.
+    """
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    assert response.status_code == 202
+    run_id = UUID(response.json()["runId"])
+    assert executor.submitted == [(run_id, BUSINESS, "more local leads", False)]
+
+
+async def test_resuming_a_stalled_run_submits_it_with_resume_set() -> None:
+    """The recovery path for a run whose process died mid-flight."""
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 202
+    assert executor.submitted == [(run.id, BUSINESS, "more leads", True)]
+
+
+@pytest.mark.parametrize("state", ["done", "failed", "partial"])
+async def test_resuming_a_finished_run_is_refused(state: str) -> None:
+    """Re-running finished work would spend money to overwrite something approved.
+
+    "Resume" does not mean "start again", and a 202 here would quietly destroy output a
+    human may already have signed off.
+    """
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    await service.finish(run.id, outcome=state)  # type: ignore[arg-type]
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "run_finished"
+    assert executor.submitted == [], "nothing may be submitted after a refusal"
+
+
+async def test_resuming_a_run_awaiting_approval_is_refused() -> None:
+    """It is not stalled, it is waiting for a person.
+
+    Resuming would step straight past the review gate, which is the one control that
+    stands between a generated page and publication.
+    """
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    await service.await_approval(run.id)
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "run_awaiting_approval"
+    assert executor.submitted == []
+
+
+async def test_resuming_another_businesss_run_is_a_404() -> None:
+    """Same rule as every other run route: existence is itself information."""
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+    other = await service.start(business_id=uuid4(), goal="not yours")
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{other.id}/resume")
+
+    assert response.status_code == 404
+    assert executor.submitted == []
+
+
+async def test_the_application_holds_exactly_one_executor() -> None:
+    """A per-request executor would enforce no concurrency limit and drop task refs.
+
+    Each new instance gets its own allowance of four -- which is no allowance -- and
+    loses the previous one's strong references, letting live runs be collected.
+    """
+    from backend.app.services.run_executor import RunExecutor
+
+    app = create_app()
+    request = SimpleNamespace(app=app)
+
+    first = runs_api.get_executor(request)  # type: ignore[arg-type]
+    second = runs_api.get_executor(request)  # type: ignore[arg-type]
+
+    assert isinstance(first, RunExecutor)
+    assert first is second
