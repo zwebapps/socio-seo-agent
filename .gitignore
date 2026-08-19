@@ -25,6 +25,12 @@ frontend/tsconfig.tsbuildinfo
 data/
 *.log
 
+# Local AI-agent tooling. Kept on disk so /next and the architect work in this
+# project without borrowing another project's config, but deliberately untracked:
+# it is personal build machinery, not part of the deliverable.
+/CLAUDE.md
+/.claude/
+
 # OS / editor
 .DS_Store
 .idea/
