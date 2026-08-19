@@ -10,7 +10,7 @@ Routes stay thin. They never reach into an engine or an adapter directly.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.api import health
+from backend.app.api import health, onboarding
 from backend.app.core.config import get_settings
 
 
@@ -40,6 +40,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(health.router)
+    app.include_router(onboarding.router)
     return app
 
 
