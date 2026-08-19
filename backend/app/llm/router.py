@@ -40,6 +40,7 @@ from backend.app.llm.contract import (
     ModelTier,
     Provider,
     ProviderFailure,
+    ProviderUnavailableError,
     TaskClass,
     ToolSpec,
 )
@@ -315,6 +316,39 @@ class ModelRouter:
         fake_chain = FAKE_CHAINS[tier]
         return ResolvedRoute(task=task, tier=tier, chain=fake_chain, using_fake=True)
 
+    def _provider_for(self, name: str) -> Provider:
+        """The adapter for one provider name, constructing a keyless one on demand.
+
+        Ollama cannot be built at construction time the way a hosted provider is: there
+        is no credential to detect, and its address comes from the admin configuration
+        the resolver holds. So it is built here, lazily, and cached.
+
+        The import is local for the same reason `build_providers`' are: a deployment with
+        no local server and no API key must never load a vendor SDK just by importing
+        this module.
+        """
+        existing = self._providers.get(name)
+        if existing is not None:
+            return existing
+
+        resolver = self._resolver
+        if name == "ollama" and resolver is not None:
+            base_url = resolver.base_url(name)  # type: ignore[attr-defined]
+            if base_url:
+                from backend.app.llm.ollama_provider import OllamaProvider
+
+                built: Provider = OllamaProvider(base_url=base_url)
+                self._providers[name] = built
+                return built
+
+        # Should be unreachable: resolve() filters on _usable() first. A named error
+        # beats a KeyError if the two ever disagree -- and it says which provider,
+        # which a KeyError on a dict lookup does not make obvious in a traceback.
+        raise ProviderUnavailableError(
+            f"no adapter available for provider {name!r}: it is neither credentialled "
+            "nor configured with an address"
+        )
+
     def estimate_usd(
         self,
         model: str,
@@ -363,7 +397,7 @@ class ModelRouter:
         failures: list[ProviderFailure] = []
 
         for entry in route.chain:
-            provider = self._providers[entry.provider]
+            provider = self._provider_for(entry.provider)
 
             # -- the guard, and it is here on purpose: before the await ------ #
             if budget is not None:

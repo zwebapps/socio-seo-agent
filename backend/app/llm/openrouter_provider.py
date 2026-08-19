@@ -147,6 +147,69 @@ def _to_message_params(
     return params
 
 
+# --------------------------------------------------------------------------- #
+# OpenAI-wire-format response parsing
+#
+# Module-level and provider-parameterised on purpose: this is the OpenAI wire format,
+# not an OpenRouter detail, and Ollama speaks the same shape. Two copies of it would
+# drift, and the way that drift shows up is a model that quietly stopped calling tools —
+# no error, just structured-output nodes failing for no visible reason.
+# --------------------------------------------------------------------------- #
+
+
+def parse_tool_arguments(
+    *, provider: str, model: str, tool_name: str, raw: str | None
+) -> dict[str, Any]:
+    """Turn the wire-format JSON string into a dict, or raise."""
+    if raw is None or raw.strip() == "":
+        return {}
+    try:
+        parsed: object = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InvalidToolArgumentsError(
+            provider, model, tool_name, f"arguments were not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise InvalidToolArgumentsError(
+            provider,
+            model,
+            tool_name,
+            f"arguments must be a JSON object, got {type(parsed).__name__}",
+        )
+    return parsed
+
+
+def parse_tool_calls(*, provider: str, model: str, raw: Sequence[Any] | None) -> list[ToolCall]:
+    """Parse tool calls, narrowing the SDK's tool-call union explicitly.
+
+    `tool_calls` is a union of function calls and (newer) custom calls. Only the
+    function variant carries `.function.arguments`, so the variant is checked rather
+    than assumed -- an unexpected shape is reported, not silently dropped, because a
+    dropped tool call looks to the caller like a model that answered when it actually
+    asked for something.
+    """
+    if not raw:
+        return []
+
+    calls: list[ToolCall] = []
+    for entry in raw:
+        call_type = getattr(entry, "type", None)
+        if call_type != "function":
+            raise InvalidToolArgumentsError(
+                provider,
+                model,
+                str(getattr(entry, "id", "<unknown>")),
+                f"unsupported tool-call type {call_type!r}; only 'function' is mapped",
+            )
+        function = entry.function
+        name = str(function.name)
+        arguments = parse_tool_arguments(
+            provider=provider, model=model, tool_name=name, raw=function.arguments
+        )
+        calls.append(ToolCall(name=name, arguments=arguments, call_id=str(entry.id)))
+    return calls
+
+
 class OpenRouterProvider:
     """OpenRouter, via the OpenAI-compatible SDK. Satisfies `contract.Provider`."""
 
@@ -219,7 +282,7 @@ class OpenRouterProvider:
             raise ProviderServerError(self.name, model, "response contained no choices")
 
         message = response.choices[0].message
-        tool_calls = self._to_tool_calls(model, message.tool_calls)
+        tool_calls = parse_tool_calls(provider=self.name, model=model, raw=message.tool_calls)
         text = message.content
 
         tokens_in, tokens_out, estimated = self._token_counts(response, text, tool_calls)
@@ -241,54 +304,6 @@ class OpenRouterProvider:
             usage=usage,
             is_final=not tool_calls,
         )
-
-    def _to_tool_calls(self, model: str, raw: Sequence[Any] | None) -> list[ToolCall]:
-        """Parse tool calls, narrowing the SDK's tool-call union explicitly.
-
-        `tool_calls` is a union of function calls and (newer) custom calls. Only
-        the function variant carries `.function.arguments`, so the variant is
-        checked rather than assumed -- an unexpected shape is reported, not
-        silently dropped, because a dropped tool call looks to the caller like a
-        model that answered when it actually asked for something.
-        """
-        if not raw:
-            return []
-
-        calls: list[ToolCall] = []
-        for entry in raw:
-            call_type = getattr(entry, "type", None)
-            if call_type != "function":
-                raise InvalidToolArgumentsError(
-                    self.name,
-                    model,
-                    str(getattr(entry, "id", "<unknown>")),
-                    f"unsupported tool-call type {call_type!r}; only 'function' "
-                    "is mapped by this adapter",
-                )
-            function = entry.function
-            name = str(function.name)
-            arguments = self._parse_arguments(model, name, function.arguments)
-            calls.append(ToolCall(name=name, arguments=arguments, call_id=str(entry.id)))
-        return calls
-
-    def _parse_arguments(self, model: str, tool_name: str, raw: str | None) -> dict[str, Any]:
-        """Turn the wire-format JSON string into a dict, or raise."""
-        if raw is None or raw.strip() == "":
-            return {}
-        try:
-            parsed: object = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise InvalidToolArgumentsError(
-                self.name, model, tool_name, f"arguments were not valid JSON: {exc}"
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise InvalidToolArgumentsError(
-                self.name,
-                model,
-                tool_name,
-                f"arguments must be a JSON object, got {type(parsed).__name__}",
-            )
-        return parsed
 
     def _token_counts(
         self, response: ChatCompletion, text: str | None, tool_calls: Sequence[ToolCall]

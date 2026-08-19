@@ -46,7 +46,7 @@ import json
 import time
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import Any, Final
+from typing import Final
 
 import httpx
 from openai import (
@@ -62,7 +62,6 @@ from pydantic import BaseModel
 
 from backend.app.llm.contract import (
     Completion,
-    InvalidToolArgumentsError,
     Message,
     ProviderRateLimitError,
     ProviderRequestError,
@@ -77,7 +76,11 @@ from backend.app.llm.contract import (
 # Importing it rather than copying it is the point: a divergence between two
 # copies of this translation would show up as a model that silently stopped
 # calling tools, with no error anywhere.
-from backend.app.llm.openrouter_provider import _to_message_params, _to_tool_param
+from backend.app.llm.openrouter_provider import (
+    _to_message_params,
+    _to_tool_param,
+    parse_tool_calls,
+)
 from backend.app.llm.pricing import conservative_token_estimate
 
 DEFAULT_OLLAMA_BASE_URL: Final = "http://localhost:11434/v1"
@@ -296,7 +299,9 @@ class OllamaProvider:
             raise ProviderServerError(self.name, model, "response contained no choices")
 
         message = response.choices[0].message
-        tool_calls = self._to_tool_calls(model, message.tool_calls)
+        # Shared with the OpenRouter adapter: one implementation of the OpenAI wire
+        # format, so the two cannot drift apart.
+        tool_calls = parse_tool_calls(provider=self.name, model=model, raw=message.tool_calls)
         text = message.content
 
         tokens_in, tokens_out, estimated = self._token_counts(response, text, tool_calls)
@@ -321,58 +326,6 @@ class OllamaProvider:
             usage=usage,
             is_final=not tool_calls,
         )
-
-    def _to_tool_calls(self, model: str, raw: Sequence[Any] | None) -> list[ToolCall]:
-        """Parse tool calls, narrowing the SDK's tool-call union explicitly.
-
-        A dropped tool call would look to the caller like a model that answered
-        when it actually asked for something, so an unexpected shape is reported
-        rather than skipped.
-        """
-        if not raw:
-            return []
-
-        calls: list[ToolCall] = []
-        for entry in raw:
-            call_type = getattr(entry, "type", None)
-            if call_type != "function":
-                raise InvalidToolArgumentsError(
-                    self.name,
-                    model,
-                    str(getattr(entry, "id", "<unknown>")),
-                    f"unsupported tool-call type {call_type!r}; only 'function' "
-                    "is mapped by this adapter",
-                )
-            function = entry.function
-            name = str(function.name)
-            arguments = self._parse_arguments(model, name, function.arguments)
-            calls.append(ToolCall(name=name, arguments=arguments, call_id=str(entry.id)))
-        return calls
-
-    def _parse_arguments(self, model: str, tool_name: str, raw: str | None) -> dict[str, Any]:
-        """Turn the wire-format JSON string into a dict, or raise.
-
-        Local models are markedly worse at this than hosted ones -- truncated
-        JSON and a prose preamble before the object are both common -- which is
-        precisely why the failure is typed and raised at the boundary instead of
-        being swallowed into an empty argument set.
-        """
-        if raw is None or raw.strip() == "":
-            return {}
-        try:
-            parsed: object = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise InvalidToolArgumentsError(
-                self.name, model, tool_name, f"arguments were not valid JSON: {exc}"
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise InvalidToolArgumentsError(
-                self.name,
-                model,
-                tool_name,
-                f"arguments must be a JSON object, got {type(parsed).__name__}",
-            )
-        return parsed
 
     def _token_counts(
         self, response: ChatCompletion, text: str | None, tool_calls: Sequence[ToolCall]

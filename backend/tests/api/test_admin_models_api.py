@@ -205,3 +205,35 @@ async def test_a_chain_with_an_unpriced_model_is_flagged_as_not_cost_reportable(
 
     generate = next(r for r in body["routes"] if r["taskClass"] == "generate")
     assert generate["costReportable"] is False
+
+
+async def test_the_catalogue_lists_pickable_models_for_a_provider() -> None:
+    async with _client() as client:
+        body = (await client.get("/api/v1/admin/models/available?provider=anthropic")).json()
+
+    assert body["provider"] == "anthropic"
+    assert body["models"], "an admin screen must never be handed an empty picker"
+    assert all("id" in m and "priced" in m for m in body["models"])
+
+
+async def test_an_unconfigured_ollama_is_not_probed_at_all() -> None:
+    """Two reasons, and the second is why this test exists at all:
+
+    the app must not reach out to a machine the operator never pointed it at; and
+    defaulting to localhost made this very test non-hermetic — it found a real Ollama
+    server running on the developer's laptop and returned its models.
+    """
+    async with _client() as client:
+        response = await client.get("/api/v1/admin/models/available?provider=ollama")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["models"] == []
+    assert body["live"] is False
+    assert "No address is configured" in (body["message"] or "")
+
+
+async def test_an_unknown_provider_in_the_catalogue_is_422() -> None:
+    async with _client() as client:
+        response = await client.get("/api/v1/admin/models/available?provider=nope")
+    assert response.status_code == 422

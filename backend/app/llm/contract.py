@@ -241,6 +241,15 @@ class ProviderError(LlmError):
         super().__init__(f"{provider}/{model}: {message}")
 
 
+class ProviderUnavailableError(LlmError):
+    """A route names a provider this process has no adapter for.
+
+    Distinct from AllProvidersFailedError, which is about a chain that WAS tried:
+    this one means an adapter never existed, which is a configuration problem
+    rather than a provider problem.
+    """
+
+
 class ProviderRateLimitError(ProviderError):
     """Provider returned 429. Retryable, and a reason to fall back."""
 
