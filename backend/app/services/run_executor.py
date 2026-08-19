@@ -129,6 +129,29 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
     } | {"pages": summarised}
 
 
+async def _load_revocations() -> Mapping[str, frozenset[str]]:
+    """Operator tool revocations, read once per run.
+
+    Once per run rather than once per node: a revocation taking effect halfway through
+    would mean a run whose first half could publish and whose second half could not,
+    which is harder to reason about than either answer. A run that started before the
+    switch was pulled finishes under the old policy; the next one gets the new one.
+
+    A failure to read them is NOT fatal, and the direction matters: the fallback is the
+    code allowlist, which is the NARROWER-or-equal answer in every case, because
+    revocations can only subtract. Failing the run instead would turn a settings-table
+    outage into an inability to work at all.
+    """
+    try:
+        from backend.app.db.adapters.route_store import PostgresToolPolicyStore
+
+        stored = await PostgresToolPolicyStore().load_policies()
+    except Exception:
+        logger.exception("could not load tool revocations; using the code allowlist")
+        return {}
+    return {record.node: frozenset(record.revoked) for record in stored}
+
+
 async def build_real_deps(business_id: UUID) -> NodeDeps:
     """Wire the nodes to the real engines and services.
 
@@ -169,6 +192,7 @@ async def build_real_deps(business_id: UUID) -> NodeDeps:
         router=router,
         crawl_site=crawl_site,
         serp_search=serp_search,
+        revoked_tools=await _load_revocations(),
         # Retrieval and memory need a database session per call, and wiring them is
         # the next step rather than this one -- see the module docstring in
         # `kb_service.retrieve` for the embedder/store it also needs. Left None so

@@ -47,9 +47,7 @@ def _report() -> CostReport:
         default_run_cap_usd="0.50000000",
         runs_in_window=1,
         runs_at_cap=0,
-        top_runs=[
-            RunSpend(run_id=uuid4(), usd="0.02100000", cap_usd="0.50000000", at_cap=False)
-        ],
+        top_runs=[RunSpend(run_id=uuid4(), usd="0.02100000", cap_usd="0.50000000", at_cap=False)],
         ledger_wired=True,
         message="fixture",
     )

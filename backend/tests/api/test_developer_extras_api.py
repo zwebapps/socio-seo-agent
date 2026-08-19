@@ -292,9 +292,14 @@ async def test_the_tools_screen_reports_the_ceiling_the_policy_and_the_effect() 
     assert "web_search" in nodes["GENERATE"]["granted"]
     assert "web_search" not in nodes["GENERATE"]["effective"]
     assert body["actuatorTools"] == ["notify", "publish"]
-    # The screen must not imply a kill switch is armed when the graph does not read the
-    # policy yet.
-    assert body["enforced"] is False
+    # `enforced` was False while `agents/nodes._toolbox` still built its allowlist from
+    # NODE_TOOLS directly -- a revocation was stored, shown and computed but not
+    # honoured. That argument is now wired, so the screen may say the switch is armed,
+    # and `test_the_screen_reports_enforcement_that_actually_happens` checks the flag
+    # against the runtime rather than against a literal.
+    assert body["enforced"] is True
+    # Unchanged, and it is about GRANTING rather than enforcement: revoking is
+    # expressible here and granting is a code change, which stays true either way.
     assert "cannot be switched on" in body["policy"]
 
 

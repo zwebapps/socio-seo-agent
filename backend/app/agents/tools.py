@@ -201,11 +201,20 @@ class NodeToolbox:
 
     node: str
     implementations: Mapping[str, ToolImpl] = field(default_factory=dict)
+    #: Operator revocations for this node, from `node_tool_policies`.
+    #:
+    #: Subtracted from the code allowlist, never added to it. The direction is the
+    #: security property, and it holds structurally: a set DIFFERENCE cannot produce a
+    #: member its left operand did not have, so no stored value -- garbage, hostile, or
+    #: naming another node's tools -- can widen what this node reaches. That is why the
+    #: settings table has a `revoked` column and no `granted` one.
+    revoked: frozenset[str] = frozenset()
     _refusals: list[ToolRefusal] = field(default_factory=list, init=False, repr=False)
 
     @property
     def allowed(self) -> frozenset[str]:
-        return allowed_tools(self.node)
+        """The code ceiling, minus whatever an operator has revoked."""
+        return allowed_tools(self.node) - self.revoked
 
     @property
     def refusals(self) -> tuple[ToolRefusal, ...]:

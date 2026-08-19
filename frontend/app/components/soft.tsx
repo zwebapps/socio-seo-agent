@@ -295,6 +295,7 @@ export function SoftTile({
  *   neumorphic slider has two boundaries to make perceivable, and shadow carries neither.
  */
 export function SoftRange({
+  controlId,
   value,
   onChange,
   min,
@@ -306,12 +307,21 @@ export function SoftRange({
   disabled = false,
   className = "",
 }: {
+  /**
+   * Unique DOM id, supplied by the CALLER rather than derived from `label`.
+   *
+   * This was derived from the label text, and that was a real bug found in a browser:
+   * two rows expanded at once produced two `id="range-temperature"` inputs, so
+   * `label[for=...]` bound to the first and the second slider had no accessible name at
+   * all. A component cannot know how many of itself are on a page; the caller can.
+   */
+  controlId: string;
   value: number;
   onChange: (next: number) => void;
   min: number;
   max: number;
   step: number;
-  /** Visible label text. Rendered, and also the control's accessible name. */
+  /** Visible label text. Rendered, and — via `htmlFor` — the control's accessible name. */
   label: string;
   /** Human-readable form of the current value, announced instead of the bare number. */
   valueText: string;
@@ -320,13 +330,11 @@ export function SoftRange({
   disabled?: boolean;
   className?: string;
 }) {
-  const id = `range-${label.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
-
   return (
     <div className={className}>
       <div className="mb-1.5 flex items-baseline justify-between gap-3">
         <label
-          htmlFor={id}
+          htmlFor={controlId}
           className="text-[11px] font-semibold uppercase tracking-wider"
           style={{ color: "var(--text-muted)" }}
         >
@@ -339,7 +347,7 @@ export function SoftRange({
         </span>
       </div>
       <input
-        id={id}
+        id={controlId}
         type="range"
         className="soft-range"
         min={min}

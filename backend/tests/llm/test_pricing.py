@@ -128,3 +128,42 @@ def test_token_estimate_over_counts_on_purpose() -> None:
     assert conservative_token_estimate(text) > len(text) // 4  # vs the ~4 average
     assert conservative_token_estimate("") == 0
     assert conservative_token_estimate("a") == 1  # never rounds down to zero
+
+
+# --------------------------------------------------------------------------- #
+# Display formatting
+# --------------------------------------------------------------------------- #
+
+
+def test_a_zero_amount_formats_as_fixed_point_not_scientific_notation() -> None:
+    """The bug this function exists for. `compute_usd` quantises, and
+    `str(Decimal("0").quantize(USD_QUANTUM))` is `"0E-8"` -- which is a correct Decimal
+    repr and reached a live screen as "Guard reserves $0E-8 per call" for a free-tier
+    embedding model. Two separate screens got this wrong independently before the
+    formatter was shared."""
+    from backend.app.llm.pricing import compute_usd, format_usd
+
+    assert format_usd(Decimal("0")) == "0.00000000"
+    assert format_usd(compute_usd("openai/text-embedding-3-small", 1000, 0)) == "0.00002000"
+    # An embedding call has no output tokens, so its output rate is a true zero -- the
+    # exact case that produced 0E-8.
+    assert format_usd(compute_usd("fake/embed", 1000, 1000)) == "0.00000000"
+
+
+def test_every_amount_shares_one_scale_so_a_screen_never_mixes_formats() -> None:
+    """`0` beside `0.02100000` reads as two different units. Quantising to the ledger
+    column's own scale is what keeps a column of figures aligned and comparable."""
+    from backend.app.llm.pricing import format_usd
+
+    rendered = [format_usd(Decimal(v)) for v in ("0", "0.021", "0.5", "12")]
+
+    assert rendered == ["0.00000000", "0.02100000", "0.50000000", "12.00000000"]
+    assert len({len(r.split(".")[1]) for r in rendered}) == 1, "inconsistent decimal places"
+
+
+def test_formatting_does_not_alter_the_value() -> None:
+    """It is a display helper, not arithmetic. A caller must be able to round-trip."""
+    from backend.app.llm.pricing import format_usd
+
+    for raw in ("0", "0.021", "3.14159265", "999.99999999"):
+        assert Decimal(format_usd(Decimal(raw))) == Decimal(raw)

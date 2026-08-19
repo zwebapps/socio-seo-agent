@@ -24,6 +24,7 @@ from backend.app.agents.tools import (
     NODE_TOOLS,
     PUBLISH,
     WEB_SEARCH,
+    NodeToolbox,
     allowed_tools,
 )
 from backend.app.db.models import NodeToolPolicy
@@ -161,13 +162,23 @@ def test_a_stale_revocation_is_surfaced_rather_than_silently_dropped() -> None:
     assert PUBLISH not in generate.effective
 
 
-def test_the_screen_admits_the_revocation_is_not_yet_enforced_at_runtime() -> None:
-    """The graph builds its toolbox from `NODE_TOOLS` directly and does not read this
-    policy yet. A UI implying a kill switch is armed when it is not would be worse than no
-    UI, so the flag is reported and this test pins it to reality.
+def test_the_screen_reports_enforcement_that_actually_happens() -> None:
+    """REPLACES `test_the_screen_admits_the_revocation_is_not_yet_enforced_at_runtime`.
 
-    When the one-argument change in `agents/nodes._toolbox` lands, flip `RUNTIME_ENFORCED`
-    and this assertion with it.
+    That test asserted `RUNTIME_ENFORCED is False`, and its own docstring said to flip it
+    when the wiring landed. The wiring has landed -- `agents/nodes._toolbox` passes the
+    revocations into `NodeToolbox(revoked=...)` -- so the old assertion now pins an
+    honest-but-unfinished state that no longer exists.
+
+    The replacement is stronger in kind, not just in value. Rather than asserting the
+    constant equals a literal, it asserts the constant AGREES WITH THE BEHAVIOUR, by
+    revoking a tool and checking the toolbox actually refuses it. So the flag and the
+    runtime cannot drift apart in either direction -- and a flag claiming enforcement
+    that does not happen is the failure mode this whole surface was careful about.
     """
-    assert RUNTIME_ENFORCED is False
-    assert all(v.enforced is False for v in describe_node_tools())
+    box = NodeToolbox(node="EXPORT", revoked=frozenset({PUBLISH}))
+    actually_enforced = not box.allows(PUBLISH)
+
+    assert actually_enforced is True, "the runtime must honour a revocation"
+    assert actually_enforced == RUNTIME_ENFORCED
+    assert all(view.enforced is True for view in describe_node_tools())

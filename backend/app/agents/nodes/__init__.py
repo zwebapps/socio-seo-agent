@@ -135,6 +135,12 @@ class NodeDeps:
     #: page written to two different sets of rules.
     load_memory: Callable[[], Awaitable[list[str]]] | None = None
     channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
+    #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
+    #:
+    #: Injected like every other dependency rather than read here, because the nodes
+    #: must stay database-free: a `_toolbox` that queried a table would put I/O behind
+    #: a property and make every node test need Postgres.
+    revoked_tools: Mapping[str, frozenset[str]] | None = None
 
 
 def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
@@ -163,8 +169,17 @@ def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
 
 
 def _toolbox(node: str, deps: NodeDeps) -> NodeToolbox:
-    """The gate this node's tool calls pass through."""
-    return NodeToolbox(node=node, implementations=_implementations(deps))
+    """The gate this node's tool calls pass through.
+
+    This is the one call site the tool-policy service's docstring pointed at: until it
+    passed `revoked`, an operator's revocation was stored, displayed and computed but
+    NOT honoured by the running graph -- a kill switch that did nothing, which is worse
+    than no kill switch because somebody would believe they had pulled it.
+    """
+    revoked = (deps.revoked_tools or {}).get(node, frozenset())
+    return NodeToolbox(
+        node=node, implementations=_implementations(deps), revoked=frozenset(revoked)
+    )
 
 
 def _with_refusals(state: AgentState, box: NodeToolbox, updates: dict[str, Any]) -> dict[str, Any]:

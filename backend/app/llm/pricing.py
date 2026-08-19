@@ -96,6 +96,22 @@ PRICE_TABLE: Mapping[str, ModelPrice] = dict(
 )
 
 
+def format_usd(value: Decimal) -> str:
+    """Render a USD amount for display, quantised and in fixed-point notation.
+
+    Lives here, beside the quantum it uses, because two separate screens each need it and
+    each got it wrong independently the first time. `str()` on a quantised `Decimal` zero
+    is `"0E-8"` -- a correct `Decimal` repr and an absurd thing to print beside a currency
+    symbol, which is exactly what a free-tier embedding model produced on the sampling
+    screen. `:f` forces fixed point, and quantising first means every figure on a screen
+    shares the ledger column's own scale instead of `0` sitting next to `0.02100000`.
+
+    Formatting only. Every amount reaching this function was already computed in
+    `Decimal`; nothing here changes a value, and no caller may substitute `float`.
+    """
+    return f"{value.quantize(USD_QUANTUM):f}"
+
+
 def is_priced(model: str) -> bool:
     """Whether `model` has a price-table entry."""
     return model in PRICE_TABLE

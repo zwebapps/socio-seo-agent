@@ -261,6 +261,7 @@ function SamplingRow({
 
           <div>
             <SoftRange
+              controlId={`temperature-${row.taskClass}`}
               label="Temperature"
               value={temperature}
               onChange={setTemperature}
@@ -282,9 +283,11 @@ function SamplingRow({
               ) : row.modelsRejectingTemperature.length > 0 ? (
                 <>
                   Applies to some of this chain only —{" "}
-                  {row.modelsRejectingTemperature.join(", ")} reject{" "}
-                  <code>temperature</code> outright, and the value is skipped for them
-                  rather than failing the call. 0 is repeatable; higher is more varied.
+                  {row.modelsRejectingTemperature.join(", ")}{" "}
+                  {row.modelsRejectingTemperature.length === 1 ? "rejects" : "reject"}{" "}
+                  <code>temperature</code> outright, and the value is skipped for{" "}
+                  {row.modelsRejectingTemperature.length === 1 ? "it" : "them"} rather than
+                  failing the call. 0 is repeatable; higher is more varied.
                 </>
               ) : (
                 <>
@@ -299,6 +302,7 @@ function SamplingRow({
 
           <div>
             <SoftRange
+              controlId={`ceiling-${row.taskClass}`}
               label="Output ceiling"
               value={maxTokens}
               onChange={setMaxTokens}

@@ -44,7 +44,7 @@ from sqlalchemy.orm import InstrumentedAttribute
 from backend.app.agents.state import DEFAULT_MAX_USD
 from backend.app.db.models import ModelUsage, Run
 from backend.app.db.session import business_session
-from backend.app.llm.pricing import USD_QUANTUM, is_priced
+from backend.app.llm.pricing import format_usd, is_priced
 
 #: Default reporting window. Thirty days covers a monthly bill conversation, which is
 #: the question this screen exists to answer.
@@ -146,19 +146,12 @@ def _window(days: int) -> tuple[int, datetime]:
 def _usd(value: Decimal | None) -> str:
     """Render a possibly-absent SUM as a money string.
 
-    Three things this handles. ``SUM`` over no rows is SQL NULL, not zero, and
-    ``str(None)`` would put the literal text ``None`` on a dashboard. The result is
-    quantised to :data:`USD_QUANTUM` -- the same scale the ledger column uses -- so an
-    empty window reads ``0.00000000`` rather than ``0``, matching every populated figure
-    beside it. And it is formatted with ``:f`` rather than ``str()``, because
-    ``str(Decimal("0").quantize(USD_QUANTUM))`` is ``"0E-8"`` -- scientific notation,
-    which is a correct Decimal repr and an absurd thing to print next to a currency
-    symbol.
-
-    Formatting only: the arithmetic already happened in ``Decimal``.
+    The only thing this adds over :func:`~backend.app.llm.pricing.format_usd` is the
+    NULL case: ``SUM`` over no rows is SQL NULL, not zero, and ``str(None)`` would put the
+    literal text ``None`` on a dashboard. Quantisation and fixed-point notation come from
+    the shared formatter, so this screen and the sampling screen cannot drift.
     """
-    quantised = (value if value is not None else Decimal("0")).quantize(USD_QUANTUM)
-    return f"{quantised:f}"
+    return format_usd(value if value is not None else Decimal("0"))
 
 
 #: The dimension a breakdown groups by. Typed as the mapped attribute rather than

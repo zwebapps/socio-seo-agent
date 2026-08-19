@@ -37,7 +37,7 @@ from backend.app.db.adapters.route_store import (
 from backend.app.db.models import Role, User
 from backend.app.llm import ModelTier, TaskClass, config_status
 from backend.app.llm.catalogue import CatalogueModel, list_models
-from backend.app.llm.pricing import compute_usd, is_priced
+from backend.app.llm.pricing import compute_usd, format_usd, is_priced
 from backend.app.llm.route_config import KEYLESS_PROVIDERS, RouteResolver
 from backend.app.llm.router import DEFAULT_MAX_OUTPUT_TOKENS
 from backend.app.llm.sampling import (
@@ -596,7 +596,7 @@ def _reservation(model: str, max_tokens: int | None) -> tuple[str | None, int | 
     tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_OUTPUT_TOKENS
     reserved = compute_usd(model, 0, tokens)
     fits = int(DEFAULT_MAX_USD / reserved) if reserved > 0 else None
-    return str(reserved), fits
+    return format_usd(reserved), fits
 
 
 @router.get("/sampling", response_model=SamplingListOut, response_model_by_alias=True)

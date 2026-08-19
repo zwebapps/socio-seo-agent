@@ -37,13 +37,16 @@ most useful thing this screen can offer. Revoking `web_search` from GENERATE for
 node onto the business's own material. Revoking `crawl.site` from HARVEST stops the
 runtime fetching a site whose owner has asked us to stop.
 
-**Honesty about enforcement.** The runtime reads its allowlist inside
-`agents/nodes._toolbox`, which constructs `NodeToolbox(node=...)` and lets the property
-resolve `allowed_tools(node)`. Wiring a stored revocation in is one argument at that
-call site, and it is NOT done yet -- so :func:`describe_node_tools` reports
-``enforced=False`` and the screen says so out loud, per the claims discipline in
-CLAUDE.md. A UI that implied a revocation was live when it was not would be worse than
-no UI: an operator would believe they had pulled a kill switch.
+**Enforcement.** The runtime reads its allowlist inside `agents/nodes._toolbox`,
+which now passes the stored revocations into `NodeToolbox(revoked=...)`; the property
+subtracts them from `allowed_tools(node)`. So :func:`describe_node_tools` reports
+``enforced=True``, and that claim is backed by a test that drives a real node through
+the real graph with a revocation in place rather than by this sentence.
+
+Until that argument was wired, a revocation was stored, displayed and computed but not
+honoured -- and the screen said so out loud, because a UI implying a live kill switch
+that did nothing would be worse than no UI at all. Recorded here because the honest
+intermediate state is the part that is easy to skip.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -57,10 +60,16 @@ from backend.app.agents.tools import (
     allowed_tools,
 )
 
-#: True once a stored revocation is honoured by the running graph. See the module
-#: docstring: flipping this is one argument at `agents/nodes._toolbox`, and it is a
-#: single flag rather than a per-node condition because the seam is one call site.
-RUNTIME_ENFORCED = False
+#: True: a stored revocation IS honoured by the running graph.
+#:
+#: `agents/nodes._toolbox` now passes the revocations into `NodeToolbox(revoked=...)`,
+#: and `NodeToolbox.allowed` subtracts them from the code allowlist. One flag rather
+#: than a per-node condition because the seam is one call site.
+#:
+#: This is a claim the UI repeats to an operator, so it is asserted rather than
+#: believed: `test_a_revocation_is_honoured_by_the_running_graph` drives a real node
+#: through the real graph with a revocation in place and proves the tool is refused.
+RUNTIME_ENFORCED = True
 
 
 class NodeToolPolicyRecord(BaseModel):

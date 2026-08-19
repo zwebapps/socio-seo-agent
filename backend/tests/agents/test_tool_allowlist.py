@@ -17,6 +17,7 @@ places would have diverged the first time a node grew a capability in a hurry.
 import re
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -333,3 +334,100 @@ def test_the_landing_audit_belongs_to_the_node_with_no_model_in_it() -> None:
     that grades it."""
     assert "landing.check" in NODE_TOOLS["VALIDATE"]
     assert "landing.check" not in NODE_TOOLS["CONVERT"]
+
+
+# --------------------------------------------------------------------------- #
+# Revocations are honoured by the RUNNING graph, not merely stored
+# --------------------------------------------------------------------------- #
+
+
+def test_a_revocation_narrows_what_a_node_may_call() -> None:
+    """The wiring `services/tool_policy` pointed at, now done.
+
+    Until `_toolbox` passed `revoked`, an operator's revocation was stored, displayed
+    and computed but NOT honoured by the running graph -- a kill switch that did
+    nothing, which is worse than no kill switch because somebody would believe they
+    had pulled it.
+    """
+    ceiling = allowed_tools("EXPORT")
+    assert "publish" in ceiling, "the fixture depends on EXPORT holding publish"
+
+    box = NodeToolbox(node="EXPORT", revoked=frozenset({"publish"}))
+
+    assert box.allows("publish") is False
+    assert box.allowed == ceiling - {"publish"}
+
+
+def test_a_revocation_cannot_widen_the_allowlist() -> None:
+    """The security property, and it holds STRUCTURALLY rather than by validation.
+
+    `allowed` is a set DIFFERENCE, so it cannot produce a member its left operand did
+    not have. Garbage, another node's tools, or the entire vocabulary all narrow or do
+    nothing -- which is why the settings table has a `revoked` column and no `granted`
+    one, and why no input sanitising is needed here.
+    """
+    ceiling = allowed_tools("GENERATE")
+
+    for hostile in (
+        frozenset({"publish"}),  # an actuator this node must never hold
+        frozenset(KNOWN_TOOLS),  # the whole vocabulary
+        frozenset({"../../etc/passwd", ""}),  # nonsense
+    ):
+        assert NodeToolbox(node="GENERATE", revoked=hostile).allowed <= ceiling
+
+
+async def test_a_revocation_is_honoured_by_the_running_graph() -> None:
+    """End to end through `build_nodes`, because the claim is about the RUNTIME.
+
+    `describe_node_tools` reports `enforced=True` to an operator, and a constant
+    asserting that would prove nothing. This drives a real node with a real toolbox and
+    shows the tool is refused -- and, critically, that the node still produces its
+    output, because an attacker must not be able to end a run by causing a refusal.
+    """
+    from backend.app.agents.nodes import NodeDeps, build_nodes
+    from backend.app.agents.state import new_state
+
+    crawled: list[str] = []
+
+    async def crawl(url: str) -> dict[str, object]:
+        crawled.append(url)
+        return {"pages": []}
+
+    state = new_state(business_id=uuid4(), goal="more leads")
+    state["dna"] = {"website": "https://mueller.example", "locale": "de"}
+
+    # Same deps twice, once with `crawl.site` revoked from HARVEST.
+    permitted = build_nodes(NodeDeps(router=object(), crawl_site=crawl))
+    revoked = build_nodes(
+        NodeDeps(
+            router=object(),
+            crawl_site=crawl,
+            revoked_tools={"HARVEST": frozenset({"crawl.site"})},
+        )
+    )
+
+    await permitted["HARVEST"](state)
+    assert crawled == ["https://mueller.example"], "the control: it crawls when permitted"
+
+    crawled.clear()
+    result = await revoked["HARVEST"](state)
+
+    assert crawled == [], "revoked means the implementation is never reached"
+    assert result is not None, "the node must still return; a refusal is not a run-ender"
+
+
+def test_the_enforcement_flag_matches_reality() -> None:
+    """REPLACES the assertion that `RUNTIME_ENFORCED is False`.
+
+    That test was correct while the wiring was absent and is now exactly wrong -- it
+    would pin the honest-but-unfinished state forever. It is replaced rather than
+    deleted, and by something stronger: instead of asserting the constant's value, this
+    asserts the constant AGREES with the behaviour, so the two cannot drift. A flag
+    claiming enforcement that does not happen is the failure mode worth guarding.
+    """
+    from backend.app.services.tool_policy import RUNTIME_ENFORCED
+
+    box = NodeToolbox(node="EXPORT", revoked=frozenset({"publish"}))
+    actually_enforced = not box.allows("publish")
+
+    assert actually_enforced == RUNTIME_ENFORCED
