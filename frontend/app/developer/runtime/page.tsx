@@ -62,11 +62,49 @@ export default function RuntimePage() {
   return (
     <main className="mx-auto w-full max-w-[1800px] px-6 lg:px-10 xl:px-14 py-12">
       <PageHeader title="Sampling and prompts">
-        How much freedom each task class gets, and how long its answer may be. Changes take
-        effect on the next run — no redeploy. A task with nothing set sends no sampling
-        parameters at all and takes the provider default, which is what every call does
-        today.
+        Model execution policies: how much freedom each task class gets, and how long its
+        answer may be. Changes take effect on the next run — no redeploy. A task with nothing
+        set sends no sampling parameters at all and takes the provider default, which is what
+        every call does today.
       </PageHeader>
+
+      {/*
+        The distinction this screen used to blur, stated before either section rather than
+        left for a reader to infer from two lists of different lengths. A TASK CLASS is what
+        a model call is FOR; a GRAPH NODE is a step in the run. Two nodes doing the same kind
+        of work share one task class, which is why `EXTRACT` and `PRIORITISE` appear with no
+        node of that name and why `EMBED` is a tier rather than a step in any graph. Both
+        counts come from the server, each derived from its own source of truth.
+      */}
+      {prompts.data && (
+        <SoftWell className="mb-8 p-4">
+          <div className="flex flex-wrap gap-x-10 gap-y-3">
+            <div>
+              <p className="text-xs uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+                Model policies
+              </p>
+              <p className="text-sm font-semibold">
+                {prompts.data.taskClassCount} task classes
+              </p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+                Agent workflow
+              </p>
+              <p className="text-sm font-semibold">
+                {prompts.data.graphNodeCount === null
+                  ? "node count unavailable"
+                  : `${prompts.data.graphNodeCount} graph nodes`}
+              </p>
+            </div>
+            <p className="max-w-xl text-xs leading-relaxed" style={{ color: "var(--text-muted)" }}>
+              These are different numbers on purpose. A task class is what a model call is{" "}
+              <em>for</em>; a graph node is a step in the run. Two nodes doing the same kind of
+              work share one task class, and two nodes make no model call at all.
+            </p>
+          </div>
+        </SoftWell>
+      )}
 
       {error && (
         <ErrorCard

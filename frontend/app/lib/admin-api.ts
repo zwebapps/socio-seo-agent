@@ -132,6 +132,19 @@ export type PromptVersions = {
   selectable: boolean;
   evalHarnessNote: string;
   summary: string;
+  /**
+   * How many nodes the graph runs, read from `graph.ORDER` on the server. `null` when it
+   * could not be read — render nothing rather than a plausible number.
+   */
+  graphNodeCount: number | null;
+  /**
+   * How many model-routing task classes exist. **Never the node count.** These arrive as
+   * two fields because they are two concepts: a graph node is a step in the run, a task
+   * class is what a model call is FOR, and two nodes doing the same kind of work share one
+   * class. Rendering one number for both is what made this screen claim the graph had
+   * eight nodes when it has eleven.
+   */
+  taskClassCount: number;
 };
 
 /* --------------------------------------------------------------------------- */

@@ -54,7 +54,13 @@ from backend.app.llm.sampling import (
     validate_max_output_tokens,
     validate_temperature,
 )
-from backend.app.services.prompt_inventory import EVAL_HARNESS_NOTE, PromptSurface, prompt_surfaces
+from backend.app.services.prompt_inventory import (
+    EVAL_HARNESS_NOTE,
+    PromptSurface,
+    graph_node_count,
+    prompt_surfaces,
+    task_class_count,
+)
 from backend.app.services.tool_policy import (
     RUNTIME_ENFORCED,
     NodeToolPolicyRecord,
@@ -813,6 +819,17 @@ class PromptVersionsOut(CamelModel):
     selectable: bool
     eval_harness_note: str
     summary: str
+    #: How many nodes the graph runs, from `graph.ORDER` itself. `None` when it could not
+    #: be read, which the screen states rather than replacing with a guess.
+    #:
+    #: Sent SEPARATELY from `task_class_count`, and that separation is the point: these are
+    #: two different concepts that were being conflated on this screen. A graph node is a
+    #: step in the run; a task class is what a model call is FOR. Two nodes doing the same
+    #: kind of work share one task class, so the numbers are not meant to match and a
+    #: single count would invite exactly the false claim this replaced.
+    graph_node_count: int | None
+    #: How many model-routing task classes exist. Never the node count.
+    task_class_count: int
 
 
 @router.get("/prompt-versions", response_model=PromptVersionsOut, response_model_by_alias=True)
@@ -826,10 +843,13 @@ async def list_prompt_versions(
     """
     surfaces = prompt_surfaces()
     selectable = any(s.variants > 1 for s in surfaces)
+    nodes, _unreadable = graph_node_count()
     return PromptVersionsOut(
         surfaces=surfaces,
         selectable=selectable,
         eval_harness_note=EVAL_HARNESS_NOTE,
+        graph_node_count=nodes,
+        task_class_count=task_class_count(),
         summary=(
             f"{len(surfaces)} prompt surface(s), each with exactly one version defined in "
             "code, so there is nothing here to choose between. A version is recorded on "

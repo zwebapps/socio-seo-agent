@@ -729,7 +729,23 @@ A1 is the first code to create.
   the two notes appear only when the run genuinely published neither; the amended test
   asserts a fabricated code still fails.**
 
-- [ ] **A1c · `/developer/runtime` says "Graph nodes (all eight)" and the graph has ELEVEN**
+- [x] **A1c · `/developer/runtime` says "Graph nodes (all eight)" and the graph has ELEVEN**
+  — the label is DERIVED now: `graph_node_count()` reads `graph.ORDER` through the same lazy
+  `importlib` path the version constants use, because a module-level `import graph` here would
+  pull nodes/tools/engines into every HTTP process — which is what this module was written to
+  avoid. `_DECLARED` carries an EMPTY label for that row, so there is no literal left to drift.
+  `graphNodeCount` (11) and `taskClassCount` (8) ship as two separate API fields and render as
+  two labelled figures, because a single count is what let a reader believe they were the same
+  concept. Four tests, and the load-bearing one extends `ORDER` under `mock.patch` and asserts
+  the displayed count FOLLOWS — asserting against `len(ORDER)` once would pass on a second
+  hardcoded literal that happened to be right the day it was written. An unreadable graph
+  renders a bare "Graph nodes" rather than any number. Verified live against a real admin
+  session. The eight TaskClass cards were left untouched, per the founder's ruling.
+  **Found while verifying, and fixed with it:** `PromptSurface` had no alias generator, so
+  `how_to_change` shipped snake_case while the screen read `surface.howToChange` — the one
+  sentence telling an operator how to change a prompt version rendered as `undefined`, which
+  React shows as nothing. An outer model's `response_model_by_alias` does not reach a nested
+  model.
   — found by the founder reviewing the screen, and it is a claims-discipline defect of exactly
   the kind this project keeps finding: a hardcoded count that drifts from the code it describes.
   `services/prompt_inventory.py:69` hardcodes the label `"Graph nodes (all eight)"` and its
