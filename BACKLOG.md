@@ -564,3 +564,65 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   `pnpm build` exercises the same compile-and-typecheck path with the test files present
   and `--frozen-lockfile` is verified, so the risk is low — but low is not verified, and CI
   is where it will be found out.
+
+## Publishing, built (2026-08-20)
+
+The architecture named an Actuator layer, `docs/AGENT_RUNTIME.md` §3 tabulated EXPORT and
+MEASURE, and none of it existed: `publish`/`notify` were string constants, `EXPORT` was in
+the allowlist and not in `graph.ORDER`, `backend/app/actuators/` did not exist, and a
+repo-wide grep for `oauth|access_token|graph.facebook|linkedin.com/v2` returned nothing.
+
+- [x] **The actuator layer** — `backend/app/actuators/`. `actuate()` is the only entry
+  point and owns idempotency, approval and audit, so a new integration cannot forget
+  them. Claim-the-key-before-calling is the ordering that turns a crash mid-call into an
+  `in_flight` row a human can chase instead of an invisible gap a retry turns into a
+  double post. Never raises: its caller is a graph node, and a node that dies on a failed
+  publish takes the rest of the run's output with it.
+- [x] **EXPORT and MEASURE in `ORDER`, after REVIEW and unreachable without it** — in both
+  runtimes, so "nothing publishes without a human" is a property of the machine. The
+  subtle half: REVIEW's LangGraph router would have returned EXPORT via `_next_unvisited`,
+  routing AROUND the edge `interrupt_before` is armed on.
+- [x] **`POST /api/v1/runs/{id}/approve`** — the human decision, finally reachable.
+  Nothing recorded WHO approved a run, so EXPORT's no-approver refusal fired on every run.
+  The approver is the authenticated user and lands on every `actions` row.
+- [x] **The email actuator** (`notify.email`) — the one channel with no App Review. Legal
+  checks run BEFORE the fake/real branch, because a refusal that only fires once a key is
+  set is a refusal first exercised on a real recipient.
+- [x] **`platform_connections` + AES-256-GCM at rest** — business-scoped with RLS, secrets
+  masked on every print path, bound to `business|platform` so a ciphertext moved between
+  rows will not open.
+- [x] **The Tier-3 export pack** (`GET /runs/{id}/export`, JSON + markdown) and a Delivery
+  tab that cannot render a simulated send as a delivered one.
+- [x] **Actuators wired into real runs.** Verified end to end: approve → EXPORT → MEASURE,
+  with the ledger reading `publish.page succeeded simulated=true`, `social.post refused
+  "no linkedin connection"`, and `notify_note: "no email address on record"` — three
+  different reasons, none of them a silent skip.
+
+### Open, and each one is honest about why
+
+- [ ] ⛔ **Tier 1 direct publish is gated on per-platform App Review**, not on code: Meta
+  (screencast, privacy policy, business verification; 2–6 weeks, refusable), LinkedIn
+  Marketing Developer Platform, TikTok audit. No real `OAuthProvider` and no
+  `SocialPublisher` exist deliberately — neither could be exercised by this suite or by
+  hand, and untested code pretending to be a feature is worse than a stated gap.
+- [ ] ⛔ **A real email send needs `RESEND_API_KEY`.** Every mapping is written against
+  Resend's documented error envelope and exercised through `MockTransport`; what a key
+  would prove is the actual status codes, that a 200 always carries `id`, and that
+  `List-Unsubscribe` survives delivery.
+- [ ] **No connect/callback/disconnect API routes** for platform connections. The store,
+  the cipher and the OAuth seam are done and tested; nothing exposes them, so a business
+  cannot connect an account even to the fake provider.
+- [ ] **`nodes._notify_owner` builds a `notify.email` the email actuator refuses** — no
+  sender, no body, no unsubscribe, no consent basis. Either that node supplies them or
+  owner notifications get their own action type with transactional rules. Widening
+  `CONSENT_BASES` to make it pass would throw away the point of the check.
+- [ ] **`publish.page` is simulated even though the page is served by this app.**
+  `publish_landing_page` exists with no caller, so "publishing" a landing page is a status
+  change nobody makes. This is the cheapest real publish left and it needs no credential.
+- [ ] **MEASURE reports the attribution PATH, not lead counts.** Real counts need a
+  lead-store read, which is outside its documented grants (`geo.probe`,
+  `analytics.fetch`), so it states `leads_measured: false` with the reason.
+- [ ] **The weekly published-pieces-per-business cap** (`ARCHITECTURE.md` §8) is not
+  implemented; it needs a cross-run ledger read the node cannot make hermetically today.
+- [ ] **The Docker `images` CI job is still unverified** against the new frontend test
+  files — the local build ran past 15 minutes twice and was killed.

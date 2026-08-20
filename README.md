@@ -98,6 +98,27 @@ make images           # build both Docker images
 make ragas-env        # build .venv-ragas, only needed for `evals/run.py --ragas`
 ```
 
+### Publishing, and what it honestly does
+
+The graph stops at a human gate. `POST /api/v1/runs/{id}/approve` is what lets it past —
+EXPORT and MEASURE sit *after* REVIEW in the machine and are unreachable without it, so
+"nothing publishes without a person" is structural rather than a convention.
+
+What happens then depends on the destination, and the product says which:
+
+| Destination | Today |
+|---|---|
+| **Export pack** (every channel) | Real. `GET /api/v1/runs/{id}/export` as JSON or markdown, plus a screen — text to paste, which works on channels no API can reach |
+| **Email** | Real the moment `RESEND_API_KEY` is set. Refuses a send with no unsubscribe link in the body, no sender identity, or no recorded consent basis |
+| **Social** (LinkedIn, Facebook, Instagram) | Refuses with *"no connection — connect the account first"*. Direct publishing needs per-platform App Review, which is weeks of someone else's process, not code |
+| **Landing page** | Simulated, visibly. The page is served by this app; wiring the status change is the cheapest real publish left |
+
+**A simulated send is never rendered as a real one.** With no credential an actuator
+returns a real outcome marked `fake`, with a `fake://…` reference, and that flag travels
+to the ledger, the timeline and the Delivery tab. Attribution does not depend on any of
+it: the tracked short link works whether we posted or you pasted, which is the whole
+reason the lead loop is decoupled from publishing.
+
 ### Evaluating it
 
 `uv run python evals/run.py` writes [`evals/report.md`](evals/report.md) from 20 cases

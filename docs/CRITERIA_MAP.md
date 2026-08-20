@@ -26,7 +26,7 @@ a separate file would have been a second copy to let rot:
 | Clear agent purpose | one-sentence problem statement + the 5-link lead chain | [`PROBLEM.md`](../PROBLEM.md), `FEATURES.md` §0 | 1 |
 | Why useful | replaces a $500–850/mo tool stack or a $2–5k/mo agency; owns conversion + attribution, which content tools don't | [`PROBLEM.md`](../PROBLEM.md), `FEATURES.md` §1 | 1 |
 | Target users | SMB owner (primary) · in-house marketer · small agency | [`PROBLEM.md`](../PROBLEM.md) §3 | 1 |
-| Core functionality | 10-node graph: intake → harvest → opportunity → plan → generate → validate → repack → review → export → measure | `agents/graph.py` | 3–11 |
+| Core functionality | 11-node graph: intake → harvest → opportunity → plan → generate → **convert** → validate → repack → review → **export → measure**. EXPORT and MEASURE sit after the human interrupt and are unreachable without passing it, in both runtimes | `agents/graph.py`, `agents/state_graph.py`, `agents/nodes/` | 3–11 |
 | User interactions | onboarding, document upload, opportunity selection, edit, approve/reject, brand voice, tool toggles, model settings | `frontend/app/(app)/` | 2–12 |
 | User-friendly UI for **all** functionality | every backend capability has a screen; user mode vs `/developer` mode | `frontend/` | 2–13 |
 | Appropriate tools/libraries | LangGraph (`StateGraph`, genuinely imported — see the note below), FastAPI, Pydantic, pgvector, Next.js, Langfuse, **DeepEval** and **Ragas** (see the note below), Vitest + React Testing Library | `pyproject.toml`, `ARCHITECTURE.md` §5, §14 | — |
