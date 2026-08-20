@@ -94,6 +94,50 @@ export type RunReview = {
   /** What could NOT be gathered. Rendered so the screen never implies research happened. */
   factGaps: string[];
   errors: { node: string; code: string; message: string }[];
+  /** What EXPORT did, or `null` when it never ran — which is every unapproved run. */
+  published: Published | null;
+  publishedNote: string | null;
+  measurement: Measurement | null;
+  measurementNote: string | null;
+};
+
+/** One destination EXPORT tried, and what actually happened to it. */
+export type PublishedTarget = {
+  actionType: string;
+  target: string;
+  /** `succeeded` · `failed` · `refused`. A string, not a union: the server owns it. */
+  status: string;
+  externalRef: string | null;
+  error: string | null;
+  /**
+   * The field this type exists for. A destination whose post never left the process
+   * must be impossible to render as a success, and the only way to guarantee that on a
+   * screen is for the screen to be handed the fact.
+   */
+  simulated: boolean;
+  /** The actuator's own line, which already refuses to overstate. */
+  summary: string;
+};
+
+export type Published = {
+  /** EXPORT's own headline. Not recomputed here — it already folds "N of M". */
+  note: string;
+  attempted: number;
+  succeeded: number;
+  simulated: boolean;
+  notified: boolean;
+  notifyNote: string | null;
+  targets: PublishedTarget[];
+};
+
+export type Measurement = {
+  publishedRefs: number;
+  channels: string[];
+  simulated: boolean;
+  /** What was NOT measured, and why. Shown, or the rest reads as zero. */
+  gaps: string[];
+  leadsMeasured: boolean;
+  attributionNote: string | null;
 };
 
 export function fetchReview(runId: string): Promise<RunReview> {

@@ -25,6 +25,12 @@ const NOTES = {
   seo: "VALIDATE has not scored a draft for this run.",
   social: "REPACK has not written posts for this run.",
   ai: "GENERATE has not produced answer blocks for this run.",
+  published:
+    "Nothing has been published yet. EXPORT runs only after a human approves the run at " +
+    "the review gate — approving it is what lets it publish.",
+  measurement:
+    "Nothing has been measured yet. MEASURE runs after EXPORT, so there is nothing to " +
+    "measure until something has been published.",
 } as const;
 
 function review(over: Partial<RunReview> = {}): RunReview {
@@ -38,6 +44,10 @@ function review(over: Partial<RunReview> = {}): RunReview {
     socialNote: NOTES.social,
     aiBlocks: null,
     aiBlocksNote: NOTES.ai,
+    published: null,
+    publishedNote: NOTES.published,
+    measurement: null,
+    measurementNote: NOTES.measurement,
     opportunity: null,
     factGaps: [],
     errors: [],
@@ -253,5 +263,140 @@ describe("when the review itself cannot be loaded", () => {
 
     expect(screen.getByText("No such run for this business.")).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "Draft" })).not.toBeInTheDocument();
+  });
+});
+
+describe("Delivery panel", () => {
+  const simulatedLanding = {
+    actionType: "publish.page",
+    target: "landing_page",
+    status: "succeeded",
+    externalRef: "fake://publish.page/landing_page#8fe88144",
+    error: null,
+    simulated: true,
+    summary: "publish.page → landing_page: done (SIMULATED — no credential configured)",
+  };
+  const refusedLinkedin = {
+    actionType: "social.post",
+    target: "linkedin",
+    status: "refused",
+    externalRef: null,
+    error: "this business has no linkedin connection. Connect the account first.",
+    simulated: true,
+    summary: "social.post → linkedin: refused (this business has no linkedin connection)",
+  };
+
+  function delivered(over = {}) {
+    return review({
+      published: {
+        note: "Published 1 of 3; nothing was published to facebook, linkedin -- SIMULATED",
+        attempted: 3,
+        succeeded: 1,
+        simulated: true,
+        notified: false,
+        notifyNote: "Nobody was told: this business profile has no email address on record.",
+        targets: [simulatedLanding, refusedLinkedin],
+        ...over,
+      },
+    });
+  }
+
+  it("says the GATE is why nothing was published, not that something failed", async () => {
+    // The normal state of every unapproved run. "EXPORT has not run" must not read as
+    // "publishing is broken", because the reader's next action is completely different.
+    body = review();
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText(/approves the run at the review gate/i)).toBeInTheDocument();
+  });
+
+  it("never labels a simulated send as published", async () => {
+    // The single most important assertion on this screen. A simulated send carries
+    // `status: "succeeded"` — it DID succeed, at simulating — so anything colouring or
+    // labelling by status alone paints a dry run as a delivery.
+    body = delivered();
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    const landing = screen.getByText(/landing page/i).closest("div");
+    expect(landing).not.toBeNull();
+    expect(landing!.textContent?.toLowerCase()).toContain("simulated");
+    expect(landing!.textContent?.toLowerCase()).not.toMatch(/\bpublished\b/);
+  });
+
+  it("warns in words, not only in colour, that nothing left the process", async () => {
+    body = delivered();
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText(/nothing left this process/i)).toBeInTheDocument();
+    expect(screen.getByText(/dry run, not a delivery/i)).toBeInTheDocument();
+  });
+
+  it("keeps a refusal's reason, because that is the actionable half", async () => {
+    body = delivered();
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText(/Connect the account first/i)).toBeInTheDocument();
+  });
+
+  it("shows the server's headline rather than recomputing one", async () => {
+    // Two headlines is two chances to disagree, and they would disagree on exactly the
+    // runs where it matters — the partly-simulated ones.
+    body = delivered();
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText(/Published 1 of 3/)).toBeInTheDocument();
+  });
+
+  it("says why the owner was not told rather than leaving it blank", async () => {
+    body = delivered();
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText(/no email address on record/i)).toBeInTheDocument();
+  });
+
+  it("reports leads as not-yet-attributable instead of zero", async () => {
+    const withMeasurement = review({
+      published: delivered().published,
+      measurement: {
+        publishedRefs: 1,
+        channels: ["landing_page"],
+        simulated: true,
+        gaps: ["Google Search Console / GA4 (cut from this build)"],
+        leadsMeasured: false,
+        attributionNote: "No leads are attributable yet: the tracked links were published moments ago.",
+      },
+      measurementNote: null,
+    });
+    body = withMeasurement;
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText(/attributable yet/i)).toBeInTheDocument();
+    // And what was NOT measured is named, or the rest reads as zero.
+    expect(screen.getByText(/Google Search Console/)).toBeInTheDocument();
+    // A bare "0 leads" must never appear.
+    expect(screen.queryByText(/^0 leads/)).toBeNull();
+  });
+
+  it("does label a genuinely delivered destination as published", async () => {
+    // The companion to the simulated test: the rule is "do not overstate", not "never
+    // say published", and a test that only checked the absence would pass on a panel
+    // that could never report a real delivery.
+    const real = delivered({
+      simulated: false,
+      targets: [{ ...simulatedLanding, simulated: false, externalRef: "https://example.com/lp" }],
+    });
+    body = real;
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /delivery/i }));
+
+    expect(screen.getByText("published")).toBeInTheDocument();
+    expect(screen.queryByText(/dry run, not a delivery/i)).toBeNull();
   });
 });

@@ -15,6 +15,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Shell } from "../../components/page-shell";
 import { Pill, SoftCard, SoftWell } from "../../components/soft";
 // Shared with the dashboard panel and the /runs list. Three private copies of "what colour
 // is `partial`" is three chances for the screens to disagree about whether a run that
@@ -168,7 +169,7 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
   for (const e of events) statusByNode.set(e.node, e.status);
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-12">
+    <Shell className="py-12">
       <p
         className="text-[11px] font-semibold uppercase tracking-[0.18em]"
         style={{ color: "var(--accent)" }}
@@ -250,7 +251,7 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
           It is NOT gated on a terminal state: a partial run has partial output, and
           hiding it until the end would withhold work the owner has already paid for. */}
       {runId && run && <RunReviewTabs runId={runId} runState={run.state} />}
-    </main>
+    </Shell>
   );
 }
 

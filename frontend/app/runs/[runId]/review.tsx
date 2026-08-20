@@ -43,6 +43,9 @@ import {
   fetchReview,
   type AiBlocks,
   type Draft,
+  type Measurement,
+  type Published,
+  type PublishedTarget,
   type ReviewFinding,
   type RunReview,
   type SeoReport,
@@ -127,6 +130,22 @@ export function RunReviewTabs({ runId, runState }: { runId: string; runState: st
       id: "export",
       label: "Export pack",
       panel: <ExportPanel runId={runId} runState={runState} />,
+    },
+    {
+      // "Delivery", not "Published": on most runs nothing was, and on the rest some of
+      // it was simulated. A tab labelled "Published" would be a claim before the panel
+      // has said anything.
+      id: "delivery",
+      label: "Delivery",
+      badge: review.published ? review.published.succeeded || undefined : undefined,
+      panel: (
+        <DeliveryPanel
+          published={review.published}
+          publishedNote={review.publishedNote}
+          measurement={review.measurement}
+          measurementNote={review.measurementNote}
+        />
+      ),
     },
   ];
 
@@ -602,6 +621,157 @@ function PostNotes({ post }: { post: SocialPost }) {
       ))}
     </ul>
   );
+}
+
+/* ------------------------------------------------------------------------- */
+/* Delivery — what EXPORT actually did, and what MEASURE could not do         */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The one panel in this product where an over-claim would be worst.
+ *
+ * EXPORT can simulate. With no credential for a destination it produces a real
+ * `Outcome` with `fake=true` and a `fake://…` reference, and with no platform connection
+ * it REFUSES with a reason. Both are successes of the design and neither is a post. So
+ * this panel is built around a single rule: **a simulated or refused destination must be
+ * impossible to read as a delivered one.** The word "Published" appears only on a row
+ * that genuinely was, and every simulated row is labelled in words as well as colour.
+ *
+ * The headline is the server's own sentence, not one recomputed here. EXPORT already
+ * folds "published N of M", which destinations failed, and whether anything was
+ * simulated; deriving a second headline from the rows would be a second place for that
+ * arithmetic to be wrong, and the two would disagree on exactly the runs that matter.
+ */
+function DeliveryPanel({
+  published,
+  publishedNote,
+  measurement,
+  measurementNote,
+}: {
+  published: Published | null;
+  publishedNote: string | null;
+  measurement: Measurement | null;
+  measurementNote: string | null;
+}) {
+  if (!published) {
+    return (
+      <div className="space-y-4">
+        <Nothing note={publishedNote} />
+        <p className="max-w-[70ch] text-xs" style={{ color: "var(--text-muted)" }}>
+          Approving a run is what lets it publish. Until then the content is stored and
+          reviewable — which is the whole point of the gate, not a limitation of it.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <SoftWell className="p-4">
+        {/* EXPORT's own headline, verbatim. */}
+        <p className="max-w-[70ch] text-sm">{published.note}</p>
+        {published.simulated && (
+          <p className="mt-2 max-w-[70ch] text-xs font-medium" style={{ color: "var(--warn)" }}>
+            At least one destination was SIMULATED: no credential is configured for it, so
+            nothing left this process. Treat those rows as a dry run, not a delivery.
+          </p>
+        )}
+      </SoftWell>
+
+      <ul className="space-y-2.5">
+        {published.targets.map((target) => (
+          <li key={`${target.actionType}:${target.target}`}>
+            <div className="soft-flat soft-edge px-4 py-3" style={{ borderRadius: "var(--r-sm)" }}>
+              <div className="flex flex-wrap items-center gap-2">
+                <Pill tone={deliveryTone(target)}>{deliveryLabel(target)}</Pill>
+                <span className="text-sm font-medium">
+                  {/* `landing_page` is a destination, not a channel, so the shared
+                      label helper is asked and its fallback is the raw target. */}
+                  {channelLabel(target.target)}
+                </span>
+                <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                  {target.actionType}
+                </span>
+              </div>
+              {/* The actuator's own line: it already refuses to overstate, and a screen
+                  that showed only this still could not claim a real post. */}
+              <p className="mt-1.5 max-w-[70ch] text-xs" style={{ color: "var(--text-muted)" }}>
+                {target.summary}
+              </p>
+              {target.error && (
+                <p className="mt-1 max-w-[70ch] text-xs" style={{ color: "var(--warn)" }}>
+                  {target.error}
+                </p>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+
+      <SoftWell className="p-4">
+        <h3 className="text-sm font-semibold">Was the owner told?</h3>
+        <p className="mt-1.5 max-w-[70ch] text-xs" style={{ color: "var(--text-muted)" }}>
+          {published.notified
+            ? "Yes — an email naming what went live and what did not."
+            : published.notifyNote ||
+              "No notification was sent, and no reason was recorded for that."}
+        </p>
+      </SoftWell>
+
+      {measurement ? (
+        <SoftWell className="p-4">
+          <h3 className="text-sm font-semibold">What can be measured yet</h3>
+          <p className="mt-1.5 max-w-[70ch] text-sm">
+            {/* `leadsMeasured` is carried rather than derived from a count, because a
+                count of zero and "nobody has arrived through a tracked link yet" are the
+                same number and different claims — and only the second is true minutes
+                after publishing. */}
+            {measurement.leadsMeasured
+              ? `${measurement.channels.length} channel(s) with attributable traffic.`
+              : measurement.attributionNote ||
+                "No leads are attributable yet. This is the attribution path, not a result."}
+          </p>
+          {measurement.gaps.length > 0 && (
+            <>
+              <h4 className="mt-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>
+                Not measured
+              </h4>
+              <ul className="mt-1.5 space-y-1">
+                {measurement.gaps.map((gap) => (
+                  <li key={gap} className="max-w-[70ch] text-xs" style={{ color: "var(--text-muted)" }}>
+                    {gap}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </SoftWell>
+      ) : (
+        <Nothing note={measurementNote} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The pill for one destination. `simulated` beats `succeeded`, deliberately.
+ *
+ * A simulated send has `status: "succeeded"` — it did succeed, at simulating — so
+ * colouring by status alone would paint a dry run green. Checking `simulated` first is
+ * what makes the rule "a simulated destination cannot be read as a delivered one" hold
+ * in the code rather than in a comment.
+ */
+function deliveryTone(target: PublishedTarget): "ok" | "warn" | "err" | "muted" {
+  if (target.simulated) return "warn";
+  if (target.status === "succeeded") return "ok";
+  if (target.status === "failed") return "err";
+  return "muted";
+}
+
+function deliveryLabel(target: PublishedTarget): string {
+  if (target.simulated) return "simulated";
+  if (target.status === "succeeded") return "published";
+  return target.status;
 }
 
 /* ------------------------------------------------------------------------- */

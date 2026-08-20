@@ -117,6 +117,10 @@ const CHANNEL_LABEL: Record<string, string> = {
   email: "Email",
   blog_article: "Blog article",
   link_hub: "Link hub",
+  // Not a channel, but it IS a publish destination, and the delivery panel renders
+  // destinations. Without an entry the screen showed an owner the raw `landing_page`
+  // key, which is developer output leaking onto a customer surface.
+  landing_page: "Landing page",
 };
 
 /**

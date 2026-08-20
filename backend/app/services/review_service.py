@@ -112,6 +112,21 @@ __all__ = [
 ]
 
 
+#: Why the publish and measure sections are empty, phrased as the MECHANISM.
+#:
+#: "EXPORT has not run" is the normal state of every unapproved run rather than a fault,
+#: and saying so is the difference between a screen that reads as unfinished work and one
+#: that reads as broken software. Both name the gate, because that is the thing the
+#: reader can act on.
+_NOT_PUBLISHED: Final = (
+    "Nothing has been published yet. EXPORT runs only after a human approves the run at "
+    "the review gate -- approving it is what lets it publish."
+)
+_NOT_MEASURED: Final = (
+    "Nothing has been measured yet. MEASURE runs after EXPORT, so there is nothing to "
+    "measure until something has been published."
+)
+
 #: Why a tab is empty, phrased as the mechanism rather than as an apology. Each names
 #: the node that fills it, because "GENERATE has not run" is actionable and "no data"
 #: is not.
@@ -284,6 +299,59 @@ class Opportunity(_Wire):
     score: int | None
 
 
+class PublishedTarget(_Wire):
+    """One destination EXPORT tried, and what actually happened to it.
+
+    `simulated` is the field this whole model exists to carry. A destination whose post
+    never left the process must not be renderable as a success, and the only way to
+    guarantee that on a screen is to hand the screen the fact.
+    """
+
+    action_type: str
+    target: str
+    status: str
+    external_ref: str | None
+    error: str | None
+    simulated: bool
+    #: The actuator's own one-line rendering, which already refuses to overstate. Carried
+    #: verbatim so a surface that shows nothing else still cannot claim a real post.
+    summary: str
+
+
+class Published(_Wire):
+    """What EXPORT did, per destination, plus the honest headline.
+
+    `note` is the sentence EXPORT composed and is not recomputed here: it already folds
+    "published N of M", the destinations that failed, and whether anything was simulated.
+    A screen deriving its own headline from `targets` would be a second place for that
+    arithmetic to be wrong.
+    """
+
+    note: str
+    attempted: int
+    succeeded: int
+    simulated: bool
+    notified: bool
+    notify_note: str | None
+    targets: tuple[PublishedTarget, ...]
+
+
+class Measurement(_Wire):
+    """What MEASURE could and could not measure.
+
+    `leadsMeasured` is false and stays false until a visitor actually arrives through a
+    tracked link. `gaps` names what was not measured and why, because a screen that
+    shows only the numbers it has implies the rest were zero.
+    """
+
+    published_refs: int
+    channels: tuple[str, ...]
+    simulated: bool
+    gaps: tuple[str, ...]
+    leads_measured: bool
+    attribution_note: str | None
+
+
 class RunReview(_Wire):
     """Everything the four tabs need, plus the honesty carried alongside them.
 
@@ -304,6 +372,12 @@ class RunReview(_Wire):
     opportunity: Opportunity | None
     fact_gaps: tuple[str, ...]
     errors: tuple[dict[str, str], ...]
+    #: What EXPORT did, or `None` when it never ran -- which is the case for every run
+    #: that has not been approved, and is a different fact from "it published nothing".
+    published: Published | None
+    published_note: str | None
+    measurement: Measurement | None
+    measurement_note: str | None
 
 
 # --------------------------------------------------------------------------- #
@@ -493,6 +567,82 @@ def _social(checkpoint: Mapping[str, Any]) -> tuple[SocialPost, ...]:
     )
 
 
+def _published(checkpoint: Mapping[str, Any]) -> tuple[Published | None, str | None]:
+    """What EXPORT did, and the reason there is nothing when there is nothing.
+
+    A pair, because "EXPORT never ran" and "EXPORT ran and published nothing" are
+    different facts and only the second one is about the platforms. The first is the
+    normal state of every run that has not been approved -- REVIEW is an interrupt, and
+    EXPORT sits after it -- so the note names the gate rather than implying a failure.
+    """
+    raw = _mapping(checkpoint.get("published"))
+    if not raw:
+        return None, _NOT_PUBLISHED
+
+    targets: list[PublishedTarget] = []
+    succeeded = 0
+    for entry in raw.get("refs") or ():
+        row = _mapping(entry)
+        status = _text(row.get("status"))
+        if not status:
+            continue
+        if status == "succeeded":
+            succeeded += 1
+        targets.append(
+            PublishedTarget(
+                action_type=_text(row.get("action_type")),
+                target=_text(row.get("target")),
+                status=status,
+                external_ref=_optional_text(row.get("external_ref")),
+                error=_optional_text(row.get("error")),
+                simulated=bool(row.get("fake", False)),
+                summary=_text(row.get("summary")),
+            )
+        )
+
+    return (
+        Published(
+            # EXPORT's own sentence, not a recomputed one: it already folds "N of M",
+            # the destinations that failed and whether anything was simulated, and a
+            # second place for that arithmetic is a second place for it to be wrong.
+            note=_text(raw.get("note")),
+            attempted=_int(raw.get("attempted")),
+            succeeded=succeeded,
+            simulated=bool(raw.get("simulated", False)),
+            notified=bool(raw.get("notified", False)),
+            notify_note=_optional_text(raw.get("notify_note")),
+            targets=tuple(targets),
+        ),
+        None,
+    )
+
+
+def _measurement(checkpoint: Mapping[str, Any]) -> tuple[Measurement | None, str | None]:
+    """What MEASURE measured, and what it could not.
+
+    `leads_measured` is carried rather than derived from a count, because a count of
+    zero and "nobody has arrived through a tracked link yet" are the same number and
+    different claims -- and this product's whole argument is that the second one must
+    never be printed as the first.
+    """
+    raw = _mapping(checkpoint.get("measurement"))
+    if not raw:
+        return None, _NOT_MEASURED
+
+    attribution = _mapping(raw.get("attribution"))
+    return (
+        Measurement(
+            published_refs=_int(raw.get("published_refs")),
+            channels=_strings(raw.get("channels")),
+            simulated=bool(raw.get("simulated", False)),
+            gaps=_strings(raw.get("gaps")),
+            leads_measured=bool(attribution.get("leads_measured", False)),
+            attribution_note=_optional_text(attribution.get("note")),
+        ),
+        None,
+    )
+
+
 def _ai_blocks(checkpoint: Mapping[str, Any]) -> tuple[AiBlocks | None, str | None]:
     """Answer blocks, and the reason there are none when there are none.
 
@@ -570,12 +720,19 @@ def project_review(checkpoint: Mapping[str, Any] | None) -> RunReview:
             opportunity=None,
             fact_gaps=(),
             errors=(),
+            published=None,
+            published_note=_NO_CHECKPOINT,
+            measurement=None,
+            measurement_note=_NO_CHECKPOINT,
         )
 
     draft = _draft(checkpoint)
     seo = _seo(checkpoint)
     social = _social(checkpoint)
     ai_blocks, ai_note = _ai_blocks(checkpoint)
+
+    published, published_note = _published(checkpoint)
+    measurement, measurement_note = _measurement(checkpoint)
 
     return RunReview(
         has_output=bool(draft or seo or social or (ai_blocks and ai_blocks.blocks)),
@@ -590,6 +747,10 @@ def project_review(checkpoint: Mapping[str, Any] | None) -> RunReview:
         opportunity=_opportunity(checkpoint),
         fact_gaps=_strings(checkpoint.get("fact_gaps")),
         errors=_errors(checkpoint),
+        published=published,
+        published_note=published_note,
+        measurement=measurement,
+        measurement_note=measurement_note,
     )
 
 
@@ -711,6 +872,10 @@ class ExportPack(_Wire):
     tracked_link_note: str
     fact_gaps: tuple[str, ...]
     errors: tuple[dict[str, str], ...]
+    # Deliberately NOT carrying `published`/`measurement`. The pack is the thing a human
+    # pastes into a composer; what EXPORT did with it belongs on the review screen, and
+    # putting publish status here would invite a client to render a publish claim on a
+    # surface whose whole point is that it publishes nothing. See `RunReview`.
 
 
 def _missing_hashtags(body: str, hashtags: Sequence[str]) -> tuple[str, ...]:

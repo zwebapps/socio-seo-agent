@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from backend.app.agents.state import new_state, to_checkpoint
 from backend.app.engines.seo import SeoScoreRequest, score_page
-from backend.app.services.review_service import project_review
+from backend.app.services.review_service import ExportPack, project_review
 
 # --------------------------------------------------------------------------- #
 # Absence is an answer, and it names the node
@@ -346,3 +346,128 @@ def test_a_fresh_state_projects_as_nothing_to_review_not_as_empty_content() -> N
     assert review.has_output is False
     assert review.draft is None and review.draft_note is not None
     assert review.seo is None and review.seo_note is not None
+
+
+# --------------------------------------------------------------------------- #
+# What EXPORT did, and what MEASURE could not do
+# --------------------------------------------------------------------------- #
+
+
+def test_an_unapproved_run_says_the_gate_is_why_nothing_published() -> None:
+    """The normal state of most runs, and it must not read as a fault.
+
+    REVIEW is an interrupt and EXPORT sits after it, so "nothing published" is the
+    expected condition of every run nobody has approved. A note naming the GATE is
+    actionable; a blank section or a zero would read as broken software.
+    """
+    review = project_review({"draft": {"title": "t", "html": "<h1>t</h1>"}})
+
+    assert review.published is None
+    assert review.published_note is not None
+    assert "approves" in review.published_note
+    assert review.measurement is None
+    assert "after EXPORT" in (review.measurement_note or "")
+
+
+def test_a_simulated_publish_can_never_be_rendered_as_a_real_one() -> None:
+    """The single most important assertion on this screen. Verified against the exact
+    shape a real run wrote: a landing page simulated because no credential is configured,
+    and two channels REFUSED because the business has no connection — which is the honest
+    answer and not a cheerful fake success."""
+    review = project_review(
+        {
+            "published": {
+                "note": (
+                    "Published 1 of 3; nothing was published to facebook, linkedin -- "
+                    "SIMULATED: at least one destination has no credential configured"
+                ),
+                "attempted": 3,
+                "simulated": True,
+                "notified": False,
+                "notify_note": (
+                    "Nobody was told: this business profile has no email address on record."
+                ),
+                "refs": [
+                    {
+                        "action_type": "publish.page",
+                        "target": "landing_page",
+                        "status": "succeeded",
+                        "external_ref": "fake://publish.page/landing_page#8fe88144",
+                        "error": None,
+                        "fake": True,
+                        "summary": (
+                            "publish.page → landing_page: done "
+                            "(SIMULATED — no credential configured)"
+                        ),
+                    },
+                    {
+                        "action_type": "social.post",
+                        "target": "linkedin",
+                        "status": "refused",
+                        "external_ref": None,
+                        "error": "this business has no linkedin connection",
+                        "fake": True,
+                        "summary": (
+                            "social.post → linkedin: refused "
+                            "(this business has no linkedin connection)"
+                        ),
+                    },
+                ],
+            }
+        }
+    )
+
+    assert review.published is not None
+    assert review.published.simulated is True
+    assert review.published.succeeded == 1
+    assert review.published.attempted == 3
+    # Every target carries its own flag, so a row cannot be rendered as real either.
+    assert all(target.simulated for target in review.published.targets)
+    # And the refusal keeps its reason, which is the thing the owner can act on.
+    refused = [t for t in review.published.targets if t.status == "refused"]
+    assert refused and "no linkedin connection" in (refused[0].error or "")
+    assert "SIMULATED" in review.published.note
+    assert review.published.notified is False
+    assert "no email address" in (review.published.notify_note or "")
+
+
+def test_leads_are_reported_as_unmeasured_rather_than_zero() -> None:
+    """The product's whole argument is that attribution must be trustworthy, and "zero
+    leads" and "nobody has arrived through a tracked link yet" are the same number and
+    different claims. Only the second one is true minutes after publishing."""
+    review = project_review(
+        {
+            "measurement": {
+                "published_refs": 1,
+                "channels": ["landing_page"],
+                "simulated": True,
+                "gaps": ["Google Search Console / GA4 (cut from this build)"],
+                "attribution": {
+                    "leads_measured": False,
+                    "note": (
+                        "No leads are attributable yet: the tracked links were "
+                        "published moments ago."
+                    ),
+                    "channels": ["landing_page"],
+                },
+            }
+        }
+    )
+
+    assert review.measurement is not None
+    assert review.measurement.leads_measured is False
+    # The note has to explain WHY there is no number, or the screen shows an empty
+    # attribution panel and the reader supplies "it does not work" themselves.
+    assert "attributable yet" in (review.measurement.attribution_note or "")
+    assert review.measurement.gaps, "what was NOT measured has to reach the screen"
+    assert review.measurement.simulated is True
+
+
+def test_the_export_pack_carries_no_publish_status() -> None:
+    """Deliberate. The pack is what a human pastes into a composer; a publish claim on
+    the one surface whose point is that it publishes nothing would be the most misleading
+    field in the product."""
+    fields = set(ExportPack.model_fields)
+
+    assert "published" not in fields
+    assert "measurement" not in fields

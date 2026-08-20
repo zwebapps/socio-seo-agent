@@ -18,12 +18,20 @@
  *   a 2px `--accent` outline with an offset, on top of whatever the shadow is doing.
  *
  * The neumorphic trap, handled: a soft shadow measures around 1.2:1 against this
- * background, and WCAG 1.4.11 asks 3:1 for the boundary of a UI component. So every tab
- * carries the `soft-edge` hairline (`--edge`, which is set to 3:1 against `--bg`) as well
- * as its shadow. The selected tab is ALSO distinguished by three things that are not
- * colour — a raised shadow instead of a recessed one, a heavier font weight, and an
- * accent underline — because colour alone is not an accessible signal, and because
- * `aria-selected` is the only signal a screen reader gets either way.
+ * background, and WCAG 1.4.11 asks 3:1 for the boundary of a UI component. So every
+ * UNSELECTED tab carries the `soft-edge` hairline (`--edge`, set to 3:1 against `--bg`)
+ * as well as its shadow.
+ *
+ * **The selected tab is filled, not underlined.** It used to be `--surface-raised`
+ * against a `--surface-sunken` track plus a 2px accent bar — and on this palette that
+ * background swap is a couple of percent of lightness, so the bar was doing nearly all
+ * the work and a glance did not land on it. It is now solid `--primary` with
+ * `--primary-ink`, matching `SoftButton`'s primary variant and the `/developer` section
+ * nav, measured at 9.22:1. No hairline on it, because a filled surface already has an
+ * edge and the hairline would draw a line inside the fill.
+ *
+ * Two signals survive alongside the colour, because colour alone is not accessible: a
+ * heavier font weight, and `aria-selected`, which is the only one a screen reader gets.
  */
 
 import { useCallback, useId, useRef, type ReactNode } from "react";
@@ -130,13 +138,25 @@ export function SoftTabs({
               // Roving tabindex: the tablist is ONE tab stop, arrows do the rest.
               tabIndex={selected ? 0 : -1}
               onClick={() => onActivate(tab.id)}
-              className={`soft-press soft-edge relative flex items-center gap-2 px-3.5 py-2 text-sm ${
-                selected ? "soft-raised font-semibold" : "font-medium"
+              // The selected tab is FILLED, matching the `/developer` section nav and
+              // `SoftButton`'s primary variant. It used to be `--surface-raised` against
+              // a `--surface-sunken` track plus a 2px bar — a couple of percent of
+              // lightness, so the bar was doing all the work and a glance did not land
+              // on it. Measured: white on `--primary` is 9.22:1.
+              className={`soft-press relative flex items-center gap-2 px-3.5 py-2 text-sm ${
+                // No hairline on the filled pill: a filled surface already has an edge.
+                selected ? "font-semibold" : "soft-edge font-medium"
               }`}
               style={{
                 borderRadius: "var(--r-pill)",
-                color: selected ? "var(--text)" : "var(--text-muted)",
-                background: selected ? "var(--surface-raised)" : "transparent",
+                ...(selected
+                  ? {
+                      background: "var(--primary)",
+                      color: "var(--primary-ink)",
+                      boxShadow:
+                        "-4px -4px 10px var(--shadow-light), 5px 5px 14px var(--shadow-dark)",
+                    }
+                  : { color: "var(--text-muted)", background: "transparent" }),
               }}
             >
               <span>{tab.label}</span>
@@ -145,19 +165,14 @@ export function SoftTabs({
                   className="tabular soft-flat px-1.5 text-[10px] font-semibold"
                   style={{
                     borderRadius: "var(--r-pill)",
-                    color: selected ? "var(--accent)" : "var(--text-faint)",
+                    // On the filled pill the badge sits on `--primary`, so the accent
+                    // orange would be 2.1:1 against it. `--primary-ink` is the only
+                    // colour that is legible there.
+                    color: selected ? "var(--primary-ink)" : "var(--text-muted)",
                   }}
                 >
                   {tab.badge}
                 </span>
-              )}
-              {/* A third, non-colour marker for the selected tab: shadow, weight, bar. */}
-              {selected && (
-                <span
-                  aria-hidden
-                  className="absolute bottom-[3px] left-1/2 h-[2px] w-5 -translate-x-1/2"
-                  style={{ background: "var(--accent)", borderRadius: 2 }}
-                />
               )}
             </button>
           );

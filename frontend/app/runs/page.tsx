@@ -19,6 +19,7 @@
 
 import Link from "next/link";
 
+import { Shell } from "@/app/components/page-shell";
 import { RunRows, useRuns } from "@/app/components/run-rows";
 import { Pill, SoftButton } from "@/app/components/soft";
 import { ALL_RUNS } from "@/app/lib/runs-api";
@@ -27,7 +28,7 @@ export default function RunsPage() {
   const { state, live, reload, loadMore, canLoadMore, loadingMore } = useRuns(ALL_RUNS);
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-12">
+    <Shell className="py-12">
       <p
         className="text-[11px] font-semibold uppercase tracking-[0.18em]"
         style={{ color: "var(--accent)" }}
@@ -35,7 +36,7 @@ export default function RunsPage() {
         Runs
       </p>
       <h1 className="mt-2 text-[26px] font-semibold tracking-tight">Everything you have asked for</h1>
-      <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
+      <p className="mt-3 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
         Newest first. Open one to see which step it reached, what each step cost, and the
         draft, SEO findings, social posts and AI answer blocks it produced. A run left
         mid-flight by a restart can be picked back up from its checkpoint.
@@ -84,6 +85,6 @@ export default function RunsPage() {
           Back to the dashboard
         </Link>
       </p>
-    </main>
+    </Shell>
   );
 }
