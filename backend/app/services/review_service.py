@@ -3,8 +3,9 @@
 Two projections live here, over the same checkpoint: the four review tabs
 (:func:`project_review`) and the Tier 3 export pack (:func:`project_export_pack`).
 
-The review surface has four tabs — the blog draft, the deterministic SEO findings, the
-social posts per channel, and the "AI blocks" an answer engine can quote. All four are
+The review surface has a tab per kind of output — the blog draft, the deterministic SEO
+findings, the social posts per channel, and the "AI blocks" an answer engine can quote,
+plus the retrieval trace and the delivery record. Those first four are
 already produced by the graph and already persisted: ``AgentState`` carries ``draft``,
 ``seo_report``, ``renderings`` and ``outline``, and ``runs.checkpoint`` is that state
 after :func:`backend.app.agents.state.to_checkpoint`. So this module invents no storage
@@ -478,7 +479,7 @@ class Measurement(_Wire):
 
 
 class RunReview(_Wire):
-    """Everything the four tabs need, plus the honesty carried alongside them.
+    """Everything the review tabs need, plus the honesty carried alongside them.
 
     ``fact_gaps`` and ``errors`` are not decoration. They are what lets the screen say
     "written without live research" instead of implying research happened, which is the

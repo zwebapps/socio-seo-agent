@@ -1016,6 +1016,18 @@ A1 is the first code to create.
   un-completable end to end by a human — which is worth saying out loud rather than leaving a
   reader to discover by clicking.
 
+- [ ] **A2c · A node that raises loses its retrieval trace along with everything else** — found
+  by A2a, pre-existing, and deliberately not changed there. `GENERATE` and `CONVERT` raise
+  `ValueError` when the model returns no tool call; the driver converts that to a `NodeError` and
+  **discards the whole update dict** — so the trace for that node is lost, and so is `_cost`. It
+  is not retrieval-specific: every field the node computed before it raised goes the same way,
+  which is why fixing it inside A2a would have been the wrong shape. `OPPORTUNITY`'s no-args path
+  already does it right by RETURNING rather than raising, so the pattern to follow exists.
+  **done = a node that fails after doing chargeable work still reports that work (its cost and
+  its trace) alongside the error, in BOTH drivers; a test asserts the cost of a failed GENERATE
+  is not silently dropped.** Note this is a money-visibility bug as much as an evidence one: a
+  run can spend on a node whose spend is then never recorded.
+
 ## B · ⛔ BLOCKED — what the human must supply, and the exact question
 
 - [ ] ⛔ **The OpenRouter account's data policy** — cheapest unblock available and it

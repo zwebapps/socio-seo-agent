@@ -1,7 +1,12 @@
 "use client";
 
 /**
- * The review surface: five tabs over one run's output.
+ * The review surface: one tab per kind of output a run produces.
+ *
+ * Deliberately not "N tabs": the count has now been wrong twice — it said four in
+ * `review_service.py` and five here while the real number reached seven — and a number in
+ * a comment cannot be derived from the array below it. `TABS` is the source of truth; a
+ * reader who needs the count can read it there and it cannot go stale.
  *
  * The blog draft, the deterministic SEO findings, the social posts per platform, the
  * "AI blocks" — the self-contained answers an AI answer engine can quote — and the export

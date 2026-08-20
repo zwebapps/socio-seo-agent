@@ -222,11 +222,6 @@ The five deterministic scorers are unchanged, still gate drafts, and the judged 
 are excluded from their mean. Running both judges together is the interesting case:
 where they disagree on the same text, that gap measures the JUDGES.
 
-**One demo step below is aspirational and is marked so.** Step 5 ("open the retrieval
-trace") has no UI: `RetrievalTrace` is produced, carries every grade and the fallback
-decision, and is not rendered anywhere yet. Demo it from the API response or the run
-timeline, and do not claim a screen that does not exist.
-
 ---
 
 ## 8. The demo — 13 steps, under 8 minutes
