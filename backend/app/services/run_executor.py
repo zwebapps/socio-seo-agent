@@ -569,6 +569,14 @@ class RunExecutor:
                     "memory.load": deps.load_memory is not None,
                     "geo.probe": deps.geo_probe is not None,
                     "web_search": deps.web_search is not None,
+                    # EXPORT's two, and they need BOTH halves: `actuate()` claims an
+                    # idempotency key in the ledger before it calls anything, so an
+                    # actuator with no store is not a publisher. Reported here for the
+                    # same reason as the rest -- a run that published nothing because
+                    # this deployment has no integration looks, afterwards, exactly
+                    # like a run whose posts were rejected.
+                    "publish": deps.actuator_for is not None and deps.actuator_store is not None,
+                    "notify": deps.actuator_for is not None and deps.actuator_store is not None,
                 }.items()
                 if is_wired
             )

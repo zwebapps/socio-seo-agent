@@ -6,10 +6,17 @@ resumption after a crash, and per-node evaluation -- none of which an
 LLM-decides-everything loop gives you (docs/ARCHITECTURE.md section 14).
 
     INTAKE -> HARVEST -> OPPORTUNITY -> PLAN -> GENERATE -> CONVERT -> VALIDATE -> REPACK -> REVIEW
-                              |                    ^           ^           |
-                        no opportunity             |           +- fails ---+  (max 2)
-                              v                   +-- draft failed --------+
-                        end, honestly
+                              |                    ^           ^           |                  |
+                        no opportunity             |           +- fails ---+  (max 2)     human gate
+                              v                   +-- draft failed --------+                   |
+                        end, honestly                                                          v
+                                                                        EXPORT -> MEASURE -> end
+
+EXPORT and MEASURE sit AFTER the interrupt, and nothing reaches them on a fresh run:
+the builtin driver returns at REVIEW and the LangGraph one is paused on the edge out
+of it. They run on the RESUME that follows an approval -- and EXPORT still checks
+`state["approved_by"]` itself, because "this run was resumed" and "a human approved
+this run" are not the same fact (see :func:`resumable_skip`).
 
 VALIDATE returns three verdicts and they are gated differently.
 
@@ -75,7 +82,20 @@ ORDER: tuple[str, ...] = (
     "VALIDATE",
     "REPACK",
     "REVIEW",
+    # After the human gate, and unreachable without passing it. A FRESH run stops at
+    # REVIEW -- both drivers -- so these two only ever run on a resume, which is what
+    # makes "nothing publishes without a human" a property of the machine rather than
+    # of a node's good manners. EXPORT additionally refuses without an approver on the
+    # state, because a resumed run is not necessarily an approved one (see
+    # `state.approved_by`).
+    "EXPORT",
+    "MEASURE",
 )
+
+#: The first node after the human gate. Named rather than indexed, because
+#: `state_graph` routes the gate's continuation edge here and an off-by-one there
+#: would publish without pausing.
+FIRST_AFTER_REVIEW: str = "EXPORT"
 
 #: Passing score for the deterministic SEO gate. Matches the seo engine.
 PASSING_SCORE = 85
@@ -134,6 +154,28 @@ async def _run_node(
     state = {**state, **merged}  # type: ignore[typeddict-item]
     emit(sink, name, "done", {"cost_usd": str(state["cost_usd"])})
     return state
+
+
+def resumable_skip(state: AgentState, node: str) -> bool:
+    """May a resumed run skip ``node`` because the checkpoint says it already ran.
+
+    Shared by both drivers for the reason `verdicts` is: two copies of "what does a
+    resume repeat" would let one runtime publish something the other regenerated.
+
+    The work was paid for once and paying again is the bug resumption exists to
+    prevent, so the answer is normally yes. **GENERATE is the exception, and the
+    exception is BOUNDED by the human gate.** A run revived mid-validation has to be
+    able to write a new draft -- that is why the exemption exists at all -- but once
+    REVIEW has run, the draft, the landing page and the renderings are the artifacts a
+    human was shown. Rewriting them on the resume that follows an approval would
+    publish copy nobody approved, pay the strong tier to do it, and spend three steps
+    of a 14-step budget that a one-retry run has already largely used.
+    """
+    if node not in state["visited"]:
+        return False
+    if node != "GENERATE":
+        return True
+    return "REVIEW" in state["visited"]
 
 
 def node_failure(state: AgentState, node: str) -> str | None:
@@ -324,7 +366,7 @@ async def run_graph(
 
             # On resume, skip what the checkpoint says already ran. The work was
             # paid for once; paying again is the bug resumption exists to prevent.
-            if resume and name in state["visited"] and name != "GENERATE":
+            if resume and resumable_skip(state, name):
                 index += 1
                 continue
 

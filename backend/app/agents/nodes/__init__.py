@@ -34,7 +34,18 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Final, get_args
+from uuid import UUID
 
+from backend.app.actuators import (
+    Actuation,
+    Actuator,
+    ActuatorStore,
+    OutcomeStatus,
+    actuate,
+)
+from backend.app.actuators import (
+    Outcome as ActuationOutcome,
+)
 from backend.app.agents.nodes.prompts import (
     GENERATE_TOOL,
     LANDING_TOOL,
@@ -56,6 +67,8 @@ from backend.app.agents.tools import (
     LANDING_CHECK,
     MEMORY_LOAD,
     NAP_AUDIT,
+    NOTIFY,
+    PUBLISH,
     SEO_SCORE,
     SERP_SEARCH,
     WEB_SEARCH,
@@ -133,6 +146,94 @@ _LEGAL_FORM_FIELDS: Final[frozenset[str]] = frozenset(get_args(FormFieldName.__v
 #: main lever on harvest cost.
 MAX_SEED_SEARCHES = 3
 
+# --------------------------------------------------------------------------- #
+# EXPORT's vocabulary
+#
+# Dotted, target-first, matching `actuators/contract.py`'s convention: the name says
+# which integration owns the effect. The `action_type` is half of the idempotency key,
+# so these strings are as load-bearing as a column name -- renaming one makes every
+# prior action look like a different effect and re-publishes it.
+# --------------------------------------------------------------------------- #
+
+#: One channel rendering, posted to that channel.
+SOCIAL_POST_ACTION: Final = "social.post"
+#: The landing page the tracked links point at.
+PAGE_PUBLISH_ACTION: Final = "publish.page"
+#: The one message EXPORT sends the owner: what went live and what did not.
+NOTIFY_ACTION: Final = "notify.email"
+
+#: What `publish` may actuate, and what `notify` may. Two grants in the allowlist mean
+#: two capabilities, so they cannot share one implementation: a node holding `notify`
+#: and not `publish` must not be able to post, and the check has to live somewhere that
+#: the grant name reaches.
+PUBLISHABLE_ACTIONS: Final[frozenset[str]] = frozenset({SOCIAL_POST_ACTION, PAGE_PUBLISH_ACTION})
+NOTIFIABLE_ACTIONS: Final[frozenset[str]] = frozenset({NOTIFY_ACTION})
+
+#: The landing page's destination within the publishing integration.
+#:
+#: A constant rather than a slug because the page's public slug is minted by
+#: `landing_service` when the piece is stored, and it is not in the agent state -- so
+#: there is nothing truthful to put here per run. One landing page per run makes a
+#: constant sufficient: `business_id` and the payload hash carry the rest of the
+#: identity into the idempotency key, so an edited page is a new effect and an
+#: unchanged one is a replay.
+LANDING_TARGET: Final = "landing_page"
+
+#: Why nothing was published, per reason. Stated in full on the run, because "EXPORT
+#: ran and published nothing" has four causes and they mean entirely different things
+#: to whoever reads the run.
+NOT_APPROVED_NOTE: Final = (
+    "Nothing was published: this run carries no approval. `approved_by` is empty, and "
+    "the actuator layer requires one for every side effect -- so the content is here, "
+    "reviewable, and unpublished. Approving the run records the approver and a resume "
+    "publishes it."
+)
+NOTHING_TO_PUBLISH_NOTE: Final = (
+    "Nothing was published: this run produced no channel rendering and no landing "
+    "page, so there was nothing to send. Whatever was lost upstream is named in the "
+    "run's errors."
+)
+PUBLISH_REVOKED_NOTE: Final = (
+    "Nothing was published: an operator has REVOKED EXPORT's `publish` tool, so the "
+    "kill switch is doing exactly what it is for. The approved content is stored and "
+    "unpublished; restoring the grant and resuming publishes it. Deliberately distinct "
+    "from 'no integration is configured' -- one of those is somebody's decision and the "
+    "other is a deployment gap, and they are fixed by different people."
+)
+NO_ACTUATOR_NOTE: Final = (
+    "Nothing was published: no publishing integration is configured on this "
+    "deployment, so there is nowhere to send it. The approved content is stored and "
+    "can be published by hand, or by wiring an actuator and resuming. This is NOT a "
+    "claim that a post went out."
+)
+
+#: The analytics gap MEASURE names rather than fills.
+#:
+#: `analytics.fetch` is in MEASURE's allowlist and is deliberately implemented by
+#: nothing: `CLAUDE.md` cuts GSC/GA4 from this build -- two OAuth flows for a metric
+#: that cannot move inside the project's timeline -- so the grant records a capability
+#: the design reserves and the deployment does not have. Named on every measurement,
+#: because a report that silently omits search traffic reads as a report that measured
+#: it and found nothing.
+ANALYTICS_GAP: Final = (
+    "Google Search Console / GA4 (cut from this build: attribution is proven by our "
+    "own short links instead, so ranking and organic-traffic movement are NOT measured "
+    "here)"
+)
+
+#: Why no lead count appears next to a freshly published piece.
+#:
+#: Leads arrive when a visitor clicks `/go/{code}` and submits the form, which is
+#: minutes to weeks after EXPORT and is read by the leads surface, not by the run. So
+#: MEASURE reports the attribution PATH it established and refuses to print a lead
+#: count of zero for a piece that has not been live long enough to have one -- a zero
+#: here is indistinguishable from a piece nobody has seen yet.
+LEADS_NOT_YET_NOTE: Final = (
+    "No leads are attributable yet: the tracked links were published moments ago, and "
+    "a lead is counted when a visitor arrives through /go/{code} and submits the form. "
+    "This is the attribution path, not a result -- zero would read as a measurement."
+)
+
 
 @dataclass
 class NodeDeps:
@@ -166,6 +267,20 @@ class NodeDeps:
     #: `serp_search` is: a fake result that reads as research is worse than no
     #: research, because it cannot be told apart from the real thing afterwards.
     web_search: Callable[..., Awaitable[Any]] | None = None
+    #: Resolves a dotted action type to the actuator that performs it.
+    #:
+    #: A resolver rather than a mapping so a deployment can decide per action type --
+    #: a real WordPress publisher, a `FakeActuator` for the channels it has no
+    #: credential for -- without the node knowing which is which. `None` (the default)
+    #: means NO integration is configured at all, and EXPORT then reports that it
+    #: published nothing and why, rather than skipping silently.
+    actuator_for: Callable[[str], Actuator | None] | None = None
+    #: The `actions` ledger the idempotency key is claimed in.
+    #:
+    #: Injected for the same reason `load_memory` is a callable: the nodes stay
+    #: database-free, so every node test is hermetic. `actuate()` needs both this and
+    #: an actuator, and EXPORT treats either one missing as "not wired".
+    actuator_store: ActuatorStore | None = None
     channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
     #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
     #:
@@ -211,8 +326,67 @@ def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
         NAP_AUDIT: _audit_own_nap,
         GEO_PROBE: deps.geo_probe,
         WEB_SEARCH: deps.web_search,
+        # The two actuator tools, wired together or not at all: `actuate()` needs an
+        # actuator AND a ledger, and half of that is not a working publisher. Only
+        # EXPORT holds them, so mapping them here cannot widen any other node -- the
+        # allowlist decides who may reach them, and this dict decides whether they
+        # exist at all.
+        PUBLISH: _actuation_tool(deps, PUBLISHABLE_ACTIONS),
+        NOTIFY: _actuation_tool(deps, NOTIFIABLE_ACTIONS),
+        # `analytics.fetch` is ABSENT on purpose and must stay absent: GSC/GA4 is cut
+        # from this build (`CLAUDE.md`), so MEASURE holds the grant, finds it unwired,
+        # and names the gap. Wiring anything here -- least of all a fake -- would turn
+        # a stated omission into a fabricated metric.
     }
     return {name: impl for name, impl in candidates.items() if impl is not None}
+
+
+def _actuation_tool(deps: NodeDeps, actions: frozenset[str]) -> ToolImpl | None:
+    """The implementation behind `publish` / `notify`: one actuation through `actuate`.
+
+    Returns None when no integration is configured, which is what makes
+    `NodeToolbox.available()` answer "granted but not wired" for EXPORT -- the state
+    the node has to REPORT rather than skip.
+
+    `actuate()` is called here and nowhere else in the graph. Everything it owns --
+    claiming the idempotency key before the call, refusing without an approval,
+    settling the row afterwards -- applies to every publish by construction rather
+    than by each publisher remembering.
+    """
+    resolve, store = deps.actuator_for, deps.actuator_store
+    if resolve is None or store is None:
+        return None
+
+    async def perform(actuation: Actuation) -> ActuationOutcome:
+        if actuation.action_type not in actions:
+            # A wiring mistake, refused rather than performed: `publish` and `notify`
+            # are separate grants, and an implementation that honoured both would make
+            # revoking one of them meaningless.
+            return ActuationOutcome(
+                status=OutcomeStatus.REFUSED,
+                action_type=actuation.action_type,
+                target=actuation.target,
+                error=(
+                    f"{actuation.action_type!r} is not one of the actions this tool "
+                    f"performs ({', '.join(sorted(actions))})"
+                ),
+            )
+        actuator = resolve(actuation.action_type)
+        if actuator is None:
+            # Configured integrations, but none for THIS action type. Distinct from
+            # "nothing is configured", which is `available()` answering False.
+            return ActuationOutcome(
+                status=OutcomeStatus.REFUSED,
+                action_type=actuation.action_type,
+                target=actuation.target,
+                error=(
+                    f"no actuator is configured for {actuation.action_type!r}, so "
+                    "nothing was sent to this destination"
+                ),
+            )
+        return await actuate(actuation, actuator=actuator, store=store)
+
+    return perform
 
 
 def _toolbox(node: str, deps: NodeDeps) -> NodeToolbox:
@@ -986,6 +1160,201 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         """The interrupt point. Nothing to do: the graph pauses here for a human."""
         return {}
 
+    async def export(state: AgentState) -> dict[str, Any]:
+        """Publish what was approved — or record, precisely, why nothing went out.
+
+        The ONLY node that may reach an actuator, which docs/AGENT_RUNTIME.md section 3
+        calls "the second of three independent prompt-injection barriers". The barrier
+        is the allowlist in `tools.py`: HARVEST and GENERATE handle attacker-controlled
+        text and hold no actuator tool, so a crawled page that talks a model into
+        asking for `publish` gets a recorded refusal in the node that read it, and the
+        node that CAN publish never reads untrusted text at all.
+
+        Two rules decide whether anything happens, and both fail CLOSED:
+
+        * **No approval, no publication.** `state["approved_by"]` is the whole
+          authority, and it is deliberately not inferred from "REVIEW is in `visited`":
+          the checkpoint of an interrupted run is written BEFORE the run is parked, so
+          a process that dies in that window leaves a resumable run with REVIEW behind
+          it and no human decision anywhere. An approval is a fact somebody records.
+          Nothing is even constructed without one -- an `Actuation` carrying a blank
+          approver would be a request nobody made, and `actuate`'s own refusal path is
+          the lower barrier for an approval revoked between the gate and the call, not
+          a substitute for this one.
+        * **A missing integration is REPORTED, never skipped.** With no actuator wired
+          -- which is every deployment today -- this node says so, on the run, in the
+          words a customer needs: the content exists, nothing was sent, and this is not
+          a claim that a post went live.
+
+        Per destination failure is per destination, exactly like HARVEST's per-source
+        degradation: one dead platform costs that channel and is NAMED, and the other
+        three still go out. A run that published three of four says which one it did
+        not.
+        """
+        box = _toolbox("EXPORT", deps)
+        approver = str(state.get("approved_by") or "").strip()
+        pieces = _publishable(state)
+
+        note = _export_refusal(approver=approver, pieces=pieces, box=box)
+        if note is not None:
+            code, message = note
+            return _with_refusals(
+                state,
+                box,
+                {
+                    "published": {
+                        "approved_by": approver or None,
+                        "attempted": 0,
+                        "refs": [],
+                        "not_published": [target for _, target, _ in pieces],
+                        "simulated": False,
+                        "note": message,
+                    },
+                    # An error, not a `fact_gap`: `fact_gaps` says what the content was
+                    # written WITHOUT, and this is about what happened to the finished
+                    # content. The review screen already renders errors.
+                    "errors": [
+                        *state["errors"],
+                        NodeError(node="EXPORT", code=code, message=message),
+                    ],
+                },
+            )
+
+        business = UUID(state["business_id"])
+        refs: list[dict[str, Any]] = []
+        not_published: list[str] = []
+        errors: list[NodeError] = []
+
+        for action_type, target, payload in pieces:
+            outcome = await _actuate(
+                box,
+                PUBLISH,
+                business=business,
+                approver=approver,
+                action_type=action_type,
+                target=target,
+                payload=payload,
+            )
+            refs.append(_outcome_row(outcome))
+            if outcome.succeeded:
+                continue
+            not_published.append(target)
+            errors.append(
+                NodeError(
+                    node="EXPORT",
+                    code="publish_refused"
+                    if outcome.status is OutcomeStatus.REFUSED
+                    else "publish_failed",
+                    message=(
+                        f"Nothing was published to {target}: {outcome.error or 'no reason given'}. "
+                        "The other destinations were unaffected."
+                    ),
+                )
+            )
+
+        published = [row["target"] for row in refs if row["status"] == "succeeded"]
+        # Carried all the way up, and into the one-line note as well as the flag: a
+        # surface that renders only the sentence would otherwise say "Published 3 of 3"
+        # about three posts that never left this process, and a report that cannot tell
+        # a real post from a simulated one is worse than no report.
+        simulated = any(row["fake"] for row in refs)
+        report: dict[str, Any] = {
+            "approved_by": approver,
+            "attempted": len(pieces),
+            "refs": refs,
+            "not_published": not_published,
+            "simulated": simulated,
+            "note": (
+                f"Published {len(published)} of {len(pieces)}"
+                + (
+                    f"; nothing was published to {', '.join(not_published)}"
+                    if not_published
+                    else ""
+                )
+                + (
+                    " -- SIMULATED: at least one destination has no credential "
+                    "configured, so nothing left this process for it"
+                    if simulated
+                    else ""
+                )
+            ),
+        }
+        report.update(
+            await _notify_owner(
+                box,
+                state,
+                business=business,
+                approver=approver,
+                published=published,
+                not_published=not_published,
+            )
+        )
+
+        updates: dict[str, Any] = {"published": report}
+        if errors:
+            updates["errors"] = [*state["errors"], *errors]
+        return _with_refusals(state, box, updates)
+
+    async def measure(state: AgentState) -> dict[str, Any]:
+        """Report what the published work is doing, and NAME whatever nobody measured.
+
+        Three honesty rules do all the work here, and each one exists because the
+        obvious implementation would report a fabrication as a measurement:
+
+        * **`no_answer` stays out of the share-of-voice denominator.** A model that
+          would not answer is not a brand that was absent, so a probe whose answers
+          were all unusable reports "no share to report" and not zero.
+        * **A metric nobody measured is ABSENT, not zero.** There is no `movement: 0`
+          for a piece published a minute ago and no `leads: 0` for a link nobody has
+          clicked yet -- both would read as findings.
+        * **`analytics.fetch` is granted and deliberately unwired**, so the GSC/GA4
+          omission is named on every measurement rather than inferred from its absence.
+
+        The share of voice is not re-probed here when HARVEST already measured it. A
+        second probe minutes after publishing asks the same models the same prompts and
+        would produce a "movement" number generated by sampling noise; the baseline is
+        carried forward instead, and movement belongs to the next cycle. A probe DOES
+        run when there is no baseline at all, because then it is establishing the
+        series rather than pretending to compare against it.
+        """
+        box = _toolbox("MEASURE", deps)
+        published = state.get("published") or {}
+        refs = [
+            row
+            for row in (published.get("refs") or [])
+            if isinstance(row, Mapping) and row.get("status") == "succeeded"
+        ]
+        channels = sorted({str(row.get("target")) for row in refs})
+
+        # Named first, so it is present even on the path where nothing was published.
+        gaps: list[str] = [ANALYTICS_GAP]
+        report: dict[str, Any] = {
+            "published_refs": len(refs),
+            "channels": channels,
+            # A simulated publish has no audience, so nothing downstream of it can be
+            # measured -- and a metric collected against it would be measuring us.
+            "simulated": bool(published.get("simulated")),
+            "attribution": {
+                "channels": channels,
+                "leads_measured": False,
+                "note": LEADS_NOT_YET_NOTE,
+            },
+        }
+        if not refs:
+            report["note"] = (
+                "Nothing is live from this run, so there is nothing to measure. "
+                + str(published.get("note") or "EXPORT has not published anything.")
+            )
+
+        share, gap = await _share_of_voice(box, state)
+        if share is not None:
+            report["share_of_voice"] = share
+        if gap is not None:
+            gaps.append(gap)
+
+        report["gaps"] = gaps
+        return _with_refusals(state, box, {"measurement": report})
+
     return {
         "INTAKE": intake,
         "HARVEST": harvest,
@@ -996,7 +1365,309 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         "VALIDATE": validate,
         "REPACK": repack,
         "REVIEW": review,
+        "EXPORT": export,
+        "MEASURE": measure,
     }
+
+
+# --------------------------------------------------------------------------- #
+# EXPORT
+# --------------------------------------------------------------------------- #
+
+
+def _publishable(state: AgentState) -> list[tuple[str, str, dict[str, Any]]]:
+    """What REVIEW approved, as one actuation request per destination.
+
+    **The landing page comes first, and the order is functional rather than tidy.**
+    Every channel post carries the ask that points at that page, so publishing the
+    posts first would put clicks on a page that is not there yet -- and the clicks a
+    tracked link loses in that window are exactly the leads the whole chain exists to
+    capture.
+
+    Both shapes of `renderings` are accepted: the current mapping with `body` and
+    `hashtags`, and the plain string that checkpoints written before that change hold.
+    A reader of a JSONB column does not get to assume its own version wrote it, and
+    nothing migrates a display field.
+    """
+    pieces: list[tuple[str, str, dict[str, Any]]] = []
+
+    page = state.get("landing_page")
+    if isinstance(page, Mapping) and str(page.get("headline") or "").strip():
+        pieces.append((PAGE_PUBLISH_ACTION, LANDING_TARGET, dict(page)))
+
+    for channel, rendering in (state.get("renderings") or {}).items():
+        body, hashtags = _rendered_post(rendering)
+        if not body:
+            # Nothing to post. REPACK has already recorded WHY it is missing (a banned
+            # claim, a malformed tool call), so an empty body here needs no second
+            # error -- inventing one would report the same loss twice.
+            continue
+        pieces.append(
+            (
+                SOCIAL_POST_ACTION,
+                canonical_channel(str(channel)),
+                {"body": body, "hashtags": hashtags},
+            )
+        )
+    return pieces
+
+
+def _rendered_post(rendering: Any) -> tuple[str, list[str]]:
+    """One channel's post as ``(body, hashtags)``, from either stored shape."""
+    if isinstance(rendering, str):
+        return rendering.strip(), []
+    if isinstance(rendering, Mapping):
+        tags = [str(tag) for tag in (rendering.get("hashtags") or []) if str(tag).strip()]
+        return str(rendering.get("body") or "").strip(), tags
+    return "", []
+
+
+def _export_refusal(
+    *,
+    approver: str,
+    pieces: Sequence[tuple[str, str, dict[str, Any]]],
+    box: NodeToolbox,
+) -> tuple[str, str] | None:
+    """Why EXPORT will publish nothing, as ``(code, message)``, or None to proceed.
+
+    Ordered deliberately: **approval is checked before capability.** A run nobody
+    approved must read as unapproved even on a deployment that also has no publisher,
+    because those two get fixed by completely different people.
+
+    The last two are the same distinction one layer down. `allows` is the grant minus
+    what an operator revoked and `available` adds "and it is wired", so a revoked
+    publisher and an absent one are told apart rather than both reported as "not
+    configured" -- which would have made the kill switch indistinguishable from a
+    deployment that never had a publisher.
+    """
+    if not approver:
+        return "not_approved", NOT_APPROVED_NOTE
+    if not pieces:
+        return "nothing_to_publish", NOTHING_TO_PUBLISH_NOTE
+    if not box.allows(PUBLISH):
+        return "publish_revoked", PUBLISH_REVOKED_NOTE
+    if not box.available(PUBLISH):
+        return "actuator_unwired", NO_ACTUATOR_NOTE
+    return None
+
+
+async def _actuate(
+    box: NodeToolbox,
+    tool: str,
+    *,
+    business: UUID,
+    approver: str,
+    action_type: str,
+    target: str,
+    payload: Mapping[str, Any],
+) -> ActuationOutcome:
+    """One side effect, through the node's allowlist. Never raises except a refusal.
+
+    `actuate()` already returns an `Outcome` for every failure mode it knows about, so
+    what this catches is the layer below it: an injected publisher whose store cannot
+    reach the database, or an actuator that raised something `ActuatorError` does not
+    cover. One dead destination has to cost that destination and nothing else, which is
+    the same rule HARVEST applies to a dead fact source.
+
+    An allowlist refusal is re-raised, exactly as everywhere else in this module: that
+    is a wiring fault or an attack, and it must be loud rather than degraded into a
+    channel that quietly did not publish.
+    """
+    actuation = Actuation(
+        business_id=business,
+        action_type=action_type,
+        target=target,
+        payload=dict(payload),
+        approved_by=approver,
+    )
+    try:
+        outcome = await box.call(tool, actuation)
+    except ToolNotAllowedError:
+        raise
+    except Exception as exc:  # broad on purpose: one dead destination, not the run
+        logger.warning("export: %s to %s raised: %s", action_type, target, exc)
+        return ActuationOutcome(
+            status=OutcomeStatus.FAILED,
+            action_type=action_type,
+            target=target,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    if isinstance(outcome, ActuationOutcome):
+        return outcome
+    # A publisher that answered with something other than an outcome. Reported as a
+    # failure rather than assumed successful: "we do not know what happened" and "it
+    # went out" must never collapse into the same row.
+    return ActuationOutcome(
+        status=OutcomeStatus.FAILED,
+        action_type=action_type,
+        target=target,
+        error=f"the publisher returned {type(outcome).__name__}, not an Outcome",
+    )
+
+
+def _outcome_row(outcome: ActuationOutcome) -> dict[str, Any]:
+    """One outcome as JSON primitives, for the checkpoint and the review screen.
+
+    `at` becomes a string because the checkpoint is a JSONB column and a `datetime`
+    cannot serialise into one -- a state that cannot serialise cannot resume.
+    """
+    return {
+        "action_type": outcome.action_type,
+        "target": outcome.target,
+        "status": str(outcome.status),
+        "external_ref": outcome.external_ref,
+        "replayed": outcome.replayed,
+        "fake": outcome.fake,
+        "error": outcome.error,
+        "summary": outcome.summary(),
+        "at": outcome.at.isoformat(),
+    }
+
+
+async def _notify_owner(
+    box: NodeToolbox,
+    state: AgentState,
+    *,
+    business: UUID,
+    approver: str,
+    published: Sequence[str],
+    not_published: Sequence[str],
+) -> dict[str, Any]:
+    """Tell the owner what went live and what did not. One message, never per channel.
+
+    Sent even when everything failed -- especially then. "Nothing was published, and
+    here is which platform refused it" is the message with the most value in it, and a
+    notifier that only fires on success is how a silent failure stays silent.
+    """
+    address = str(state["dna"].get("email") or "").strip()
+    if not address:
+        return {
+            "notified": False,
+            "notify_note": (
+                "Nobody was told: this business profile has no email address on record."
+            ),
+        }
+    if not box.available(NOTIFY):
+        return {
+            "notified": False,
+            "notify_note": (
+                "Nobody was told: no notification integration is configured on this deployment."
+            ),
+        }
+
+    outcome = await _actuate(
+        box,
+        NOTIFY,
+        business=business,
+        approver=approver,
+        action_type=NOTIFY_ACTION,
+        target=address,
+        payload={
+            "subject": f"Published {len(published)} of {len(published) + len(not_published)}",
+            "published": list(published),
+            "not_published": list(not_published),
+        },
+    )
+    return {"notified": outcome.succeeded, "notify": _outcome_row(outcome)}
+
+
+# --------------------------------------------------------------------------- #
+# MEASURE
+# --------------------------------------------------------------------------- #
+
+
+async def _share_of_voice(
+    box: NodeToolbox, state: AgentState
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The AI-visibility figure to report, and the gap to name — never both.
+
+    Three cases, and the first is the common one:
+
+    * HARVEST measured it: carry the baseline forward and say plainly that movement is
+      the next cycle's to report. Re-probing here would ask the same models the same
+      prompts minutes later and call the difference "movement".
+    * HARVEST could not: probe now, because establishing the baseline is real work and
+      the grant exists for it.
+    * No probe configured, or the probe fails: name the gap and report NO figure. The
+      series is left alone -- "provider down → skip the cycle, never corrupt the
+      series" (docs/AGENT_RUNTIME.md section 3).
+    """
+    baseline = (state.get("facts") or {}).get("visibility")
+    if isinstance(baseline, Mapping):
+        return {
+            "source": "harvest",
+            "baseline": _sov_view(baseline),
+            "movement_note": (
+                "Movement is not reported for this run: the baseline above was measured "
+                "before publishing, and a second probe taken minutes later would "
+                "measure sampling noise. The comparison belongs to the next cycle."
+            ),
+        }, None
+
+    if not box.available(GEO_PROBE):
+        return None, (
+            "AI answer-engine visibility (no probe configured, so there is no baseline "
+            "to measure movement against)"
+        )
+
+    try:
+        probe = await box.call(GEO_PROBE, state["dna"])
+    except ToolNotAllowedError:
+        raise
+    except Exception as exc:  # broad on purpose: a dead provider skips the cycle
+        logger.warning("measure: visibility probe failed: %s", exc)
+        return None, (
+            "AI answer-engine visibility (the probe failed, so this cycle is skipped "
+            f"rather than recorded as an absence: {exc})"
+        )
+
+    if not isinstance(probe, Mapping):
+        return None, "AI answer-engine visibility (the probe returned nothing usable)"
+    return {
+        "source": "measure",
+        "baseline": _sov_view(probe),
+        "movement_note": (
+            "This run took the FIRST measurement for this business, so there is nothing "
+            "to compare it against yet."
+        ),
+    }, None
+
+
+def _sov_view(probe: Mapping[str, Any]) -> dict[str, Any]:
+    """A probe summary as a share of voice, or an explicit "no share to report".
+
+    `usable_answers` is the denominator the geo service already computed with
+    `no_answer` excluded, and this reads it rather than dividing anything itself. When
+    it is zero there is no share -- reporting 0% would record a model outage as the
+    brand being absent from answers nobody got, which is the difference between a
+    measurement and a fabrication.
+    """
+    usable = int(probe.get("usable_answers") or 0)
+    view: dict[str, Any] = {
+        "usable_answers": usable,
+        "no_answer_count": int(probe.get("no_answer_count") or 0),
+        # Travels with every number, because a share measured against a deterministic
+        # fake provider is not a measurement of anything.
+        "using_fake_provider": bool(probe.get("using_fake_provider")),
+        "caveats": [str(caveat) for caveat in (probe.get("caveats") or [])],
+    }
+    if usable <= 0:
+        view["measured"] = False
+        view["note"] = (
+            "No share of voice is reported: every probe came back no_answer, and "
+            "no_answer is excluded from the denominator. A model outage recorded as "
+            "brand absence would be a fabrication, not a measurement."
+        )
+        return view
+
+    view["measured"] = True
+    # The engine's own rendering, which physically cannot print a share without its
+    # denominator -- so nothing downstream can quote "22%" off nine samples.
+    view["headline"] = str(probe.get("headline") or "")
+    view["mention_share_pct"] = probe.get("mention_share_pct")
+    view["unprompted_mention_share_pct"] = probe.get("unprompted_mention_share_pct")
+    return view
 
 
 async def _bring_hashtags_in_range(
@@ -1291,4 +1962,19 @@ def _own_host(dna: Mapping[str, Any]) -> str | None:
     return website.removeprefix("https://").removeprefix("http://").split("/")[0]
 
 
-__all__ = ["CHANNEL_LIMITS", "DEFAULT_CHANNELS", "Node", "NodeDeps", "build_nodes"]
+__all__ = [
+    "ANALYTICS_GAP",
+    "CHANNEL_LIMITS",
+    "DEFAULT_CHANNELS",
+    "LANDING_TARGET",
+    "NOTHING_TO_PUBLISH_NOTE",
+    "NOTIFY_ACTION",
+    "NOT_APPROVED_NOTE",
+    "NO_ACTUATOR_NOTE",
+    "PAGE_PUBLISH_ACTION",
+    "PUBLISH_REVOKED_NOTE",
+    "SOCIAL_POST_ACTION",
+    "Node",
+    "NodeDeps",
+    "build_nodes",
+]

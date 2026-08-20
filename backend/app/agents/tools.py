@@ -109,10 +109,12 @@ KNOWN_TOOLS: Final[frozenset[str]] = frozenset(
 #: may hold one, and the injection test asserts exactly that.
 ACTUATOR_TOOLS: Final[frozenset[str]] = frozenset({PUBLISH, NOTIFY})
 
-#: The allowlist. Keys are every node in the documented machine, including the
-#: two (EXPORT, MEASURE) that are specified but not yet built -- their grants are
-#: recorded now so the barrier is already in place when they are wired, rather
-#: than being invented by whoever writes them.
+#: The allowlist. Keys are every node in the documented machine.
+#:
+#: EXPORT's and MEASURE's grants were recorded here BEFORE either node existed, so
+#: that the barrier was in place when they were wired rather than being invented by
+#: whoever wrote them. Both are wired now, and neither grant widened on the way in --
+#: `tests/agents/test_tool_allowlist.py` holds them to exactly this.
 NODE_TOOLS: Final[Mapping[str, frozenset[str]]] = {
     # No model call and no evidence gathering. It reads business memory, which is
     # our own data, not harvested text.

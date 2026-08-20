@@ -1,0 +1,399 @@
+"""Connecting a platform: the lifecycle, and the read model that never carries a token.
+
+This is the half of "connecting platforms" that does not depend on anybody's approval
+queue. Publishing to Facebook, Instagram, LinkedIn or TikTok is gated on per-platform App
+Review (``docs/CHANNELS.md`` §2-3, and see ``platform_oauth`` for why no real client is
+written yet) — but *storing a credential safely*, *knowing whether it is still usable*,
+and *renewing it before it dies* are ours to get right, and everything downstream waits
+on them.
+
+Three rules shape the module.
+
+**A read never yields a credential.** :class:`ConnectionView` has no field that could
+hold one: it carries a masked hint and the scheme that wrote the envelope, and that is
+all a screen, an API response or a log line ever needs. Getting the plaintext is a
+separate, differently-named call on the store (``reveal_access``), so "who can read a
+token" is answerable with grep instead of with a review.
+
+**The clock decides usability, not the status column.** ``status`` is a cache of a fact
+whose truth changes without anybody writing a row: a token with ``expires_at`` five
+minutes ago is expired whether or not a sweep has noticed. So
+:meth:`ConnectionView.unusable_reason` is the authority every surface asks — the actuator
+included — and :func:`mark_expired_if_stale` exists only so SQL-level reads agree with
+it. If those two ever disagree the pure function wins, which is the same discipline the
+rest of this codebase applies to derived state.
+
+**A refusal to store is the correct outcome when there is no cipher.** With no
+``PLATFORM_CREDENTIAL_KEY`` the cipher refuses (``core/token_cipher``), so
+:func:`complete_connect` fails and no row is written. The alternative — write the token
+in the clear and tidy it up later — leaves every credential taken before the cleanup
+readable forever, in every backup made meanwhile.
+"""
+
+from __future__ import annotations
+
+import logging
+import secrets
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Final, Protocol
+from uuid import UUID
+
+from backend.app.core.token_cipher import Secret
+from backend.app.services.platform_oauth import (
+    CONNECTABLE_PLATFORMS,
+    PLATFORM_SCOPES,
+    OAuthError,
+    OAuthProvider,
+    TokenGrant,
+)
+
+logger: Final = logging.getLogger(__name__)
+
+__all__ = [
+    "AuthorizationRequest",
+    "ConnectionStatus",
+    "ConnectionStore",
+    "ConnectionView",
+    "begin_connect",
+    "complete_connect",
+    "mark_expired_if_stale",
+    "refresh_connection",
+    "revoke_connection",
+]
+
+#: How long before the stated expiry a credential is treated as due for renewal. A token
+#: that expires in forty seconds is not worth publishing with: the request would be built,
+#: sent, and refused, and the post would be lost to a race we could have avoided by
+#: renewing first.
+RENEW_BEFORE: Final = 300  # seconds
+
+#: Entropy for the OAuth ``state`` parameter. 32 bytes because this value is the only
+#: thing standing between a genuine callback and an attacker's — a guessable state is a
+#: connection made to somebody else's account.
+_STATE_BYTES: Final = 32
+
+
+class ConnectionStatus(StrEnum):
+    """The stored lifecycle state of a connection.
+
+    Mirrors the CHECK constraint on ``platform_connections.status`` deliberately: a value
+    this code can produce and the database will reject is a write that fails at 3am, so
+    the two lists are the same list.
+    """
+
+    CONNECTED = "connected"
+    #: The credential passed its expiry and no refresh has succeeded. Recoverable — a
+    #: refresh may still work, which is why it is not the same thing as revoked.
+    EXPIRED = "expired"
+    #: Withdrawn, here or at the platform. Terminal: the credential is forgotten and the
+    #: business has to authorise again.
+    REVOKED = "revoked"
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionView:
+    """Everything about a connection except the credential.
+
+    Safe to return from an API, render on a screen, and put in a log. There is no field
+    here that could hold a token, which is the property that makes that true by
+    construction rather than by care.
+    """
+
+    business_id: UUID
+    platform: str
+    external_account_id: str
+    external_account_name: str | None
+    scopes: tuple[str, ...]
+    status: ConnectionStatus
+    expires_at: datetime | None
+    #: A prefix/suffix of the credential — enough for a human to match this row against a
+    #: token they are holding, not enough to use.
+    credential_hint: str
+    #: Which cipher wrote the envelope. Queryable, so a key rotation can find the rows it
+    #: still has to re-encrypt.
+    credential_scheme: str
+    #: Whether a credential is stored at all. False after a revoke, which wipes it.
+    has_credential: bool = True
+    #: True when the grant came from the fake OAuth provider. Carried all the way to the
+    #: screen, because a connection that was never made to a real platform must not look
+    #: like one that was.
+    fake: bool = False
+
+    def is_expired(self, *, now: datetime | None = None) -> bool:
+        """Whether the clock has passed the stated expiry.
+
+        ``expires_at is None`` means "no expiry known", which is not the same as "never
+        expires" — some platforms simply do not say. Such a credential cannot be expired
+        by the clock; only the platform rejecting it can move it.
+        """
+        if self.expires_at is None:
+            return False
+        moment = now if now is not None else datetime.now(UTC)
+        return _as_utc(self.expires_at) <= moment
+
+    def needs_renewal(self, *, now: datetime | None = None) -> bool:
+        """Whether it is expired or close enough that publishing with it is a race."""
+        if self.expires_at is None:
+            return False
+        moment = now if now is not None else datetime.now(UTC)
+        return (_as_utc(self.expires_at) - moment).total_seconds() <= RENEW_BEFORE
+
+    def unusable_reason(self, *, now: datetime | None = None) -> str | None:
+        """Why nothing may be published on this connection, or ``None`` if it may.
+
+        One function, every caller — the actuator's refusal message, the dashboard's
+        warning badge and the refresh sweep all read the same sentence, so they cannot
+        disagree about whether a business is connected.
+        """
+        if self.status is ConnectionStatus.REVOKED:
+            return (
+                f"the {self.platform} connection was revoked; the business has to "
+                "authorise it again"
+            )
+        if not self.has_credential:
+            return f"the {self.platform} connection holds no credential"
+        if self.status is ConnectionStatus.EXPIRED or self.is_expired(now=now):
+            # `expires_at` can legitimately be None on a row already marked expired -- a
+            # platform that refused a refresh without ever stating an expiry. Formatting
+            # None would turn a refusal into a TypeError, so the sentence adapts.
+            when = (
+                f" at {_as_utc(self.expires_at):%Y-%m-%d %H:%M} UTC"
+                if self.expires_at is not None
+                else ""
+            )
+            return f"the {self.platform} credential expired{when} and has not been renewed"
+        return None
+
+
+class ConnectionStore(Protocol):
+    """Persistence for ``platform_connections``.
+
+    A protocol, so the lifecycle below is testable without a database — and so the
+    actuator can be handed something narrower than the real store.
+
+    Note the split that matters: every read returns a :class:`ConnectionView`, and the
+    plaintext is only available through the two ``reveal_*`` methods. That is not a
+    convenience; it is the reason a credential cannot leak into a response by somebody
+    returning the wrong object.
+    """
+
+    async def save_grant(
+        self, *, business_id: UUID, platform: str, grant: TokenGrant
+    ) -> ConnectionView: ...
+
+    async def view(self, *, business_id: UUID, platform: str) -> ConnectionView | None: ...
+
+    async def views(self, *, business_id: UUID) -> list[ConnectionView]: ...
+
+    async def reveal_access(self, *, business_id: UUID, platform: str) -> Secret | None: ...
+
+    async def reveal_refresh(self, *, business_id: UUID, platform: str) -> Secret | None: ...
+
+    async def set_status(
+        self,
+        *,
+        business_id: UUID,
+        platform: str,
+        status: ConnectionStatus,
+        forget_credential: bool = False,
+    ) -> ConnectionView | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationRequest:
+    """Where to send the human, and the ``state`` the callback must echo back.
+
+    ``state`` is returned to the caller rather than stored here because verifying it is a
+    session concern: the value has to be held wherever the browser's session is, and this
+    module has neither a session nor a request. Two places deciding whether a callback is
+    genuine is one place too many.
+    """
+
+    url: str
+    state: str
+    platform: str
+    scopes: tuple[str, ...]
+
+
+def begin_connect(
+    provider: OAuthProvider,
+    *,
+    redirect_uri: str,
+    scopes: Sequence[str] | None = None,
+) -> AuthorizationRequest:
+    """Build the authorization URL for one platform. Pure: nothing is called or stored.
+
+    ``scopes`` defaults to :data:`platform_oauth.PLATFORM_SCOPES`, so a caller cannot
+    accidentally request a narrower set than publishing needs and discover it weeks later
+    as a permissions error on a post.
+    """
+    platform = provider.platform
+    if platform not in CONNECTABLE_PLATFORMS:
+        raise ValueError(f"{platform!r} is not a connectable platform")
+
+    requested = tuple(scopes) if scopes is not None else PLATFORM_SCOPES[platform]
+    state = secrets.token_urlsafe(_STATE_BYTES)
+    return AuthorizationRequest(
+        url=provider.authorization_url(redirect_uri=redirect_uri, state=state, scopes=requested),
+        state=state,
+        platform=platform,
+        scopes=requested,
+    )
+
+
+async def complete_connect(
+    *,
+    store: ConnectionStore,
+    provider: OAuthProvider,
+    business_id: UUID,
+    code: str,
+    redirect_uri: str,
+) -> ConnectionView:
+    """Exchange the callback code and persist the connection.
+
+    Raises :class:`platform_oauth.OAuthError` if the exchange fails and
+    ``core.token_cipher.CipherNotConfiguredError`` if there is nowhere safe to put the
+    result. Neither is caught here: both mean no connection exists, and inventing a row
+    that says otherwise is how a dashboard ends up claiming a business is connected to an
+    account it never authorised.
+    """
+    grant = await provider.exchange_code(code=code, redirect_uri=redirect_uri)
+    view = await store.save_grant(business_id=business_id, platform=provider.platform, grant=grant)
+    logger.info(
+        "platform connected: business=%s platform=%s account=%s scopes=%s fake=%s",
+        business_id,
+        view.platform,
+        view.external_account_id,
+        ",".join(view.scopes),
+        view.fake,
+    )
+    return view
+
+
+async def refresh_connection(
+    *,
+    store: ConnectionStore,
+    provider: OAuthProvider,
+    business_id: UUID,
+    platform: str,
+) -> ConnectionView | None:
+    """Renew a connection's credential. Returns the resulting view, or ``None`` if absent.
+
+    Failure is recorded, not raised: a platform that refuses the refresh has told us the
+    connection is dead, and the useful outcome of learning that is a row saying
+    ``expired`` — which is what makes the dashboard able to ask the business to reconnect.
+    Raising instead would leave the row claiming ``connected`` and the next publish
+    discovering it the hard way.
+    """
+    current = await store.view(business_id=business_id, platform=platform)
+    if current is None:
+        return None
+
+    refresh_token = await store.reveal_refresh(business_id=business_id, platform=platform)
+    if refresh_token is None:
+        logger.info(
+            "cannot refresh: business=%s platform=%s has no refresh credential",
+            business_id,
+            platform,
+        )
+        return await store.set_status(
+            business_id=business_id, platform=platform, status=ConnectionStatus.EXPIRED
+        )
+
+    try:
+        grant = await provider.refresh(refresh_token)
+    except OAuthError as exc:
+        # WARNING, not exception(): a refused refresh is the platform working as designed
+        # (the user removed our app), and a stack trace per dead connection is how a log
+        # becomes unreadable.
+        logger.warning(
+            "refresh refused: business=%s platform=%s retryable=%s error=%s",
+            business_id,
+            platform,
+            exc.retryable,
+            exc,
+        )
+        if exc.retryable:
+            # Leave the row alone: a rate limit or a 502 says nothing about whether the
+            # credential is still good, and writing `expired` on one would ask the
+            # business to reconnect an account that is fine.
+            return current
+        return await store.set_status(
+            business_id=business_id, platform=platform, status=ConnectionStatus.EXPIRED
+        )
+
+    return await store.save_grant(business_id=business_id, platform=platform, grant=grant)
+
+
+async def revoke_connection(
+    *,
+    store: ConnectionStore,
+    provider: OAuthProvider,
+    business_id: UUID,
+    platform: str,
+) -> ConnectionView | None:
+    """Disconnect: tell the platform, then forget the credential.
+
+    In that order, and the order is the whole point. Wiping our copy first would leave a
+    live token on the platform that we can no longer revoke — the credential outlives the
+    disconnect the customer just asked for. Conversely a provider that fails to revoke
+    must NOT stop us forgetting: the customer asked to disconnect, and a token we cannot
+    revoke is a token we should at least stop being able to use.
+    """
+    credential = await store.reveal_access(business_id=business_id, platform=platform)
+    if credential is not None:
+        try:
+            await provider.revoke(credential)
+        except OAuthError as exc:
+            logger.warning(
+                "revoke at platform failed, forgetting locally anyway: "
+                "business=%s platform=%s error=%s",
+                business_id,
+                platform,
+                exc,
+            )
+
+    return await store.set_status(
+        business_id=business_id,
+        platform=platform,
+        status=ConnectionStatus.REVOKED,
+        forget_credential=True,
+    )
+
+
+async def mark_expired_if_stale(
+    *,
+    store: ConnectionStore,
+    business_id: UUID,
+    platform: str,
+    now: datetime | None = None,
+) -> ConnectionView | None:
+    """Write ``expired`` for a connection the clock has already passed.
+
+    Purely so a SQL-level read agrees with :meth:`ConnectionView.unusable_reason`. Every
+    surface is already correct without this — the pure function folds the clock — so this
+    never has to run for the product to behave; it runs so a report does not disagree with
+    a screen.
+    """
+    current = await store.view(business_id=business_id, platform=platform)
+    if current is None:
+        return None
+    if current.status is not ConnectionStatus.CONNECTED or not current.is_expired(now=now):
+        return current
+    return await store.set_status(
+        business_id=business_id, platform=platform, status=ConnectionStatus.EXPIRED
+    )
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """Read a naive timestamp as UTC, never as local time.
+
+    ``expires_at`` is ``timestamptz`` so asyncpg returns an aware value, but a naive one
+    can still arrive from a test or a fixture. Guessing local time would move every
+    expiry by the server's offset — in one direction that publishes with a dead token, in
+    the other it declares a live connection broken.
+    """
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)

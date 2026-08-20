@@ -1,5 +1,8 @@
 """What the review screen shows: one run's output, projected out of its checkpoint.
 
+Two projections live here, over the same checkpoint: the four review tabs
+(:func:`project_review`) and the Tier 3 export pack (:func:`project_export_pack`).
+
 The review surface has four tabs — the blog draft, the deterministic SEO findings, the
 social posts per channel, and the "AI blocks" an answer engine can quote. All four are
 already produced by the graph and already persisted: ``AgentState`` carries ``draft``,
@@ -34,25 +37,78 @@ exactly this), so publishing one of them on the wire would make this module a th
 and the review screen would eventually contradict the rubric that grades it. The measured
 character count IS returned, because that is arithmetic over the text in hand and cannot
 drift. REPACK has already enforced its ceiling by the time a rendering is stored.
+
+------------------------------------------------------------------------------
+The export pack (docs/CHANNELS.md section 2, Tier 3)
+------------------------------------------------------------------------------
+
+Tier 3 — "copy-paste ready" — is this product's actual publishing story: it works on
+every platform on day one, with no App Review and no token, and for many customers it is
+what they want anyway. :func:`project_export_pack` is what makes it a deliverable rather
+than a copy button, and it is a SIBLING FUNCTION IN THIS MODULE rather than a module of
+its own, for three reasons:
+
+* it reads the same checkpoint through the same defensive readers. A separate module
+  would either import ten private helpers across a boundary or grow a second copy of
+  them, and a second ``_text``/``_strings``/``_int`` is a second set of edge cases for
+  the same JSONB column;
+* the two projections must agree. ``characters`` on the review screen and
+  ``bodyCharacters`` in the pack are the same measurement of the same string, and the
+  cheapest way to keep two numbers identical is for one function to be able to see the
+  other;
+* the absence contract is identical — name the node, invent nothing — and it is stated
+  once, above, for both.
+
+What the pack adds beyond the review screen is the *cost of posting it by hand*: the
+character count against the channel's editorial target AND its platform ceiling, the
+hashtag count against the cap, whether a link in the body is clickable at all
+(``ChannelSpec.link_in_body`` — the Instagram/TikTok truth that
+docs/CHANNELS.md section 1 calls the correction that matters most), and one block of text
+per channel that is exactly what should be pasted.
+
+Two honesty rules are load-bearing here, because this is the surface where a small
+exaggeration becomes a double-posted or an unpostable post:
+
+**Nothing in the pack claims to have been published.** No actuator is called, no
+``actions`` row is written, and no wording in the rendered file says otherwise. The
+``publish`` actuator exists (``actuators/contract.py``) and the EXPORT node that would
+drive it is specified and not in the graph — so the pack says that, rather than implying
+a connection that is not there.
+
+**The tracked short link is REPORTED ABSENT rather than invented.** Short links are minted
+by :func:`backend.app.services.landing_service.publish_landing_page`, which no route and
+no node calls yet, so no run has one. A pack that printed a plausible ``/l/xxxxxxxx``
+would be a URL that 404s in somebody's Instagram bio. The bio-link hub URL IS real —
+``GET /go/{business_id}`` resolves permanently (see ``api/links.py``) — so the pack
+carries that, with what it does and does not contain stated beside it.
 """
 
+import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Final
+from dataclasses import dataclass
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from backend.app.engines.channel import CHANNEL_SPECS, canonical_channel
+from backend.app.engines.channel import CHANNEL_SPECS, ChannelSpec, canonical_channel
 
 __all__ = [
     "AiBlocks",
     "Draft",
+    "ExportChannel",
+    "ExportCta",
+    "ExportLandingPage",
+    "ExportPack",
+    "ExportProofPoint",
     "Opportunity",
     "ReviewFinding",
     "RunReview",
     "SeoReport",
     "SocialPost",
+    "project_export_pack",
     "project_review",
+    "render_export_markdown",
 ]
 
 
@@ -83,6 +139,48 @@ _OUTLINE_WITHOUT_BLOCKS: Final = (
     "PLAN produced an outline but no answer blocks. They are an optional field on the "
     "outline, so the model returned none for this run — nothing has been hidden, and "
     "nothing has been invented to fill the tab."
+)
+_NO_LANDING: Final = (
+    "No landing page was written, so there is nothing for a click to land on. The page, "
+    "its offer and its per-channel asks come from the CONVERT node, which has not "
+    "completed for this run."
+)
+
+#: Why there is no per-channel tracked link, and what to do instead. Stated rather than
+#: filled: a plausible-looking `/l/xxxxxxxx` in the pack is a dead link in somebody's
+#: Instagram bio, which is worse than an honest gap because the failure is invisible.
+#:
+#: Worded as a fact about THIS pack — a short link is not in it — rather than as a claim
+#: about which node is missing. The node that would mint one is being built, and a
+#: sentence naming it goes stale the day it lands, at which point the honest note becomes
+#: the misleading one.
+_NO_TRACKED_LINK: Final = (
+    "No tracked short link is in this pack. A short link is minted when a landing page is "
+    "published to a public address, and that has not happened for this run — so put your "
+    "own destination address in the posts that can carry one, and use the bio-link hub for "
+    "the channels that cannot."
+)
+
+#: What the hub is, and what it is not. The route resolves for any business, so the URL
+#: is always real; whether it has anything ON it depends on what has been approved, and
+#: saying so is the difference between a working link and an apparently broken one.
+_HUB_NOTE: Final = (
+    "This is the business's own bio-link page and it is the entire conversion path for "
+    "Instagram and TikTok, where a link in the body is not clickable. It lists the CTAs "
+    "that have been approved for this business, so it is empty until one has been."
+)
+
+#: The one sentence the pack exists to make unmissable.
+#:
+#: Phrased as a fact about what THIS ROUTE does rather than about the product's
+#: capabilities, and that is deliberate. "No platform is connected" is a claim about a
+#: deployment: it stops being true the day a `publish` actuator has a credential, and a
+#: stale reassurance is worse than none. What is permanently true is that projecting a
+#: pack calls no actuator and sends nothing, so that is what it says.
+_NOTHING_PUBLISHED: Final = (
+    "This pack sends nothing to any platform. Every block below is text for a person to "
+    "paste in themselves — which is why it works even on a channel we cannot publish to "
+    "at all."
 )
 
 
@@ -301,30 +399,41 @@ def _seo(checkpoint: Mapping[str, Any]) -> SeoReport | None:
     )
 
 
-def _social(checkpoint: Mapping[str, Any]) -> tuple[SocialPost, ...]:
-    """Channels in whatever order the stored mapping yields, with no re-sorting.
+@dataclass(frozen=True, slots=True)
+class _StoredPost:
+    """One rendering as the checkpoint holds it, decoded once for both projections.
 
-    Worth stating plainly, because it is tempting to claim more: this order is NOT the
-    order REPACK wrote. The checkpoint is a JSONB column and Postgres normalises object
-    key order on the way in (by key length, then bytewise), so a `linkedin, facebook,
-    instagram` rendering comes back as `facebook, linkedin, instagram`. Verified against a
-    real row, not assumed.
+    Its reason to exist is that the review screen and the export pack must never
+    disagree about the same post: two decoders for the two stored shapes below would be
+    two chances to read ``hashtags_removed`` differently, and the numbers would drift on
+    two screens that show the same run.
+    """
 
-    The order is therefore arbitrary but deterministic. This function deliberately does
-    not impose one of its own: any sort we invented here would look like a priority the
-    product does not have, and channel priority is a decision for whoever publishes, not
-    for a projection function.
+    channel: str
+    body: str
+    hashtags: tuple[str, ...]
+    hashtags_removed: int
+    hashtags_shortfall: int
+    over_target: bool
+    #: The channel's spec, or ``None`` for a channel the table does not cover. Resolved
+    #: here so neither projection has to remember to fold the alias first.
+    spec: ChannelSpec | None
+
+
+def _stored_posts(checkpoint: Mapping[str, Any]) -> tuple[_StoredPost, ...]:
+    """Every usable rendering in the checkpoint, in the order the mapping yields.
+
+    Two shapes, and both are real rows in the database. REPACK used to store the bare
+    body string; it now stores a mapping so the hashtags it asked the model for survive
+    to this screen. Nothing migrates a JSONB display field, so an older run must keep
+    rendering -- as a post with no hashtag information, which is true of it.
     """
     raw = checkpoint.get("renderings")
     if not isinstance(raw, Mapping):
         return ()
-    posts: list[SocialPost] = []
+
+    posts: list[_StoredPost] = []
     for channel, value in raw.items():
-        # Two shapes, and both are real rows in the database. REPACK used to store the
-        # bare body string; it now stores a mapping so the hashtags it asked the model
-        # for survive to this screen. Nothing migrates a JSONB display field, so an
-        # older run must keep rendering -- as a post with no hashtag information, which
-        # is true of it.
         if isinstance(value, Mapping):
             body: Any = value.get("body")
             tags = _strings(value.get("hashtags"))
@@ -339,22 +448,49 @@ def _social(checkpoint: Mapping[str, Any]) -> tuple[SocialPost, ...]:
         if not name or not text:
             continue
 
-        spec = CHANNEL_SPECS.get(canonical_channel(name))
         posts.append(
-            SocialPost(
+            _StoredPost(
                 channel=name,
                 body=text,
-                characters=len(text),
                 hashtags=tags,
                 hashtags_removed=removed,
                 hashtags_shortfall=shortfall,
-                character_target=spec.max_chars if spec else None,
-                character_limit=spec.hard_max_chars if spec else None,
-                hashtag_limit=spec.hashtags_max if spec else None,
                 over_target=over,
+                spec=CHANNEL_SPECS.get(canonical_channel(name)),
             )
         )
     return tuple(posts)
+
+
+def _social(checkpoint: Mapping[str, Any]) -> tuple[SocialPost, ...]:
+    """Channels in whatever order the stored mapping yields, with no re-sorting.
+
+    Worth stating plainly, because it is tempting to claim more: this order is NOT the
+    order REPACK wrote. The checkpoint is a JSONB column and Postgres normalises object
+    key order on the way in (by key length, then bytewise), so a `linkedin, facebook,
+    instagram` rendering comes back as `facebook, linkedin, instagram`. Verified against a
+    real row, not assumed.
+
+    The order is therefore arbitrary but deterministic. This function deliberately does
+    not impose one of its own: any sort we invented here would look like a priority the
+    product does not have, and channel priority is a decision for whoever publishes, not
+    for a projection function.
+    """
+    return tuple(
+        SocialPost(
+            channel=post.channel,
+            body=post.body,
+            characters=len(post.body),
+            hashtags=post.hashtags,
+            hashtags_removed=post.hashtags_removed,
+            hashtags_shortfall=post.hashtags_shortfall,
+            character_target=post.spec.max_chars if post.spec else None,
+            character_limit=post.spec.hard_max_chars if post.spec else None,
+            hashtag_limit=post.spec.hashtags_max if post.spec else None,
+            over_target=post.over_target,
+        )
+        for post in _stored_posts(checkpoint)
+    )
 
 
 def _ai_blocks(checkpoint: Mapping[str, Any]) -> tuple[AiBlocks | None, str | None]:
@@ -455,3 +591,463 @@ def project_review(checkpoint: Mapping[str, Any] | None) -> RunReview:
         fact_gaps=_strings(checkpoint.get("fact_gaps")),
         errors=_errors(checkpoint),
     )
+
+
+# --------------------------------------------------------------------------- #
+# The export pack: what a human pastes, and what it will cost them to get right
+# --------------------------------------------------------------------------- #
+
+
+#: How a link reaches a reader on this channel. ``bio_hub`` is not a preference, it is
+#: the only route Instagram feed and TikTok have — a URL in the body there is plain text.
+type LinkMechanism = Literal["inline", "bio_hub", "unknown"]
+
+
+class ExportChannel(_Wire):
+    """One channel's block, ready to paste, with the cost of pasting it stated.
+
+    ``paste_text`` is the field that matters: it is the exact string to put in the
+    composer, and it is assembled HERE rather than in the client so that the count next
+    to it is a count of the same string. A client that joined the body and the hashtags
+    itself would be measuring one thing and pasting another.
+
+    Two character counts, and the distinction is not pedantry. ``body_characters`` is the
+    number the review screen shows, so the two screens cannot appear to disagree;
+    ``paste_characters`` is what the platform will actually receive, which is larger when
+    a declared hashtag was not already in the body. The limits are compared against the
+    second one, because that is the string being posted.
+    """
+
+    channel: str
+    body: str
+    #: Exactly what to paste: the body, plus any declared hashtag the body was missing.
+    paste_text: str
+    hashtags: tuple[str, ...]
+    #: Declared hashtags that are NOT already written into the body, and are therefore
+    #: appended to ``paste_text``. Usually empty — REPACK keeps the model's inline tags.
+    appended_hashtags: tuple[str, ...]
+    body_characters: int
+    paste_characters: int
+    #: The channel's editorial target and its platform reject threshold, from the one
+    #: spec table the runtime renders to and the eval grades against. ``None`` for a
+    #: channel that table does not cover: "0 / 0" would be a limit we made up.
+    character_target: int | None
+    character_limit: int | None
+    hashtag_count: int
+    hashtag_minimum: int | None
+    hashtag_limit: int | None
+    hashtags_removed: int
+    hashtags_shortfall: int
+    #: Over the editorial target, inside the platform limit: publishable, and longer than
+    #: it should be.
+    over_target: bool
+    #: Over the platform's own reject threshold. REPACK trims the body to it, so this can
+    #: only be true when appending the declared hashtags pushed it past — which is worth
+    #: saying, because the platform will refuse the paste and not explain why.
+    over_limit: bool
+    #: ``None`` when no spec covers this channel. Not defaulted to ``True``: telling
+    #: somebody a link works when we do not know is how a CTA becomes plain text.
+    link_in_body: bool | None
+    link_mechanism: LinkMechanism
+    #: What this channel will cost the poster, one honest sentence each. Rendered by the
+    #: screen AND by the downloaded file, so the wording cannot drift between them.
+    notes: tuple[str, ...]
+
+
+class ExportProofPoint(_Wire):
+    """One reason to believe the offer, and the source it came from.
+
+    ``source`` travels with the text and is never dropped. It is required by
+    ``engines.landing``'s contract for the reason that applies twice as hard on an export
+    the customer will paste under their own name: an unsourced proof point is an invented
+    claim about their business.
+    """
+
+    text: str
+    source: str
+
+
+class ExportCta(_Wire):
+    """The ask, written for one channel."""
+
+    channel: str
+    text: str
+
+
+class ExportLandingPage(_Wire):
+    """The page a click is supposed to land on, as CONVERT wrote it."""
+
+    headline: str
+    subhead: str | None
+    offer: str
+    primary_cta: str
+    consent_text: str | None
+    proof_points: tuple[ExportProofPoint, ...]
+    channel_ctas: tuple[ExportCta, ...]
+
+
+class ExportPack(_Wire):
+    """Everything Tier 3 needs, and every gap in it named.
+
+    ``notice`` is on the wire rather than left to the client on purpose: "this pack sends
+    nothing to any platform" is the one claim this payload must carry into every surface
+    that renders it, including the plain-text file, and a sentence each client writes for
+    itself is a sentence one client can forget.
+    """
+
+    has_pack: bool
+    notice: str
+    channels: tuple[ExportChannel, ...]
+    channels_note: str | None
+    landing_page: ExportLandingPage | None
+    landing_page_note: str | None
+    ai_blocks: AiBlocks | None
+    ai_blocks_note: str | None
+    #: The bio-link hub for this business. Real and permanent (``GET /go/{id}``), which is
+    #: why it is here at all: it is the only TRACKED address this pack can honestly offer,
+    #: and the only route at all on the channels that cannot carry a link.
+    hub_url: str | None
+    hub_note: str | None
+    tracked_link_note: str
+    fact_gaps: tuple[str, ...]
+    errors: tuple[dict[str, str], ...]
+
+
+def _missing_hashtags(body: str, hashtags: Sequence[str]) -> tuple[str, ...]:
+    """The declared tags the body does not already carry, in the order declared.
+
+    Matched on a word boundary rather than by substring, because ``#notar`` is a
+    substring of ``#notarkoblenz``: a substring test would report a tag as present when
+    it is not, and the paste would go out one hashtag short of what the screen showed.
+    """
+    return tuple(
+        tag
+        for tag in hashtags
+        if not re.search(rf"{re.escape(tag)}(?!\w)", body, flags=re.IGNORECASE)
+    )
+
+
+def _channel_notes(
+    post: _StoredPost, appended: Sequence[str], paste_length: int
+) -> tuple[str, ...]:
+    """What this channel will cost the poster. Empty when it costs nothing.
+
+    Every sentence is arithmetic over the text in hand or a fact from the spec table.
+    Nothing here is advice a model produced, and nothing is softened: an over-limit post
+    is refused by the platform, and the sentence says so.
+    """
+    spec = post.spec
+    notes: list[str] = []
+
+    if spec is None:
+        notes.append(
+            f"No channel spec covers {post.channel}, so no length limit, hashtag cap or "
+            "link behaviour is claimed for it. Check the platform's own rules before posting."
+        )
+    elif not spec.link_in_body:
+        notes.append(
+            f"A link in the body does not work on this channel — on {post.channel} a URL in "
+            "the body is plain text, not a clickable link. Use the bio hub instead."
+        )
+
+    if spec is not None and paste_length > spec.hard_max_chars:
+        notes.append(
+            f"{paste_length - spec.hard_max_chars:,} characters over this channel's "
+            f"{spec.hard_max_chars:,}-character platform limit — it will be refused as it "
+            "stands. Shorten it before pasting."
+        )
+    elif spec is not None and paste_length > spec.max_chars:
+        notes.append(
+            f"{paste_length - spec.max_chars:,} characters over this channel's "
+            f"{spec.max_chars:,}-character editorial target, inside the platform limit — "
+            "publishable, and longer than it should be."
+        )
+
+    if appended:
+        notes.append(
+            f"{len(appended)} hashtag{'' if len(appended) == 1 else 's'} "
+            f"({' '.join(appended)}) were listed for this post but not written into it, so "
+            "they are appended at the end of the block above."
+        )
+    if post.hashtags_removed > 0:
+        notes.append(
+            f"{post.hashtags_removed} hashtag{'' if post.hashtags_removed == 1 else 's'} "
+            "were removed in code to stay inside this channel's cap."
+        )
+    if post.hashtags_shortfall > 0:
+        notes.append(
+            f"{post.hashtags_shortfall} short of this channel's hashtag minimum — none "
+            "were invented to fill the gap, so add your own if you want them."
+        )
+    return tuple(notes)
+
+
+def _export_channels(checkpoint: Mapping[str, Any]) -> tuple[ExportChannel, ...]:
+    """One paste-ready block per rendered channel, in the stored order.
+
+    The order is the same arbitrary-but-deterministic order :func:`_social` documents,
+    and it is left alone here for the same reason: a sort invented in a projection reads
+    as a channel priority the product has not decided.
+    """
+    out: list[ExportChannel] = []
+    for post in _stored_posts(checkpoint):
+        spec = post.spec
+        appended = _missing_hashtags(post.body, post.hashtags)
+        paste = f"{post.body}\n\n{' '.join(appended)}" if appended else post.body
+        mechanism: LinkMechanism = (
+            "unknown" if spec is None else ("inline" if spec.link_in_body else "bio_hub")
+        )
+        out.append(
+            ExportChannel(
+                channel=post.channel,
+                body=post.body,
+                paste_text=paste,
+                hashtags=post.hashtags,
+                appended_hashtags=appended,
+                body_characters=len(post.body),
+                paste_characters=len(paste),
+                character_target=spec.max_chars if spec else None,
+                character_limit=spec.hard_max_chars if spec else None,
+                hashtag_count=len(post.hashtags),
+                hashtag_minimum=spec.hashtags_min if spec else None,
+                hashtag_limit=spec.hashtags_max if spec else None,
+                hashtags_removed=post.hashtags_removed,
+                hashtags_shortfall=post.hashtags_shortfall,
+                # Recomputed against the paste rather than trusting the stored flag:
+                # REPACK measured the body, and the appended hashtags are part of what
+                # gets posted. The stored flag stays authoritative on the review screen,
+                # which is showing the body.
+                over_target=bool(spec and len(paste) > spec.max_chars),
+                over_limit=bool(spec and len(paste) > spec.hard_max_chars),
+                link_in_body=spec.link_in_body if spec else None,
+                link_mechanism=mechanism,
+                notes=_channel_notes(post, appended, len(paste)),
+            )
+        )
+    return tuple(out)
+
+
+def _landing_page(checkpoint: Mapping[str, Any]) -> ExportLandingPage | None:
+    """The landing page CONVERT stored, read defensively.
+
+    Not ``LandingPageSpec.model_validate``: a checkpoint written by an earlier version of
+    the state, or half-written by a run that died, would raise — and a pack that 500s is
+    a pack nobody can export. A page with no headline and no offer is treated as absent
+    rather than reported as an empty page.
+    """
+    raw = _mapping(checkpoint.get("landing_page"))
+    headline = _text(raw.get("headline")).strip()
+    offer = _text(raw.get("offer")).strip()
+    if not headline and not offer:
+        return None
+
+    proof: list[ExportProofPoint] = []
+    points = raw.get("proof_points")
+    if isinstance(points, Sequence) and not isinstance(points, str | bytes):
+        for item in points:
+            entry = _mapping(item)
+            text = _optional_text(entry.get("text"))
+            source = _optional_text(entry.get("source"))
+            # Both or neither. A proof point whose source did not survive the round trip
+            # is an unsourced claim about the customer's business, and this module will
+            # not put one in a file they are about to paste under their own name.
+            if text is None or source is None:
+                continue
+            proof.append(ExportProofPoint(text=text, source=source))
+
+    ctas: list[ExportCta] = []
+    stored_ctas = raw.get("ctas")
+    if isinstance(stored_ctas, Sequence) and not isinstance(stored_ctas, str | bytes):
+        for item in stored_ctas:
+            entry = _mapping(item)
+            channel = _optional_text(entry.get("channel"))
+            text = _optional_text(entry.get("text"))
+            if channel is None or text is None:
+                continue
+            ctas.append(ExportCta(channel=channel, text=text))
+
+    return ExportLandingPage(
+        headline=headline,
+        subhead=_optional_text(raw.get("subhead")),
+        offer=offer,
+        primary_cta=_text(raw.get("primary_cta")).strip(),
+        consent_text=_optional_text(raw.get("consent_text")),
+        proof_points=tuple(proof),
+        channel_ctas=tuple(ctas),
+    )
+
+
+def project_export_pack(
+    checkpoint: Mapping[str, Any] | None,
+    *,
+    hub_url: str | None = None,
+) -> ExportPack:
+    """Project one run's checkpoint into the Tier 3 export pack.
+
+    Pure, like :func:`project_review`, and for the same reason — the whole pack contract
+    is assertable without a database, and the route stays a projection call plus a
+    header.
+
+    ``hub_url`` is a PARAMETER rather than something read from settings here, which keeps
+    the purity and mirrors ``landing_service``'s rule that an absolute URL comes from
+    configuration and never from a request: the caller holds both the configured base URL
+    and the authenticated business id, and this function holds neither.
+    """
+    if not checkpoint:
+        return ExportPack(
+            has_pack=False,
+            notice=_NOTHING_PUBLISHED,
+            channels=(),
+            channels_note=_NO_CHECKPOINT,
+            landing_page=None,
+            landing_page_note=_NO_CHECKPOINT,
+            ai_blocks=None,
+            ai_blocks_note=_NO_CHECKPOINT,
+            hub_url=hub_url,
+            hub_note=_HUB_NOTE if hub_url else None,
+            tracked_link_note=_NO_TRACKED_LINK,
+            fact_gaps=(),
+            errors=(),
+        )
+
+    channels = _export_channels(checkpoint)
+    landing = _landing_page(checkpoint)
+    ai_blocks, ai_note = _ai_blocks(checkpoint)
+
+    return ExportPack(
+        has_pack=bool(channels or landing or (ai_blocks and ai_blocks.blocks)),
+        notice=_NOTHING_PUBLISHED,
+        channels=channels,
+        channels_note=None if channels else _NO_SOCIAL,
+        landing_page=landing,
+        landing_page_note=None if landing else _NO_LANDING,
+        ai_blocks=ai_blocks,
+        ai_blocks_note=ai_note,
+        hub_url=hub_url,
+        hub_note=_HUB_NOTE if hub_url else None,
+        tracked_link_note=_NO_TRACKED_LINK,
+        fact_gaps=_strings(checkpoint.get("fact_gaps")),
+        errors=_errors(checkpoint),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The same pack as text, because the whole point of Tier 3 is that a human pastes it
+# --------------------------------------------------------------------------- #
+
+
+def _fence(text: str) -> str:
+    """A code fence long enough to hold ``text``.
+
+    Not a fixed ```````: a post containing three backticks would close the fence early
+    and the rest of it would be read as prose, so the paste would be silently truncated
+    at exactly the character that caused it. CommonMark allows a longer fence, so the
+    fence is measured against the content.
+    """
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _block(text: str) -> str:
+    fence = _fence(text)
+    return f"{fence}text\n{text}\n{fence}"
+
+
+def render_export_markdown(pack: ExportPack) -> str:
+    """The pack as Markdown: readable as plain text, pasteable block by block.
+
+    Markdown rather than JSON for the download because the deliverable is for a PERSON —
+    docs/CHANNELS.md section 2 is explicit that Tier 3's value is a restaurant owner
+    posting the draft in ten seconds — and a person cannot paste a JSON string that has
+    had its newlines escaped.
+
+    Pure, and derived entirely from ``pack``: the file and the screen therefore say the
+    same thing about the same run, including the notes and the absence notices.
+    """
+    lines: list[str] = ["# Export pack", "", pack.notice, ""]
+
+    if not pack.has_pack:
+        lines += ["This run produced nothing to export yet.", ""]
+
+    lines += ["## Channels", ""]
+    if pack.channels:
+        for channel in pack.channels:
+            lines += [f"### {channel.channel}", ""]
+            counts = f"{channel.paste_characters:,} characters"
+            if channel.paste_characters != channel.body_characters:
+                counts += f" ({channel.body_characters:,} before the appended hashtags)"
+            if channel.character_target is not None:
+                counts += f" · target {channel.character_target:,}"
+            if channel.character_limit is not None:
+                counts += f" · platform limit {channel.character_limit:,}"
+            lines.append(counts)
+
+            tags = f"{channel.hashtag_count} hashtag{'' if channel.hashtag_count == 1 else 's'}"
+            if channel.hashtag_limit is not None:
+                tags += f" · at most {channel.hashtag_limit}"
+            if channel.hashtag_minimum:
+                tags += f" · at least {channel.hashtag_minimum}"
+            lines.append(tags)
+
+            lines.append(
+                "Link: put it in the body — it is clickable here."
+                if channel.link_mechanism == "inline"
+                else (
+                    "Link: use the bio hub. A URL in the body is not clickable on this channel."
+                    if channel.link_mechanism == "bio_hub"
+                    else "Link: unknown for this channel — check the platform's own rules."
+                )
+            )
+            lines.append("")
+            if channel.notes:
+                lines += [f"- {note}" for note in channel.notes] + [""]
+            lines += [_block(channel.paste_text), ""]
+    else:
+        lines += [pack.channels_note or "No channel copy was rendered.", ""]
+
+    lines += ["## Landing page", ""]
+    page = pack.landing_page
+    if page is None:
+        lines += [pack.landing_page_note or "No landing page was written.", ""]
+    else:
+        lines += [f"**{page.headline}**", ""]
+        if page.subhead:
+            lines += [page.subhead, ""]
+        lines += [f"Offer: {page.offer}", f"Button: {page.primary_cta}"]
+        if page.consent_text:
+            lines.append(f"Consent line: {page.consent_text}")
+        lines.append("")
+        if page.proof_points:
+            lines += ["Proof points, each with the source it came from:", ""]
+            lines += [f"- {p.text} — source: {p.source}" for p in page.proof_points]
+            lines.append("")
+        if page.channel_ctas:
+            lines += ["The ask, per channel:", ""]
+            lines += [f"- {cta.channel}: {cta.text}" for cta in page.channel_ctas]
+            lines.append("")
+
+    lines += ["## Answer blocks for AI engines", ""]
+    blocks = pack.ai_blocks
+    if blocks is None or not blocks.blocks:
+        lines += [pack.ai_blocks_note or "No answer blocks were produced.", ""]
+    else:
+        if blocks.target_keyword:
+            lines += [f"Written for: {blocks.target_keyword}", ""]
+        lines += [f"{i}. {block}" for i, block in enumerate(blocks.blocks, start=1)]
+        lines.append("")
+
+    lines += ["## Links", ""]
+    if pack.hub_url:
+        lines += [f"Bio-link hub: {pack.hub_url}", ""]
+        if pack.hub_note:
+            lines += [pack.hub_note, ""]
+    lines += [pack.tracked_link_note, ""]
+
+    if pack.fact_gaps or pack.errors:
+        lines += ["## What this was written without", ""]
+        lines += [f"- {gap}" for gap in pack.fact_gaps]
+        lines += [f"- {error['node']}: {error['message']}" for error in pack.errors]
+        lines.append("")
+
+    # One trailing newline, not several: this is a file somebody opens in an editor.
+    return "\n".join(lines).rstrip() + "\n"

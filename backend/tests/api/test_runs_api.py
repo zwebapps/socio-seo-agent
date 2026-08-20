@@ -267,6 +267,343 @@ async def test_the_draft_html_is_not_carried_in_the_polled_timeline_payload() ->
 
 
 # --------------------------------------------------------------------------- #
+# The export pack: Tier 3, which is the only publishing path this build has
+# --------------------------------------------------------------------------- #
+
+
+#: An Instagram caption with no hashtags written into it, so the three DECLARED tags have
+#: to be appended -- which is the case where the paste is longer than the body and the
+#: two counts must not be conflated.
+INSTAGRAM_BODY = "Wer beurkundet einen Grundstückskauf? Kurz erklärt."
+INSTAGRAM_TAGS = ["#Notar", "#Koblenz", "#Immobilien"]
+LINKEDIN_BODY = "Kurz erklärt: was ein Notar beurkundet. #Notar"
+
+
+async def _exportable_run(service: RunService) -> UUID:
+    """A run with two channels and a landing page, checkpointed through the real state.
+
+    Two channels on purpose, and specifically LinkedIn and Instagram: one carries a
+    clickable link and the other does not, and that difference is the whole reason the
+    pack exists rather than a copy button. The landing page is a real
+    ``LandingPageSpec``, dumped exactly as CONVERT dumps it -- a hand-written dict here
+    would hide a drift between the spec and this projection, which is the only bug this
+    route can really have.
+    """
+    from backend.app.engines.landing import ChannelCta, FormField, LandingPageSpec, ProofPoint
+
+    run = await service.start(business_id=BUSINESS, goal="more local leads")
+    state = new_state(business_id=BUSINESS, goal="more local leads")
+    state["outline"] = {
+        "target_keyword": "notar koblenz",
+        "headings": ["Kosten"],
+        "answer_blocks": ["Ein Notar beurkundet Grundstückskaufverträge."],
+        "cta": "Termin anfragen",
+    }
+    state["renderings"] = {
+        "linkedin": {
+            "body": LINKEDIN_BODY,
+            "hashtags": ["#Notar"],
+            "hashtags_removed": 2,
+            "hashtags_shortfall": 0,
+            "over_target": False,
+        },
+        "instagram": {
+            "body": INSTAGRAM_BODY,
+            "hashtags": INSTAGRAM_TAGS,
+            "hashtags_removed": 0,
+            "hashtags_shortfall": 0,
+            "over_target": False,
+        },
+    }
+    state["landing_page"] = LandingPageSpec(
+        headline="Grundstückskauf in Koblenz beurkunden lassen",
+        subhead="Termin innerhalb einer Woche",
+        offer="Kostenlose Ersteinschätzung Ihres Kaufvertrags",
+        proof_points=[ProofPoint(text="Über 400 Beurkundungen", source="Kanzleiprofil 2025")],
+        form_fields=[FormField(name="email", label="E-Mail", required=True)],
+        primary_cta="Termin anfragen",
+        consent_text="Ich bin mit der Kontaktaufnahme einverstanden.",
+        ctas=[ChannelCta(channel="instagram", text="Link in der Bio")],
+    ).model_dump(mode="json")
+    state["fact_gaps"] = ["uploaded documents"]
+    await service.checkpoint(run.id, state=state, current_node="REVIEW")
+    await service.await_approval(run.id)
+    return run.id
+
+
+async def test_the_export_pack_projects_paste_ready_copy_from_the_checkpoint() -> None:
+    """The pack is projected from the run's own checkpoint, not assembled by a client.
+
+    `pasteText` is the field the whole tier turns on: it is the exact string to put in
+    the composer, so the count beside it has to be a count of THAT string. A client that
+    joined the body and the hashtags itself would measure one thing and paste another.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run_id}/export")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["hasPack"] is True
+
+    by_channel = {channel["channel"]: channel for channel in body["channels"]}
+    assert set(by_channel) == {"linkedin", "instagram"}
+
+    linkedin = by_channel["linkedin"]
+    # The one tag is already written into the body, so nothing is appended and the two
+    # counts agree -- which is also the guard against blindly re-appending every tag.
+    assert linkedin["appendedHashtags"] == []
+    assert linkedin["pasteText"] == LINKEDIN_BODY
+    assert linkedin["bodyCharacters"] == len(LINKEDIN_BODY)
+    assert linkedin["pasteCharacters"] == len(LINKEDIN_BODY)
+    assert linkedin["characterTarget"] == 1_700
+    assert linkedin["characterLimit"] == 3_000
+    assert linkedin["hashtagLimit"] == 3
+    assert linkedin["linkInBody"] is True
+    assert linkedin["linkMechanism"] == "inline"
+
+    instagram = by_channel["instagram"]
+    assert instagram["appendedHashtags"] == INSTAGRAM_TAGS
+    assert instagram["pasteText"] == f"{INSTAGRAM_BODY}\n\n{' '.join(INSTAGRAM_TAGS)}"
+    assert instagram["bodyCharacters"] == len(INSTAGRAM_BODY)
+    assert instagram["pasteCharacters"] == len(instagram["pasteText"])
+    assert instagram["pasteCharacters"] > instagram["bodyCharacters"]
+
+    assert body["landingPage"]["offer"] == "Kostenlose Ersteinschätzung Ihres Kaufvertrags"
+    assert body["landingPage"]["proofPoints"][0]["source"] == "Kanzleiprofil 2025"
+    assert body["aiBlocks"]["blocks"] == ["Ein Notar beurkundet Grundstückskaufverträge."]
+    assert body["factGaps"] == ["uploaded documents"]
+
+
+async def test_the_pack_says_a_link_in_the_body_does_not_work_on_instagram() -> None:
+    """docs/CHANNELS.md section 1 calls this the correction that matters most: a URL in
+    an Instagram caption is not a broken link, it is NO link. Someone pasting the caption
+    by hand has to be told, or the CTA is dead and the attribution never happens."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        body = (await client.get(f"/api/v1/runs/{run_id}/export")).json()
+
+    instagram = next(c for c in body["channels"] if c["channel"] == "instagram")
+    assert instagram["linkInBody"] is False
+    assert instagram["linkMechanism"] == "bio_hub"
+    assert any("does not work on this channel" in note for note in instagram["notes"])
+    assert any("bio hub" in note for note in instagram["notes"])
+
+    # And the channel that CAN carry one is not warned about it, or the warning becomes
+    # noise that gets skipped on the channel where it matters.
+    linkedin = next(c for c in body["channels"] if c["channel"] == "linkedin")
+    assert not any("does not work on this channel" in note for note in linkedin["notes"])
+
+
+async def test_the_pack_reports_what_code_had_to_correct() -> None:
+    """Evidence about the MODEL, not the renderer. A tidy block shown without saying two
+    hashtags were cut out in code reports the renderer's competence as the model's."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        body = (await client.get(f"/api/v1/runs/{run_id}/export")).json()
+
+    linkedin = next(c for c in body["channels"] if c["channel"] == "linkedin")
+    assert linkedin["hashtagsRemoved"] == 2
+    assert any("removed in code" in note for note in linkedin["notes"])
+
+
+async def test_a_run_with_no_renderings_names_the_node_rather_than_an_empty_pack() -> None:
+    """An empty `channels` array with nothing beside it is indistinguishable from a
+    rendering bug, and the owner cannot tell "REPACK has not run" from "the download is
+    broken" -- which need completely different responses from them.
+
+    A run that HAS a checkpoint and no renderings, specifically: that is the state a run
+    stopped at OPPORTUNITY leaves behind, and it is the one where the note has to name a
+    node rather than say the run has saved nothing.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="g")
+    await service.checkpoint(
+        run.id,
+        state=new_state(business_id=BUSINESS, goal="g"),
+        current_node="OPPORTUNITY",
+    )
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run.id}/export")
+
+    assert response.status_code == 200, "the run exists; there is simply nothing in it yet"
+    body = response.json()
+    assert body["hasPack"] is False
+    assert body["channels"] == []
+    assert "REPACK" in body["channelsNote"], "the empty half must name the node that fills it"
+    assert body["landingPage"] is None
+    assert "CONVERT" in body["landingPageNote"], "and the two notes name DIFFERENT nodes"
+
+
+async def test_a_run_that_has_saved_nothing_at_all_says_that_instead() -> None:
+    """A different fact from "REPACK has not run", and it must read as one: this run has
+    not checkpointed once, so no node's absence can be singled out."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="g")
+
+    async with _client(service) as client:
+        body = (await client.get(f"/api/v1/runs/{run.id}/export")).json()
+
+    assert body["hasPack"] is False
+    assert "has not saved any state yet" in body["channelsNote"]
+
+
+async def test_the_pack_never_invents_a_tracked_short_link() -> None:
+    """Nothing mints a short link for a run yet (`publish_landing_page` has no caller),
+    so a plausible-looking `/l/xxxxxxxx` in the pack would be a URL that 404s in
+    somebody's Instagram bio. The hub URL is real and is offered instead."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        body = (await client.get(f"/api/v1/runs/{run_id}/export")).json()
+
+    assert body["trackedLinkNote"], "the absence has to be stated, not left as an empty field"
+    assert body["hubUrl"].endswith(f"/go/{BUSINESS}")
+    assert "/l/" not in json.dumps(body), "no short link may be fabricated anywhere in the pack"
+    for channel in body["channels"]:
+        assert "trackedLink" not in channel
+
+
+async def test_the_pack_never_claims_anything_was_published() -> None:
+    """The single most misleading thing this payload could do. No actuator is called on
+    this route, no `actions` row is written, and the notice says so in the payload rather
+    than leaving each client to write that sentence for itself.
+
+    Asserted on what the ROUTE does ("this pack sends nothing") rather than on a claim
+    about the deployment: a reassurance that no platform is connected would go stale the
+    day one is, and a stale reassurance is worse than none.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        body = (await client.get(f"/api/v1/runs/{run_id}/export")).json()
+
+    assert "sends nothing to any platform" in body["notice"]
+    assert "paste" in body["notice"]
+
+
+async def test_the_markdown_rendering_contains_the_copy_and_the_counts_it_claims() -> None:
+    """The reason the pack has a text rendering at all: Tier 3's value is that a person
+    pastes it somewhere, and nobody can paste an escaped JSON string."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run_id}/export?format=markdown")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/markdown; charset=utf-8"
+    text = response.text
+
+    # The copy itself, for both channels, including the appended hashtags.
+    assert LINKEDIN_BODY in text
+    assert INSTAGRAM_BODY in text
+    assert " ".join(INSTAGRAM_TAGS) in text
+    # The cost of pasting it: the measured count, the channel's target, its ceiling.
+    assert f"{len(LINKEDIN_BODY):,} characters" in text
+    assert "target 1,700" in text
+    assert "platform limit 3,000" in text
+    # The Instagram truth, in the file as well as on the screen.
+    assert "not clickable on this channel" in text
+    # The landing page and the answer blocks, because the pack is not only the posts.
+    assert "Kostenlose Ersteinschätzung Ihres Kaufvertrags" in text
+    assert "Kanzleiprofil 2025" in text
+    assert "Ein Notar beurkundet Grundstückskaufverträge." in text
+    # And what the run did NOT have, carried into the file rather than left on the screen.
+    assert "uploaded documents" in text
+
+
+async def test_the_markdown_is_an_attachment_named_after_the_run() -> None:
+    """`attachment`, so a browser saves the customer's unpublished copy rather than
+    rendering it as a page; named after the run, so two downloads do not collide."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run_id}/export?format=markdown")
+
+    disposition = response.headers["content-disposition"]
+    assert disposition == f'attachment; filename="export-pack-{run_id}.md"'
+
+
+async def test_the_markdown_of_an_empty_run_still_says_which_node_is_missing() -> None:
+    """A downloaded file with three empty headings reads as a broken export."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="g")
+    await service.checkpoint(
+        run.id, state=new_state(business_id=BUSINESS, goal="g"), current_node="OPPORTUNITY"
+    )
+
+    async with _client(service) as client:
+        text = (await client.get(f"/api/v1/runs/{run.id}/export?format=markdown")).text
+
+    assert "nothing to export yet" in text
+    assert "REPACK" in text, "the file carries the same note the screen does"
+    assert "CONVERT" in text
+
+
+async def test_an_unrecognised_export_format_is_refused() -> None:
+    """Rather than silently answering with JSON: a client that asked for something else
+    has a bug, and answering the question it did not ask is how that bug survives."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run_id}/export?format=pdf")
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("query", ["", "?format=markdown"])
+async def test_the_export_pack_is_not_cacheable(query: str) -> None:
+    """The customer's own unpublished copy, behind a session cookie. Same rule as the
+    runs list and the leads list -- and it applies to the FILE as much as to the JSON,
+    which is the branch a shared cache is most likely to keep."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run_id}/export{query}")
+
+    assert response.headers["cache-control"] == "no-store"
+
+
+async def test_the_export_pack_requires_a_session() -> None:
+    """No `current_user` override here, deliberately: this route hands over the whole of
+    a business's unpublished content, so it must be no more reachable than the timeline.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(service)
+
+    app = create_app()
+    app.dependency_overrides[runs_api.get_run_service] = lambda: service
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.get(f"/api/v1/runs/{run_id}/export")).status_code == 401
+        assert (
+            await client.get(f"/api/v1/runs/{run_id}/export?format=markdown")
+        ).status_code == 401
+
+
+async def test_an_export_pack_for_another_businesss_run_is_404() -> None:
+    service = RunService(InMemoryRunStore())
+    other = await service.start(business_id=uuid4(), goal="someone else's run")
+
+    async with _client(service) as client:
+        assert (await client.get(f"/api/v1/runs/{other.id}/export")).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
 # The executor is actually reached, and resume refuses what it should
 # --------------------------------------------------------------------------- #
 

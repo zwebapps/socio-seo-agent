@@ -31,6 +31,19 @@ DEFAULT_MAX_STEPS = 14
 DEFAULT_MAX_USD = Decimal("0.50")
 DEFAULT_MAX_VALIDATE_LOOPS = 2
 
+#: The approver recorded when a run is approved through a surface that carries no user
+#: identity.
+#:
+#: `Actuation.approved_by` accepts either a user id or ``"policy:<name>"``, and this is
+#: the second case: as of today NOTHING in this system records WHO approved a run.
+#: `RunService.await_approval` writes a run STATE (`awaiting_approval`) and no actor,
+#: there is no approve route, and `POST /runs/{id}/resume` refuses a run in that state
+#: outright -- so there is no user id to thread, and inventing one would put a name on
+#: an authorisation nobody gave. A policy string says exactly what happened: a human
+#: gate was passed and the surface that passed it did not identify the human. Whoever
+#: builds that route should pass the real id to :func:`approve` instead.
+POLICY_APPROVER = "policy:human-review-gate"
+
 NodeName = Literal[
     "INTAKE",
     "HARVEST",
@@ -139,6 +152,24 @@ class AgentState(TypedDict):
     #: `None` means there was nothing to audit, which is NOT the same as a pass --
     #: the graph gates on a present, failing verdict and leaves an absent one alone.
     landing_report: NotRequired[dict[str, Any] | None]
+    #: Who approved publication, and the ONLY thing that lets EXPORT act.
+    #:
+    #: `None` means nobody has, and EXPORT then publishes nothing and says so. It is
+    #: deliberately not derived from "REVIEW has run": the interrupt fires after REVIEW
+    #: and the checkpoint is written before the run is parked, so a run whose process
+    #: died in that window is resumable with REVIEW in `visited` and no human decision
+    #: behind it. An approval is a fact somebody records (:func:`approve`), never one
+    #: the graph infers from its own progress.
+    approved_by: NotRequired[str | None]
+    #: What EXPORT actually did, per target -- statuses, external refs, and whether
+    #: anything was SIMULATED. JSON primitives only, like everything else here.
+    #:
+    #: `None` means EXPORT has not run. An empty `refs` list with a `note` means it ran
+    #: and published nothing, which is a different fact and has to read as one.
+    published: NotRequired[dict[str, Any] | None]
+    #: What MEASURE measured, and -- at least as important -- what it could not.
+    #: A metric nobody measured is ABSENT here, never zero.
+    measurement: NotRequired[dict[str, Any] | None]
     #: True when the run ended because content could not be made publishable, as
     #: opposed to ending because the budget or the step count ran out. Kept
     #: separate from `outcome` on purpose: "partial" is the persisted run state
@@ -183,6 +214,9 @@ def new_state(
         seo_report=None,
         claim_check=None,
         landing_report=None,
+        approved_by=None,
+        published=None,
+        measurement=None,
         publication_blocked=False,
         caps=caps or RunCaps(),
         step_count=0,
@@ -217,6 +251,24 @@ def charge(state: AgentState, usd: Decimal) -> AgentState:
         raise CapExceededError("max_usd", caps.max_usd, attempted)
 
     return {**state, "cost_usd": attempted}
+
+
+def approve(state: AgentState, approver: str = POLICY_APPROVER) -> AgentState:
+    """Record who approved publication. The one thing that unlocks EXPORT.
+
+    A function rather than a bare assignment because the string is load-bearing: it
+    ends up in `Actuation.approved_by`, which is persisted on every `actions` row and
+    is the answer to "on whose authority did this go out". A blank one is refused
+    here rather than reaching the actuator, where the same refusal would arrive one
+    layer too late to say anything useful about the caller.
+    """
+    named = approver.strip()
+    if not named:
+        raise ValueError(
+            "an approval needs an approver: a user id, or POLICY_APPROVER when the "
+            "surface that approved it carries no identity"
+        )
+    return {**state, "approved_by": named}
 
 
 def record_error(state: AgentState, error: NodeError) -> AgentState:

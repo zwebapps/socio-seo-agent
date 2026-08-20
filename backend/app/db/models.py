@@ -7,7 +7,7 @@ speculative.
 Present here: users, businesses, documents, kb_chunks, crawl_pages, runs,
 run_events, model_usage, actions, opportunities, content_pieces, geo_prompts,
 geo_results, model_routes, provider_settings, sampling_policies, node_tool_policies,
-short_links, link_clicks, leads, feedback, learned_style.
+short_links, link_clicks, leads, feedback, learned_style, platform_connections.
 Still to come: keywords, competitors, social_posts, approvals.
 """
 
@@ -764,4 +764,105 @@ class LearnedStyle(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
 
     __table_args__ = (
         CheckConstraint("status in ('proposed','approved','rejected')", name="status_valid"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Connected platforms
+# --------------------------------------------------------------------------- #
+
+
+class PlatformConnection(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """One business's authorisation to act on one external platform account.
+
+    The credential is the only genuinely dangerous column in this schema, so three
+    things about it are deliberate.
+
+    **It is encrypted, not hashed.** A password is only ever compared, so it is hashed
+    and the plaintext discarded; an access token has to be presented to Facebook later,
+    so it must be recoverable. See ``core/token_cipher`` -- the key comes from the
+    environment, never from this database, because a key stored beside the ciphertext it
+    protects protects nothing.
+
+    **The plaintext has no read path.** ``credential_hint`` is a masked prefix/suffix,
+    and it exists so that every screen, API response and log line has something safe to
+    render. Only ``db/adapters/connection_store.reveal_*`` decrypts, and only the
+    actuator calls it.
+
+    **``status`` is a cache, not the truth.** A credential whose ``expires_at`` has
+    passed is expired whether or not anything has written the row yet, so
+    ``ConnectionView.unusable_reason`` folds the clock and is the authority every surface
+    asks. The column exists so a SQL-level report agrees with the screens.
+
+    ``refresh_credential_encrypted`` is nullable because not every platform issues one --
+    and a connection without it cannot be renewed, only re-authorised, which is worth
+    being able to see in a query.
+    """
+
+    __tablename__ = "platform_connections"
+
+    #: One of ``services.platform_oauth.CONNECTABLE_PLATFORMS``. Constrained rather than
+    #: free text: a typo'd platform is a connection nobody can ever publish through, and
+    #: a CHECK turns that into an insert failure instead of a support ticket. Widening
+    #: the list is a migration, on purpose.
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: The account on the platform's side -- a Page id, a LinkedIn member urn. Part of
+    #: the uniqueness rule, because a business can legitimately connect two Pages.
+    external_account_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: What the human recognises it as. Nullable: some platforms return an id and nothing
+    #: else, and inventing a name would be inventing data.
+    external_account_name: Mapped[str | None] = mapped_column(String(255))
+    #: What was actually GRANTED, which is not always what was requested -- a token
+    #: issued with a subset is the usual reason a publish fails with a permissions error
+    #: long after the connection looked fine.
+    scopes: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="connected", server_default="connected", nullable=False
+    )
+    #: When the platform says the credential dies. Nullable means "no expiry stated",
+    #: which is NOT "never expires" -- only the platform rejecting it can move that one.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Which cipher wrote the envelopes below. Queryable, so a key rotation can find the
+    #: rows it has still to re-encrypt without opening every one of them.
+    credential_scheme: Mapped[str] = mapped_column(
+        String(32), default="", server_default="", nullable=False
+    )
+    #: The encrypted access credential. ``Text`` because an envelope's length depends on
+    #: the token and the scheme, and a token that does not fit is a connection that cannot
+    #: be stored. NULL after a revoke: disconnecting forgets the credential rather than
+    #: leaving it decryptable in a row marked dead.
+    credential_encrypted: Mapped[str | None] = mapped_column(Text)
+    #: The encrypted refresh credential, where the platform issues one.
+    refresh_credential_encrypted: Mapped[str | None] = mapped_column(Text)
+    #: A masked prefix/suffix of the access credential. The ONLY credential-derived value
+    #: any read path returns.
+    credential_hint: Mapped[str] = mapped_column(
+        String(64), default="", server_default="", nullable=False
+    )
+    #: True when the grant came from the fake OAuth provider, i.e. no real platform app
+    #: was involved. Carried to the screen, because a simulated connection that looks
+    #: identical to a real one is worse than no connection at all.
+    fake: Mapped[bool] = mapped_column(default=False, server_default=text("false"), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('connected','expired','revoked')",
+            name="status_valid",
+        ),
+        CheckConstraint(
+            "platform in ('facebook','instagram','linkedin','tiktok','youtube','google_business')",
+            name="platform_known",
+        ),
+        # One row per business per account. A second authorisation of the same account
+        # must UPDATE the credential rather than accumulate rows nobody can choose
+        # between -- and "which of these three LinkedIn tokens is live" is not a question
+        # a publish path should have to answer.
+        UniqueConstraint(
+            "business_id",
+            "platform",
+            "external_account_id",
+            name="uq_platform_connections_business_id_platform_external_account_id",
+        ),
     )

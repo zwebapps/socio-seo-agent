@@ -17,8 +17,9 @@ adds is wiring, not a rewrite:
   for work it already did;
 * the VALIDATE retry is a conditional edge back to GENERATE or CONVERT, which is what
   the module docstring of `graph.py` describes in prose;
-* ``interrupt_before=["REVIEW"]`` is the human gate, now enforced by the runtime
-  rather than by a ``return`` statement;
+* ``interrupt_before=[AFTER_REVIEW]`` is the human gate, now enforced by the runtime
+  rather than by a ``return`` statement -- armed on the edge OUT of REVIEW, so REVIEW
+  itself still runs and still appears in the timeline;
 * every early exit is an edge to ``END`` taken because a node wrapper already wrote
   the outcome and the reason into the state.
 
@@ -53,6 +54,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
 from backend.app.agents.graph import (
+    FIRST_AFTER_REVIEW,
     ORDER,
     EventSink,
     GraphResult,
@@ -60,6 +62,7 @@ from backend.app.agents.graph import (
     cap_exit,
     emit,
     opportunity_exit,
+    resumable_skip,
     validate_exit,
     verdicts,
 )
@@ -93,13 +96,19 @@ _ALLOWED_STATE_TYPES = (("backend.app.agents.state", "RunCaps"),)
 
 #: The node the run pauses BEFORE while it waits for a human.
 #:
-#: Not one of `ORDER`'s nine and deliberately not REVIEW itself. REVIEW has to RUN --
+#: Not one of `ORDER`'s eleven and deliberately not REVIEW itself. REVIEW has to RUN --
 #: the timeline's last event is REVIEW/done and `visited` ends with it, which is the
 #: contract the run screen and the resume rule are both written against -- so the
 #: interrupt has to sit one edge later, at the point the builtin driver expresses as
 #: the `return` after REVIEW. This node is that point: "what happens once a human has
 #: approved". It does nothing, and it is never wrapped, so it never counts a step or
 #: appears in `visited`.
+#:
+#: It is also the ONLY way REVIEW reaches EXPORT. REVIEW's router returns this name
+#: unconditionally rather than asking for the next unvisited node, because the next
+#: unvisited node after REVIEW is now EXPORT -- and a router that went straight there
+#: would route around the very edge the interrupt is armed on, i.e. publish without
+#: pausing. That is why the gate is a NODE and not a flag.
 AFTER_REVIEW = "APPROVED"
 
 
@@ -236,15 +245,32 @@ def build_state_graph(
             return ORDER[0]
         return _next_unvisited(state, 0, resume=True)
 
-    builder.add_conditional_edges(START, entry, [*ORDER, AFTER_REVIEW])
+    builder.add_conditional_edges(START, entry, [*ORDER, END])
 
     for index, name in enumerate(ORDER):
         builder.add_conditional_edges(
             name,
             _router(name, index, stop_after, resume=resume),
-            [*ORDER, AFTER_REVIEW, END],
+            # REVIEW can only ever reach the gate or END, and saying so HERE is what
+            # keeps the drawn graph honest: a path list is the diagram, and one that
+            # shows a REVIEW -> EXPORT edge invites somebody to believe there is one.
+            [AFTER_REVIEW, END] if name == "REVIEW" else [*ORDER, AFTER_REVIEW, END],
         )
-    builder.add_edge(AFTER_REVIEW, END)
+
+    def after_gate(state: AgentState) -> str:
+        """Where an APPROVED run goes: the first post-review node still to run.
+
+        Reached only once the interrupt has been passed, so this edge is the one place
+        that may lead to EXPORT. It still goes through `_next_unvisited`, because a
+        second resume of a run that already exported must not export again -- the
+        actuator's idempotency key would catch it, but a graph that relies on that is
+        a graph that publishes twice the day somebody edits a post.
+        """
+        return _next_unvisited(state, ORDER.index(FIRST_AFTER_REVIEW), resume=resume)
+
+    builder.add_conditional_edges(
+        AFTER_REVIEW, after_gate, [*ORDER[ORDER.index(FIRST_AFTER_REVIEW) :], END]
+    )
 
     return builder.compile(
         checkpointer=InMemorySaver(
@@ -261,16 +287,19 @@ def build_state_graph(
 def _next_unvisited(state: AgentState, index: int, *, resume: bool) -> str:
     """The next node at or after ``index`` that still has work to do.
 
-    Only ever skips on a resumed run: the work was paid for once, and paying again is
-    the bug resumption exists to prevent. GENERATE is exempt because a run revived
-    mid-validation has to be able to write a new draft -- which is also why a resumed,
-    already-approved run re-runs it once, matching the builtin driver exactly rather
-    than quietly improving on it in one runtime only.
+    Only ever skips on a resumed run, and what it may skip is `graph.resumable_skip`'s
+    decision rather than a second copy of it -- the two drivers have to repeat exactly
+    the same work on a resume or the fallback is not a fallback.
+
+    Exhausted, it returns ``END`` and not the gate. Returning `AFTER_REVIEW` was right
+    while REVIEW was the last node and that edge went straight to ``END``; now the gate
+    leads to EXPORT, so a run that had finished MEASURE would be sent back through the
+    gate and publish again, forever.
     """
     for name in ORDER[index:]:
-        if not resume or name not in state["visited"] or name == "GENERATE":
+        if not resume or not resumable_skip(state, name):
             return name
-    return AFTER_REVIEW
+    return END
 
 
 def _router(
@@ -295,6 +324,12 @@ def _router(
             _, weak_draft, weak_landing = verdicts(state)
             if weak_draft or weak_landing:
                 return "GENERATE" if weak_draft else "CONVERT"
+        if name == "REVIEW":
+            # Through the gate, never around it. `_next_unvisited` would answer EXPORT
+            # here, which is the same destination one edge earlier -- and that edge is
+            # the one `interrupt_before` is armed on, so taking it would publish
+            # without ever pausing for the human this whole node exists for.
+            return AFTER_REVIEW
         return _next_unvisited(state, index + 1, resume=resume)
 
     return route
@@ -313,6 +348,16 @@ async def run_state_graph(
     one by configuration, and a swap that needed a different call site could not be a
     fallback.
     """
+    if resume and state["outcome"] == "awaiting_approval":
+        # A resumed run is running again, and the routers read `outcome` as "has a node
+        # written a terminal verdict during THIS invocation". The checkpoint of an
+        # interrupted run says `awaiting_approval` -- so without this, the first router
+        # a resumed run reaches sees a non-running outcome and goes straight to END,
+        # and EXPORT could never run in this runtime while it ran fine in the builtin
+        # one. Narrow on purpose: `partial`, `done` and `failed` still route to END,
+        # because those runs really are over.
+        state = cast("AgentState", {**state, "outcome": "running"})
+
     compiled = build_state_graph(
         nodes,
         on_event=on_event,

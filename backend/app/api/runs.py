@@ -20,7 +20,7 @@ information, and the caller has no legitimate way to know that id.
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -30,8 +30,15 @@ from pydantic.alias_generators import to_camel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.auth import CurrentUser
+from backend.app.core.config import get_settings
 from backend.app.db.adapters.run_store import PostgresRunStore
-from backend.app.services.review_service import RunReview, project_review
+from backend.app.services.review_service import (
+    ExportPack,
+    RunReview,
+    project_export_pack,
+    project_review,
+    render_export_markdown,
+)
 from backend.app.services.run_executor import RunExecutor
 from backend.app.services.run_service import (
     DEFAULT_RUN_LIST_LIMIT,
@@ -369,6 +376,96 @@ async def get_review(
     """
     run = await _require_own_run(run_id, business_id, service)
     return project_review(run.checkpoint)
+
+
+def _hub_url(business_id: UUID) -> str:
+    """The business's bio-link hub, built from CONFIGURATION and never from the request.
+
+    `Host` is caller-controlled, so building this from the request would let a poisoned
+    header point every CTA in a downloaded file at somebody else's domain — the same
+    reasoning `landing_service` and `api/links.py` both record.
+
+    The UUID form of the handle rather than the readable slug, deliberately:
+    `GET /go/{slug}` accepts either and resolves both permanently (see `api/links.py`),
+    and the id is already in hand — reading the slug would add a query to a route whose
+    whole job is a projection.
+    """
+    return f"{get_settings().public_base_url.rstrip('/')}/go/{business_id}"
+
+
+#: Named so the two branches below cannot disagree about the filename, and so the JSON
+#: branch's absence of a disposition is visibly deliberate.
+_EXPORT_FILENAME = "export-pack-{run_id}.md"
+
+
+@router.get(
+    "/{run_id}/export",
+    response_model=ExportPack,
+    response_model_by_alias=True,
+    summary="One run's export pack: paste-ready copy per channel, as JSON or Markdown",
+    responses={
+        200: {
+            "description": "The pack. JSON by default; Markdown with `?format=markdown`.",
+            "content": {"application/json": {}, "text/markdown": {}},
+        }
+    },
+)
+async def get_export(
+    run_id: UUID,
+    business_id: Annotated[UUID, Depends(current_business)],
+    service: Annotated[RunService, Depends(get_run_service)],
+    response: Response,
+    fmt: Annotated[Literal["json", "markdown"], Query(alias="format")] = "json",
+) -> ExportPack | Response:
+    """Everything needed to publish this run BY HAND, and every gap in it named.
+
+    This is Tier 3 in docs/CHANNELS.md section 2 — the tier that "works on day one, on
+    every platform, forever" — and it is the only publishing path this build actually
+    has. So it is a first-class payload rather than a copy button: per-channel copy that
+    is ready to paste, the character count against that channel's editorial target AND
+    its platform ceiling, the hashtag count against the cap, whether a link in the body
+    is clickable there at all, the landing page, the answer blocks, and the bio-link hub.
+
+    **Two renderings of one payload.** JSON for the screen, Markdown for a person —
+    `?format=markdown` returns the same pack as a downloadable file, because Tier 3's
+    value is that somebody pastes it somewhere and nobody can paste an escaped JSON
+    string. An unrecognised `format` is a 422 rather than a silent fallback to JSON: a
+    client asking for something else has a bug, and answering the question it did not ask
+    hides it. The Markdown branch returns a `Response` directly, which FastAPI passes
+    through untouched while `response_model` keeps the JSON shape in the schema.
+
+    **`Content-Disposition: attachment`, with an ASCII filename.** The pack is the
+    customer's unpublished content and a browser must not render it as a page — and the
+    filename carries the run id so two downloads do not overwrite each other. The id is a
+    UUID, so the filename needs no RFC 5987 escaping; nothing caller-controlled reaches
+    the header.
+
+    **`no-store` on both branches.** This is the customer's own draft copy behind a
+    session cookie, so it must not land in a shared cache. Same rule as the runs list and
+    the leads list.
+
+    A run with nothing rendered yet is 200 with populated notes, not 404 and not an empty
+    pack: the run exists, and "REPACK has not completed" is the answer.
+    """
+    run = await _require_own_run(run_id, business_id, service)
+    pack = project_export_pack(run.checkpoint, hub_url=_hub_url(business_id))
+
+    if fmt == "markdown":
+        return Response(
+            content=render_export_markdown(pack),
+            # charset stated: the copy is German more often than not, and a file served
+            # as text/markdown with no charset is decoded by guesswork.
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": (
+                    f'attachment; filename="{_EXPORT_FILENAME.format(run_id=run_id)}"'
+                ),
+            },
+        )
+
+    response.headers["Cache-Control"] = "no-store"
+    return pack
 
 
 @router.post(

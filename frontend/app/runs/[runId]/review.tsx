@@ -1,12 +1,15 @@
 "use client";
 
 /**
- * The review surface: four tabs over one run's output.
+ * The review surface: five tabs over one run's output.
  *
- * The blog draft, the deterministic SEO findings, the social posts per platform, and the
- * "AI blocks" — the self-contained answers an AI answer engine can quote. One request
- * feeds all four (`GET /api/v1/runs/{id}/review`), deliberately separate from the
- * timeline poll so the draft HTML is not re-sent every couple of seconds.
+ * The blog draft, the deterministic SEO findings, the social posts per platform, the
+ * "AI blocks" — the self-contained answers an AI answer engine can quote — and the export
+ * pack. One request feeds the first four (`GET /api/v1/runs/{id}/review`), deliberately
+ * separate from the timeline poll so the draft HTML is not re-sent every couple of
+ * seconds; the export pack fetches its own payload (`GET /api/v1/runs/{id}/export`) the
+ * first time its tab is opened, because it is the same content measured for a different
+ * purpose and nobody who never opens it should pay for it.
  *
  * Three things this screen refuses to do, each because the alternative would be a lie
  * about the product rather than merely a rough edge:
@@ -29,10 +32,13 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
-import { Pill, SoftButton, SoftCard, SoftWell } from "../../components/soft";
+import { Pill, SoftCard, SoftWell } from "../../components/soft";
 import { SoftTabs, type TabSpec } from "../../components/tabs";
 import { SafeHtml } from "../../components/safe-html";
 import { ApiError } from "../../lib/api";
+// One map of "how is this channel named on screen", shared with the export pack: two
+// private copies is two chances for the same channel to be called two things.
+import { channelLabel } from "../../lib/export-api";
 import {
   fetchReview,
   type AiBlocks,
@@ -42,17 +48,12 @@ import {
   type SeoReport,
   type SocialPost,
 } from "../../lib/review-api";
+import { CopyButton } from "./copy-button";
+import { ExportPanel } from "./export";
 
 /** From the GENERATE tool schema: the model is asked for these ranges. */
 const TITLE_RANGE = { min: 50, max: 60 } as const;
 const META_RANGE = { min: 140, max: 160 } as const;
-
-const CHANNEL_LABEL: Record<string, string> = {
-  linkedin: "LinkedIn",
-  facebook: "Facebook",
-  instagram: "Instagram",
-  x: "X",
-};
 
 export function RunReviewTabs({ runId, runState }: { runId: string; runState: string }) {
   const [review, setReview] = useState<RunReview | null>(null);
@@ -119,6 +120,13 @@ export function RunReviewTabs({ runId, runState }: { runId: string; runState: st
       label: "AI blocks",
       badge: review.aiBlocks?.blocks.length || undefined,
       panel: <AiBlocksPanel blocks={review.aiBlocks} note={review.aiBlocksNote} />,
+    },
+    {
+      // "Export pack", not "Publish": this tab produces text to paste and nothing else
+      // reaches a platform. See `export.tsx` — the naming rule is asserted in its tests.
+      id: "export",
+      label: "Export pack",
+      panel: <ExportPanel runId={runId} runState={runState} />,
     },
   ];
 
@@ -498,9 +506,7 @@ function SocialPanel({ posts, note }: { posts: SocialPost[]; note: string | null
       {posts.map((post) => (
         <SoftCard key={post.channel} className="p-5" size="md" as="article">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h3 className="text-sm font-semibold">
-              {CHANNEL_LABEL[post.channel] ?? post.channel}
-            </h3>
+            <h3 className="text-sm font-semibold">{channelLabel(post.channel)}</h3>
             <div className="flex items-center gap-3">
               <span className="tabular text-[11px]" style={{ color: "var(--text-muted)" }}>
                 {/* Against the channel's own target when there is one, because "1,240
@@ -661,35 +667,5 @@ function AiBlocksPanel({ blocks, note }: { blocks: AiBlocks | null; note: string
 }
 
 /* ------------------------------------------------------------------------- */
-
-function CopyButton({ text, label }: { text: string; label: string }) {
-  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
-
-  const copy = useCallback(async () => {
-    try {
-      // Absent over plain HTTP on a non-localhost origin, so its absence is a normal
-      // state to handle rather than an error to swallow.
-      if (!navigator.clipboard) throw new Error("no clipboard");
-      await navigator.clipboard.writeText(text);
-      setState("copied");
-    } catch {
-      setState("failed");
-    }
-    window.setTimeout(() => setState("idle"), 2200);
-  }, [text]);
-
-  return (
-    <span className="flex shrink-0 items-center gap-2">
-      {/* The result is announced, not only shown, so the outcome is not colour-only. */}
-      <span className="text-[11px] font-semibold" aria-live="polite" style={{ color: "var(--ok)" }}>
-        {state === "copied" && "copied"}
-        {state === "failed" && (
-          <span style={{ color: "var(--warn)" }}>select and copy manually</span>
-        )}
-      </span>
-      <SoftButton onClick={() => void copy()} ariaLabel={label}>
-        Copy
-      </SoftButton>
-    </span>
-  );
-}
+/* `CopyButton` lives in ./copy-button.tsx — shared with the export pack, which needs the
+   same control and the same "no clipboard on a plain-HTTP origin" branch. */

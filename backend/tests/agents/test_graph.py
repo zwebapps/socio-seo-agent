@@ -270,8 +270,136 @@ def _nodes(
         "VALIDATE": validate,
         "REPACK": _ok("REPACK", renderings={"linkedin": "post"}, _cost=cost),
         "REVIEW": _ok("REVIEW"),
+        # Inert, like every other node here: what EXPORT publishes and what MEASURE
+        # can honestly say are node questions (see `test_export.py`). What belongs in
+        # THIS file is that neither of them can run before a human has been asked.
+        "EXPORT": _ok("EXPORT", published={"refs": [], "note": "stub"}),
+        "MEASURE": _ok("MEASURE", measurement={"published_refs": 0}),
         "_stop_after": stop_after,
     }
+
+
+# --------------------------------------------------------------------------- #
+# After the gate: EXPORT and MEASURE
+#
+# These two are the first nodes that can change the outside world, so what is tested
+# here is the ORDERING against the interrupt: a fresh run must not reach them however
+# it ends, and the resume that follows an approval must reach each of them exactly
+# once. Both runtimes express the gate differently -- a `return` in one, an
+# `interrupt_before` on a sentinel node in the other -- which is precisely why this
+# runs twice.
+# --------------------------------------------------------------------------- #
+
+
+def _approved(state: AgentState) -> AgentState:
+    """The state as a resumed, approved run sees it: round-tripped and signed off."""
+    import json
+
+    from backend.app.agents.state import approve, from_checkpoint, to_checkpoint
+
+    revived = from_checkpoint(json.loads(json.dumps(to_checkpoint(state))))
+    return approve(revived, "user:owner-1")
+
+
+async def test_a_fresh_run_stops_at_the_gate_and_never_reaches_export(driver: Driver) -> None:
+    """The load-bearing assertion for the whole publishing half of the machine.
+
+    EXPORT is the only node that can reach an actuator, so "a run cannot reach EXPORT
+    without passing a human" is the property that makes the review gate real rather
+    than advisory. It is asserted on the machine, not on EXPORT's own manners.
+    """
+    result = await driver(_state(), nodes=_nodes(seo_score=91))
+
+    assert result.interrupted is True
+    assert result.state["visited"][-1] == "REVIEW"
+    assert "EXPORT" not in result.state["visited"], "a fresh run must not publish itself"
+    assert "MEASURE" not in result.state["visited"]
+    assert result.state.get("published") is None, "nothing may claim to have published"
+
+
+async def test_an_approved_resume_runs_export_then_measure_exactly_once(driver: Driver) -> None:
+    first = await driver(_state(), nodes=_nodes(seo_score=91))
+
+    resumed = await driver(_approved(first.state), nodes=_nodes(seo_score=91), resume=True)
+
+    visited = resumed.state["visited"]
+    assert visited.count("EXPORT") == 1, "publishing twice is the bug idempotency exists for"
+    assert visited.count("MEASURE") == 1
+    assert visited.index("EXPORT") < visited.index("MEASURE"), "measure what was published"
+    assert resumed.state["outcome"] == "done"
+    assert resumed.interrupted is False, "the gate is spent; it must not park the run again"
+
+
+async def test_an_approved_resume_does_not_rewrite_what_the_human_approved(
+    driver: Driver,
+) -> None:
+    """A resume repeats GENERATE while the gate is still AHEAD, and must not once it is
+    behind: the draft, the landing page and the renderings after REVIEW are the exact
+    artifacts a person was shown, and publishing a fresh draft written after the
+    approval would publish copy nobody approved."""
+    scores = iter([72, 91])
+    first = await driver(_state(), nodes=_nodes(seo_score=lambda: next(scores)))
+    assert first.state["visited"].count("GENERATE") == 2, "the retry ran, so this proves something"
+
+    resumed = await driver(_approved(first.state), nodes=_nodes(seo_score=91), resume=True)
+
+    assert resumed.state["visited"].count("GENERATE") == 2, "the approved draft was rewritten"
+    assert resumed.state["visited"].count("EXPORT") == 1
+
+
+async def test_resuming_twice_does_not_publish_twice(driver: Driver) -> None:
+    """The actuator's idempotency key would catch a second publish, and the graph must
+    not lean on it: a machine that re-enters EXPORT on every resume publishes twice the
+    day somebody edits a post between them, because an edit is a different effect."""
+    first = await driver(_state(), nodes=_nodes(seo_score=91))
+    once = await driver(_approved(first.state), nodes=_nodes(seo_score=91), resume=True)
+
+    twice = await driver(_approved(once.state), nodes=_nodes(seo_score=91), resume=True)
+
+    assert twice.state["visited"].count("EXPORT") == 1
+    assert twice.state["visited"].count("MEASURE") == 1
+
+
+async def test_a_run_that_crashed_before_review_still_stops_at_the_gate_on_resume(
+    driver: Driver,
+) -> None:
+    """Resuming is not approving. A worker that died mid-run resumes with the human gate
+    still ahead of it, and has to stop there like any other run."""
+    crashed = await driver(_state(), nodes=_nodes(seo_score=91, stop_after="PLAN"))
+    assert crashed.state["outcome"] == "running"
+
+    resumed = await driver(_approved(crashed.state), nodes=_nodes(seo_score=91), resume=True)
+
+    assert resumed.interrupted is True
+    assert "EXPORT" not in resumed.state["visited"], (
+        "an approval recorded on a run that has not been reviewed yet must not let it "
+        "publish; the gate is a place in the machine, not only a field on the state"
+    )
+
+
+async def test_a_blocked_run_never_reaches_export_either(driver: Driver) -> None:
+    """The compliance gate and the publishing gate meet here: a run whose copy cannot
+    be made publishable stops before REVIEW, so there is no approval to resume with and
+    no path to EXPORT at all."""
+    result = await driver(
+        _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(False))
+    )
+
+    assert result.state["publication_blocked"] is True
+    assert "REVIEW" not in result.state["visited"]
+    assert "EXPORT" not in result.state["visited"]
+
+
+def test_review_reaches_export_only_through_the_gate_node() -> None:
+    """Structural, in the LangGraph runtime: the interrupt is armed on the edge OUT of
+    REVIEW, so a router that answered EXPORT there would route around the pause. The
+    drawn graph must not offer that edge either -- a diagram is what the next person
+    reads before they trust the gate."""
+    compiled = build_state_graph(_nodes(seo_score=91))
+    out_of_review = {edge.target for edge in compiled.get_graph().edges if edge.source == "REVIEW"}
+
+    assert AFTER_REVIEW in out_of_review
+    assert "EXPORT" not in out_of_review
 
 
 # --------------------------------------------------------------------------- #

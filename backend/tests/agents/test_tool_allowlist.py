@@ -24,7 +24,9 @@ import pytest
 from backend.app.agents.graph import ORDER
 from backend.app.agents.tools import (
     ACTUATOR_TOOLS,
+    ANALYTICS_FETCH,
     CRAWL_SITE,
+    GEO_PROBE,
     KNOWN_TOOLS,
     NODE_TOOLS,
     NOTIFY,
@@ -60,12 +62,14 @@ def test_every_node_the_graph_runs_has_an_entry() -> None:
     assert not missing, f"nodes with no allowlist entry: {missing}"
 
 
-def test_the_two_documented_but_unbuilt_nodes_already_have_their_grants() -> None:
-    """EXPORT and MEASURE are specified in the doc and not yet written. Recording
-    their grants now means the barrier is in place before the code is, rather than
-    being invented by whoever writes them under deadline."""
+def test_the_two_post_review_nodes_hold_exactly_the_grants_recorded_before_them() -> None:
+    """EXPORT and MEASURE were specified, and their grants recorded, before either node
+    existed -- so that the barrier was in place before the code was rather than being
+    invented by whoever wrote them under deadline. They are written now, and this
+    asserts the grants did not quietly widen on the way in: EXPORT publishes and
+    notifies, and MEASURE holds `analytics.fetch` it deliberately cannot use."""
     assert NODE_TOOLS["EXPORT"] == {PUBLISH, NOTIFY}
-    assert "MEASURE" in NODE_TOOLS
+    assert NODE_TOOLS["MEASURE"] == {GEO_PROBE, ANALYTICS_FETCH}
 
 
 def test_no_allowlist_names_a_tool_the_runtime_does_not_know() -> None:
