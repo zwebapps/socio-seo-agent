@@ -729,6 +729,30 @@ A1 is the first code to create.
   the two notes appear only when the run genuinely published neither; the amended test
   asserts a fabricated code still fails.**
 
+- [ ] **A1c · `/developer/runtime` says "Graph nodes (all eight)" and the graph has ELEVEN**
+  — found by the founder reviewing the screen, and it is a claims-discipline defect of exactly
+  the kind this project keeps finding: a hardcoded count that drifts from the code it describes.
+  `services/prompt_inventory.py:69` hardcodes the label `"Graph nodes (all eight)"` and its
+  module docstring repeats "ONE value shared by all eight graph nodes", while
+  `graph.ORDER` now holds **eleven** (`INTAKE HARVEST OPPORTUNITY PLAN GENERATE CONVERT VALIDATE
+  REPACK REVIEW EXPORT MEASURE` — EXPORT and MEASURE landed with the publishing epic and nothing
+  updated the count). It is wrong in the other direction too: only **five** call sites use `_ask`,
+  the single helper that stamps `PROMPT_VERSION`, so the prompt does not cover eight nodes either.
+  Two nodes make no model call at all by design (EXPORT actuates, MEASURE probes) and VALIDATE is
+  deterministic scoring per `CLAUDE.md`'s compute-it rule.
+  **Do NOT fix this by editing the number.** A second hardcoded count drifts the same way on the
+  next node. Derive the label from `graph.ORDER`, and state what the constant actually covers
+  ("every node that calls the model") rather than a count of nodes it does not.
+  **done = the label is derived, not written; adding a node to `ORDER` changes the screen with no
+  other edit; a test asserts the rendered label against `len(graph.ORDER)` so the two cannot
+  diverge again.**
+  Recorded and NOT a bug: the "Sampling per task class" section lists the eight `TaskClass`
+  values (`CLASSIFY EXTRACT REPACK PLAN PRIORITISE GENERATE REVIEW EMBED`), which are
+  model-routing classes and NOT graph nodes — `llm/contract.py:40` says so outright ("Named after
+  the work, not after a node, so two nodes doing the same kind of work share a route"). That
+  section is correctly titled. The confusion is caused by the neighbouring stale caption, which is
+  the more reason to fix it.
+
 - [ ] **A2a · Carry `RetrievalTrace` into `AgentState` so the agentic-RAG evidence leaves
   the process** — not previously in this backlog and it is the highest-stakes gap for
   grading. `nodes._retrieved()` calls `box.call(KB_SEARCH, question)` and immediately
