@@ -669,7 +669,15 @@ was checked against the code, not against its commit message.
 Dependencies are stated. Do not reorder A1 below A4/A5: both of those count things that
 A1 is the first code to create.
 
-- [ ] **A1a · A real `publish.page` actuator, so a run actually creates the landing page**
+- [x] **A1a · A real `publish.page` actuator, so a run actually creates the landing page**
+  — `c3a5dab`. `backend/app/actuators/landing.py`, wired in `run_executor`. `fake` is
+  permanently False (this app serves the page — no credential to be missing), so one run
+  now carries a real published page beside a simulated social post. Five tests on real SQL
+  under RLS (published → servable → one retargeted link per CTA → second EXPORT replays →
+  mixed real/simulated stay apart → unpublishable is refused writing nothing) plus THREE
+  resolver tests, because the five inject the actuator and would all still pass if the
+  wiring reverted to `FakeActuator` — verified by reverting it: the resolver tests fail,
+  the actuator tests stay green.
   — `publish.page` is not "the cheapest real publish left", it is the missing link in the
   product's core chain, and the audit found the consequence is larger than the item says:
   **nothing in the application ever calls `content_store.create_landing_page`**, so no
@@ -695,6 +703,21 @@ A1 is the first code to create.
   (d) running EXPORT twice creates exactly one piece and one link set — the second is
   `replayed`. `Outcome.fake` is False on this action while `social.post` stays True in the
   same run, so the Delivery tab tells the two apart.**
+
+- [ ] **A1a-i · Nothing attributes a published page to the run that made it** — found by
+  A1a and deliberately NOT folded into it. `AgentState` has no run-id key at all, so
+  `nodes._actuate` builds every `Actuation` without `run_id`, and therefore every page a run
+  publishes lands with `content_pieces.run_id = NULL` and every `actions` row loses its link
+  to the run. `LandingPageActuator` already forwards `actuation.run_id`, so it needs no
+  change — what is missing is upstream. Closing it means adding the key to `AgentState`,
+  populating it in the executor, and threading it through `_actuate`, which changes the
+  checkpoint shape and must hold in BOTH drivers (a checkpoint written before the key exists
+  must still resume). A5 (MEASURE lead counts) wants this: a lead count per run is not
+  answerable while the join column is null.
+  **done = a run's published page and its `actions` rows both carry its run id; a
+  pre-migration checkpoint with no run id still resumes; asserted in both drivers.**
+  `test_landing_actuator.py` currently asserts `run_id is None` WITH the reason — that
+  assertion inverts when this lands, and it is the test that will notice.
 
 - [ ] **A1b · The published page and its real short links reach the export pack and the
   Delivery tab** — depends on A1a. `review_service` currently hard-codes
