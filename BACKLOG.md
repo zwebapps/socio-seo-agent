@@ -1016,6 +1016,42 @@ A1 is the first code to create.
   un-completable end to end by a human — which is worth saying out loud rather than leaving a
   reader to discover by clicking.
 
+- [ ] **A10 · THE HUMAN DECISION HAS NO BUTTON — a run can be reviewed and never published**
+  (founder-reported 2026-08-20, verified same day; this is ahead of A4–A7 in value because it is
+  the step the whole product is built around). The founder described the intended flow — onboard →
+  analyse → generate → "bring to publish dashboard so the user can read and publish or reject" —
+  and everything in it works EXCEPT the last step:
+  - `POST /api/v1/runs/{id}/approve` **exists, is tested, and NOTHING CALLS IT.** Zero occurrences
+    of `approve` in `frontend/app/runs/[runId]/review.tsx` or `page.tsx`. The run page offers
+    **Resume**, which deliberately refuses a parked run ("waiting for a human decision, not
+    stalled") — so a reviewer's only available button is the one that cannot help, and EXPORT's
+    no-approver refusal is what they get if they find a way through. This is the same shape as the
+    bugs this project keeps finding: the capability is built, tested, and unreachable.
+  - **There is no reject route at all.** `grep reject backend/app/api/runs.py` is empty. Rejection
+    exists only at the CONTENT-PIECE level in `feedback_service` (`VERDICTS = ("approved",
+    "rejected")`, `reject_reason`, distil at 3+ occurrences) and `POST /content/{id}/feedback` has
+    no UI caller either. `DIAGRAMS.md` §4 documents the intent — `REVIEW --> [*]: rejected, reason
+    feeds the feedback loop` — so the behaviour is specified; the code is not.
+  **Split, because the two halves have different risk:**
+- [ ] **A10a · The approve control on the review screen** — pure UI, no schema, no decision: the
+  route exists and its contract is settled (202, approver is the AUTHENTICATED user and never
+  client-supplied, 409 `run_not_awaiting_approval` from any other state, 409 `no_checkpoint`, and
+  deliberately NOT idempotent — a second approval is a 409, not a silent no-op).
+  **done = a reviewer at the gate can approve from the screen; the button appears ONLY in
+  `awaiting_approval`; both 409s render their own sentence rather than a generic failure; a test
+  asserts the client never sends an approver.**
+- [ ] **A10b · Reject — `[DECISION NEEDED]`, because it needs a migration.** `runs.state` carries a
+  CHECK constraint of exactly six values (`queued, running, awaiting_approval, done, failed,
+  partial`), so a `rejected` terminal state is a schema change. Three questions for the architect,
+  none of which the loop should answer alone: (1) a new `rejected` state, or reuse `partial`?
+  `partial` currently means "the machine fell short with a stated reason", and a human saying no is
+  a different fact — but it is also the only terminal that already carries a reason, and the
+  diagram shows rejected as its own exit. (2) Does rejecting write a `feedback_service` rejection
+  so it counts toward distil at 3+, and if so against WHICH object — the run has no
+  `content_piece_id` until EXPORT, which a rejected run never reaches. (3) Is a reason required?
+  `feedback_service` says a reasonless rejection is accepted and contributes nothing to distil;
+  the gate could be stricter. **A10a does not depend on this and ships first.**
+
 - [ ] **A2c · A node that raises loses its retrieval trace along with everything else** — found
   by A2a, pre-existing, and deliberately not changed there. `GENERATE` and `CONVERT` raise
   `ValueError` when the model returns no tool call; the driver converts that to a `NodeError` and
