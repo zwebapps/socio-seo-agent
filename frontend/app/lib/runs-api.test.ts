@@ -11,6 +11,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ALL_RUNS,
+  approveRun,
+  canApprove,
   canResume,
   fetchRuns,
   isLive,
@@ -208,5 +210,93 @@ describe("resumeRun", () => {
     expect(call).toBeDefined();
     expect(String(call?.[0])).toContain("/api/v1/runs/a%2Fb/resume");
     expect(call?.[1]?.method).toBe("POST");
+  });
+});
+
+describe("canApprove", () => {
+  /**
+   * The approve endpoint accepts exactly one state and answers every other with a 409, so
+   * this predicate is what stops the screen offering a control that cannot ever work.
+   */
+  it("accepts awaiting_approval and nothing else", () => {
+    expect(canApprove("awaiting_approval")).toBe(true);
+    for (const state of ["queued", "running", "done", "failed", "partial"]) {
+      expect(canApprove(state)).toBe(false);
+    }
+  });
+
+  it("refuses a state it has never heard of rather than assuming it is approvable", () => {
+    // The server owns this vocabulary. Guessing "unknown means fine" would offer the
+    // decision on a run whose state we cannot reason about at all.
+    expect(canApprove("rejected")).toBe(false);
+  });
+});
+
+describe("approveRun", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * The assertion this whole route's contract turns on: **the client sends NO approver.**
+   *
+   * The approver is the authenticated user, resolved server-side from the session, and it
+   * is persisted on every `actions` row as the answer to "who authorised this post". A
+   * body carrying an approver would be the client making an authorisation decision, and
+   * the failure would be invisible — the request would succeed and the audit ledger would
+   * record whatever the browser claimed.
+   */
+  it("POSTs with no body at all, so no approver can be client-supplied", async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        status: 202,
+        json: () => Promise.resolve({ runId: "r1", state: "running" }),
+      } as unknown as Response),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await approveRun("r1");
+
+    const call = fetchMock.mock.calls[0];
+    expect(call).toBeDefined();
+    expect(call?.[1]?.method).toBe("POST");
+    // Not merely "no `approver` key": no body whatsoever, which is the only version of
+    // this that cannot drift back into sending one.
+    expect(call?.[1]?.body).toBeUndefined();
+    expect(JSON.stringify(call?.[1] ?? {})).not.toContain("approver");
+  });
+
+  it("encodes the run id into the path", async () => {
+    // Same trap as resume: an unencoded id does not fail loudly, it addresses a different
+    // route and approves nothing.
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        status: 202,
+        json: () => Promise.resolve({ runId: "a/b", state: "running" }),
+      } as unknown as Response),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await approveRun("a/b");
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/api/v1/runs/a%2Fb/approve");
+  });
+
+  /** 202, and the state it answers with is `running` — never `done`. */
+  it("passes back the state the API reports rather than assuming success means finished", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 202,
+          json: () => Promise.resolve({ runId: "r1", state: "running" }),
+        } as unknown as Response),
+      ),
+    );
+
+    expect(await approveRun("r1")).toEqual({ runId: "r1", state: "running" });
   });
 });

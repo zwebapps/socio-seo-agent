@@ -21,7 +21,7 @@ import { Pill, SoftCard, SoftWell } from "../../components/soft";
 // is `partial`" is three chances for the screens to disagree about whether a run that
 // produced nothing looks like a success.
 import { runStateLabel, runStateTone } from "../../lib/runs-api";
-import { RunReviewTabs } from "./review";
+import { ApproveGate, RunReviewTabs } from "./review";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
@@ -74,6 +74,16 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState(false);
   const lastSeq = useRef(0);
+  /**
+   * Bumped when the run is set going again, to re-open the event stream.
+   *
+   * `awaiting_approval` is TERMINAL for the purposes of streaming — the graph has stopped
+   * and there is nothing to listen to — so the effect below returns early and closes its
+   * source. Approving starts EXPORT and MEASURE minutes of work, and without this the
+   * timeline would sit still through all of it and only move if the reader reloaded, which
+   * looks exactly like an agent that did nothing.
+   */
+  const [streamEpoch, setStreamEpoch] = useState(0);
 
   useEffect(() => {
     void params.then((p) => setRunId(p.runId));
@@ -158,7 +168,7 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
       source?.close();
       if (poller !== null) window.clearInterval(poller);
     };
-  }, [runId, refresh, merge]);
+  }, [runId, refresh, merge, streamEpoch]);
 
   const totalCost = events.reduce((sum, e) => {
     const raw = e.payload["cost_usd"];
@@ -243,6 +253,23 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
             nothing here implies research that did not happen.
           </p>
         </SoftCard>
+      )}
+
+      {/* The human decision. Above the review surface deliberately: it is the reason this
+          screen exists, and a reviewer should not have to find it under seven tabs. It
+          renders nothing at all unless the run is parked at the gate, so on every other
+          run this costs the page nothing. Approving re-reads the run and re-opens the
+          event stream, so the state pill and the timeline stop showing a gate that has
+          already been passed. */}
+      {runId && run && (
+        <ApproveGate
+          runId={runId}
+          runState={run.state}
+          onApproved={() => {
+            void refresh();
+            setStreamEpoch((n) => n + 1);
+          }}
+        />
       )}
 
       {/* The review surface. Mounted once the run itself has loaded, and keyed on the

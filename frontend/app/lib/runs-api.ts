@@ -103,6 +103,52 @@ export function canResume(run: RunSummary): boolean {
 }
 
 /**
+ * Let a run past the review gate, so it can publish.
+ *
+ * The human decision the whole machine is built around. `REVIEW` is an interrupt: EXPORT
+ * and MEASURE sit AFTER it in the graph and are unreachable without passing through, so
+ * until this is called a run can be read in full and never publish anything.
+ *
+ * **No body, and that is the point.** The approver is the AUTHENTICATED USER, resolved by
+ * the API from the session — it lands in `approved_by`, reaches `Actuation.approved_by`
+ * and is persisted on every `actions` row, which is how "who authorised this post" stays
+ * answerable months later. Sending an approver from here would be the client making an
+ * authorisation decision, which is the same mistake `current_business` exists to avoid.
+ * There is deliberately nothing in this function to send.
+ *
+ * 202, not 200: this returns as soon as the API has accepted the approval, and the work
+ * then takes MINUTES. The state it answers with is `running`, and a caller must not
+ * present it as `done`.
+ *
+ * Deliberately NOT idempotent: approving an already-running run is a 409
+ * (`run_not_awaiting_approval`) rather than a quiet no-op, because the caller believes
+ * they are approving something and the honest answer is that it is already going. The
+ * other refusal is `no_checkpoint` — the run was parked before it produced anything, so
+ * there is nothing to approve. Both are different sentences and a caller must not lump
+ * them together.
+ */
+export function approveRun(runId: string): Promise<StartedRun> {
+  return request<StartedRun>(`/api/v1/runs/${encodeURIComponent(runId)}/approve`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Whether a run is in the one state the approve endpoint will accept.
+ *
+ * `awaiting_approval` only, mirroring `approve_run`'s own refusal rather than guessing at
+ * it — same rule as `canResume`. Takes the state rather than a `RunSummary` because the
+ * run timeline screen carries its own richer run shape and the state is the only fact
+ * that decides this.
+ *
+ * The consequence for a screen: a control that cannot ever work is worse than no control,
+ * so this gates whether the button EXISTS, not whether it is disabled.
+ */
+export function canApprove(state: string): boolean {
+  return state === "awaiting_approval";
+}
+
+/**
  * Ask for a run. Returns as soon as the API has accepted it — 202, not 200.
  *
  * The work then happens in the background and takes MINUTES, so a caller must not present

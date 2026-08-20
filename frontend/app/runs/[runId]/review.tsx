@@ -36,8 +36,8 @@
  * that the retry loop is real.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { Pill, SoftCard, SoftWell } from "../../components/soft";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { Pill, SoftButton, SoftCard, SoftWell } from "../../components/soft";
 import { SoftTabs, type TabSpec } from "../../components/tabs";
 import { SafeHtml } from "../../components/safe-html";
 import { ApiError } from "../../lib/api";
@@ -58,6 +58,10 @@ import {
   type SeoReport,
   type SocialPost,
 } from "../../lib/review-api";
+// The approve gate's only mutation, and the predicate that decides whether the gate
+// renders a control at all. Both live with the other run mutations rather than here, so
+// "which states does the API accept" has one home.
+import { approveRun, canApprove } from "../../lib/runs-api";
 import { CopyButton } from "./copy-button";
 import { ExportPanel } from "./export";
 
@@ -180,6 +184,216 @@ export function RunReviewTabs({ runId, runState }: { runId: string; runState: st
         <SoftTabs tabs={tabs} active={active} onActivate={setActive} label="Run output" />
       </div>
     </section>
+  );
+}
+
+/* ------------------------------------------------------------------------- */
+/* The human decision                                                         */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * What the two 409s mean for the person reading them, keyed on the API's own `code`.
+ *
+ * The API already sends a distinct sentence per refusal, and `run_not_awaiting_approval`
+ * names the ACTUAL state — which this screen cannot know better, so that sentence is
+ * rendered rather than paraphrased. What is added here is the part the API cannot say:
+ * what to do next. Collapsing the two into one message would send somebody to check the
+ * wrong thing — "already approved by a colleague" and "this run produced nothing" have
+ * nothing in common except the status code.
+ *
+ * An unrecognised code falls through to the server's sentence alone. The server owns this
+ * vocabulary and can add to it, and a browser tab is older than the API it is talking to.
+ */
+const APPROVE_REFUSAL: Record<string, string> = {
+  run_not_awaiting_approval:
+    "The state shown here was out of date, and has just been re-read. Somebody may have " +
+    "approved this run already, or it may have moved on by itself.",
+  no_checkpoint:
+    "There is nothing to publish, so there is nothing to approve. Start a new run rather " +
+    "than approving this one.",
+};
+
+/**
+ * The approve gate: the one control that lets a reviewed run publish.
+ *
+ * The route has existed, tested, with nothing calling it — so a reviewer could read every
+ * tab on this screen and had no way to say yes. The only button here was Resume, which
+ * deliberately refuses a parked run ("waiting for a human decision, not stalled"), i.e.
+ * the reviewer's only available control was the one that could not help them.
+ *
+ * Three rules this component follows, each because the alternative misleads:
+ *
+ * - **It renders no control outside `awaiting_approval`.** Not a disabled one: a
+ *   greyed-out "Approve" on a queued run announces a decision that is not theirs to make
+ *   yet, and on a finished run implies one that can still be made. Same reasoning as the
+ *   export tab's refusal to show a disabled "Publish".
+ * - **It says what approving DOES before it is clicked, per destination, without
+ *   overstating it.** EXPORT and MEASURE sit after REVIEW and are unreachable without
+ *   this, so approving is genuinely what lets the run publish — but on this deployment the
+ *   landing page is the only destination that publishes for real, social refuses without a
+ *   connected account, and email needs a key. Promising "your posts go live" would be a
+ *   claim the machine then refuses, on the one screen where the owner is deciding.
+ * - **Success reports work STARTED, never finished.** The API answers 202 with state
+ *   `running`: EXPORT and MEASURE take minutes. A confirmation reading "published" would
+ *   be a finished-sounding word for a thing still in progress.
+ *
+ * There is no reject button, and deliberately not a disabled one. Rejecting needs a
+ * terminal state `runs.state`'s CHECK constraint does not have, so it is a schema change
+ * and an open decision (BACKLOG A10b) rather than a control someone forgot to wire up.
+ */
+export function ApproveGate({
+  runId,
+  runState,
+  onApproved,
+}: {
+  runId: string;
+  runState: string;
+  /**
+   * Told that the run is moving again, so the screen around this card stops saying
+   * `awaiting approval`. Without it the state pill and the timeline would keep showing a
+   * gate the reviewer has already passed, which is the stale-screen failure this codebase
+   * treats as a bug rather than a rough edge.
+   */
+  onApproved?: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [started, setStarted] = useState(false);
+  const [refusal, setRefusal] = useState<{ code: string; message: string } | null>(null);
+
+  async function approve() {
+    setBusy(true);
+    setRefusal(null);
+    try {
+      await approveRun(runId);
+      // Kept locally rather than inferred from `runState`: the parent is about to re-read
+      // the run and this card's own state will no longer be `awaiting_approval`, and the
+      // person who just clicked should still be told what happened.
+      setStarted(true);
+      onApproved?.();
+    } catch (exc) {
+      if (exc instanceof ApiError) {
+        setRefusal({ code: exc.code, message: exc.message });
+        // A stale screen is what produced this refusal, so re-read rather than leaving the
+        // reviewer looking at the state that was already wrong.
+        if (exc.code === "run_not_awaiting_approval") onApproved?.();
+      } else {
+        setRefusal({ code: "unknown", message: "The approval could not be sent." });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (started) {
+    return (
+      <SoftCard className="mt-6 p-5" size="md" as="div">
+        <h2 className="text-sm font-semibold" style={{ color: "var(--ok)" }}>
+          Approved — publishing has started
+        </h2>
+        {/* "Started", not "published". 202 means the API took the decision, not that the
+            work is done, and EXPORT then MEASURE take minutes. */}
+        <p className="mt-1.5 text-sm" style={{ color: "var(--text-muted)" }} aria-live="polite">
+          You are recorded as the approver. EXPORT is running now and MEASURE follows it,
+          which takes a few minutes — the timeline above updates as each finishes. The
+          Delivery tab is where what actually reached a destination, and what refused, is
+          listed.
+        </p>
+      </SoftCard>
+    );
+  }
+
+  // No control in any other state, rather than a disabled one. See the docstring.
+  if (!canApprove(runState)) return null;
+
+  return (
+    <SoftCard className="mt-6 p-6" size="md" as="div">
+      <div className="flex flex-wrap items-baseline justify-between gap-3">
+        <h2 className="text-[17px] font-semibold tracking-tight">Your decision</h2>
+        <Pill tone="accent">waiting for you</Pill>
+      </div>
+
+      <p className="mt-2 text-sm" style={{ color: "var(--text-muted)" }}>
+        This run is parked at the review gate. EXPORT and MEASURE come after it and cannot
+        run until you approve, so nothing has been published and nothing has been measured
+        yet. Approving is the step that lets this run publish.
+      </p>
+
+      <h3
+        className="mt-5 text-[11px] font-semibold uppercase tracking-[0.18em]"
+        style={{ color: "var(--accent)" }}
+      >
+        What approving does, destination by destination
+      </h3>
+      {/* Per-destination and not one cheerful sentence, because the destinations do
+          genuinely different things on this deployment. The wording follows README
+          "Publishing, and what it honestly does" and the resolver in
+          `run_executor._build_actuator_resolver`, so the screen cannot promise a post the
+          machine then refuses. */}
+      <ul className="mt-2.5 space-y-2 text-sm">
+        <Destination label="Landing page">
+          Published for real — this app serves the page, so there is no credential to be
+          missing. You get a page a visitor can open and one tracked short link per call to
+          action, which is what a lead is attributed to.
+        </Destination>
+        <Destination label="Export pack">
+          Real, and already on the Export pack tab: the copy for every channel, as text to
+          paste.
+        </Destination>
+        <Destination label="Social posts">
+          Will refuse unless that platform&rsquo;s account is connected, and connecting one
+          needs the platform&rsquo;s own approval rather than a switch here. Nothing is
+          posted quietly: a simulated post is labelled as simulated on the Delivery tab.
+        </Destination>
+        <Destination label="Email">
+          Sends only where an email key is configured. Without one it records the setting
+          that is missing instead of sending, and says so.
+        </Destination>
+      </ul>
+
+      <p className="mt-4 text-sm" style={{ color: "var(--text-muted)" }}>
+        You are the approver. Your account is taken from your session and recorded against
+        every action this run takes, so it cannot be set from this screen — and approving
+        cannot be undone from here.
+      </p>
+
+      <div className="mt-5 flex flex-wrap items-center gap-3">
+        <SoftButton variant="primary" onClick={() => void approve()} disabled={busy}>
+          {busy ? "Approving…" : "Approve and let this run publish"}
+        </SoftButton>
+        <span className="text-xs" style={{ color: "var(--text-faint)" }}>
+          Starts work that takes a few minutes.
+        </span>
+      </div>
+
+      {refusal && (
+        <SoftWell className="mt-4 p-4">
+          {/* The server's own sentence first — for `run_not_awaiting_approval` it names the
+              state this screen got wrong, which no client-side copy could. */}
+          <p className="text-sm font-semibold" style={{ color: "var(--warn)" }} role="alert">
+            {refusal.message}
+          </p>
+          {APPROVE_REFUSAL[refusal.code] && (
+            <p className="mt-1.5 text-sm" style={{ color: "var(--text-muted)" }}>
+              {APPROVE_REFUSAL[refusal.code]}
+            </p>
+          )}
+        </SoftWell>
+      )}
+    </SoftCard>
+  );
+}
+
+function Destination({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <li className="flex gap-2">
+      <span aria-hidden style={{ color: "var(--text-faint)" }}>
+        —
+      </span>
+      <span>
+        <span className="font-medium">{label}.</span>{" "}
+        <span style={{ color: "var(--text-muted)" }}>{children}</span>
+      </span>
+    </li>
   );
 }
 

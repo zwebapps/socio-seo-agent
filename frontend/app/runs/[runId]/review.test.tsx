@@ -17,7 +17,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RetrievalTrace, RunReview } from "@/app/lib/review-api";
-import { RunReviewTabs } from "@/app/runs/[runId]/review";
+import { ApproveGate, RunReviewTabs } from "@/app/runs/[runId]/review";
 
 /** The notes the API actually sends, each naming the node responsible. */
 const NOTES = {
@@ -604,5 +604,252 @@ describe("retrieval trace panel", () => {
 
     expect(panel).toHaveTextContent("deferred to operator");
     expect(panel).toHaveTextContent("A future outcome this build has never heard of.");
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* The approve gate                                                           */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The human decision, which for most of this project's life had no button.
+ *
+ * `POST /api/v1/runs/{id}/approve` existed and was tested, and nothing in the UI called
+ * it: a reviewer could read every tab on this screen and the only control offered was
+ * Resume, which deliberately refuses a parked run. So these tests are less about pixels
+ * than about four claims the screen must not get wrong — that the control exists only
+ * where it can work, that its copy does not promise a post the machine will refuse, that
+ * the two refusals stay two different sentences, and that success reads as work STARTED.
+ */
+describe("the approve gate", () => {
+  const APPROVABLE = "awaiting_approval";
+
+  /** One fetch answer, shaped the way the API shapes it. */
+  function stubApprove(outcome: { ok: boolean; status: number; body: unknown }) {
+    const mock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: outcome.ok,
+        status: outcome.status,
+        json: () => Promise.resolve(outcome.body),
+      } as unknown as Response),
+    );
+    vi.stubGlobal("fetch", mock);
+    return mock;
+  }
+
+  const accepted = { ok: true, status: 202, body: { runId: "r1", state: "running" } };
+
+  function refused(code: string, message: string) {
+    return { ok: false, status: 409, body: { detail: { code, message } } };
+  }
+
+  function gate(state: string, onApproved?: () => void) {
+    render(<ApproveGate runId="r1" runState={state} onApproved={onApproved} />);
+  }
+
+  function approveButton(): HTMLElement {
+    return screen.getByRole("button", { name: /approve/i });
+  }
+
+  /**
+   * The rule from the task, and the one worth an exhaustive loop: a control that can never
+   * work is worse than no control. Every one of these states is a 409 at the API, so a
+   * button here would be a button whose only outcome is a refusal.
+   */
+  it("renders no approve control in any state other than awaiting_approval", () => {
+    for (const state of ["queued", "running", "done", "failed", "partial"]) {
+      const { unmount } = render(<ApproveGate runId="r1" runState={state} />);
+      expect(screen.queryByRole("button", { name: /approve/i })).toBeNull();
+      unmount();
+    }
+  });
+
+  /**
+   * Asserted separately from the line above because "absent" and "present but disabled"
+   * pass and fail the same query only if you write the query carelessly. A greyed-out
+   * Approve announces a decision that is not available, which is the failure the export
+   * tab's own docstring already refuses for Publish.
+   */
+  it("does not offer a disabled approve control instead of hiding it", () => {
+    const { container } = render(<ApproveGate runId="r1" runState="done" />);
+
+    expect(container.querySelectorAll("button")).toHaveLength(0);
+    expect(container.textContent?.toLowerCase() ?? "").not.toContain("approve");
+  });
+
+  it("offers the control when the run is parked at the gate", () => {
+    gate(APPROVABLE);
+
+    expect(approveButton()).toBeEnabled();
+  });
+
+  /**
+   * Requirement 2, and the one this project cares about most: the copy has to say what
+   * approving DOES without promising what it cannot deliver. The landing page publishes
+   * for real; social refuses with no connected account; email needs a key. A gate that
+   * said "your posts go live" would be making a claim the actuators then refuse, on the
+   * one screen where a person is deciding whether to let it happen.
+   */
+  it("says what approving does per destination, and does not promise a post that will refuse", () => {
+    const { container } = render(<ApproveGate runId="r1" runState={APPROVABLE} />);
+    const text = container.textContent ?? "";
+
+    // It names the thing approval unlocks, in the machine's own terms.
+    expect(text).toContain("EXPORT");
+    expect(text).toContain("MEASURE");
+    expect(text).toMatch(/lets this run publish/i);
+
+    // The one real destination is named as real.
+    expect(text).toMatch(/Landing page/);
+    expect(text).toMatch(/for real/i);
+
+    // And the two that are not are named as not.
+    expect(text).toMatch(/Social posts/);
+    expect(text).toMatch(/refuse unless that platform.s account is connected/i);
+    expect(text).toMatch(/Email/);
+    expect(text).toMatch(/only where an email key is configured/i);
+
+    // The overstatement, asserted as an explicit negative: the failure mode here is a
+    // confident word, not a missing one.
+    expect(text).not.toMatch(/go live/i);
+    expect(text).not.toMatch(/posts to every channel/i);
+  });
+
+  /** The approver is the session's, so the screen must not imply it is choosing one. */
+  it("states that the approver comes from the session rather than from this screen", () => {
+    const { container } = render(<ApproveGate runId="r1" runState={APPROVABLE} />);
+
+    expect(container.textContent ?? "").toMatch(/taken from your session/i);
+  });
+
+  it("approves, sends no approver, and reports work STARTED rather than finished", async () => {
+    const user = userEvent.setup();
+    const fetchMock = stubApprove(accepted);
+    const onApproved = vi.fn();
+    gate(APPROVABLE, onApproved);
+
+    await user.click(approveButton());
+    await settle();
+
+    // The wire shape, asserted here too and not only in `runs-api.test.ts`: this is the
+    // path a person actually takes, and the authorisation decision is the server's.
+    const call = fetchMock.mock.calls[0];
+    expect(String(call?.[0])).toContain("/api/v1/runs/r1/approve");
+    expect(call?.[1]?.method).toBe("POST");
+    expect(call?.[1]?.body).toBeUndefined();
+    expect(JSON.stringify(call?.[1] ?? {})).not.toContain("approver");
+
+    // 202 means accepted, not done. EXPORT and MEASURE take minutes, and a confirmation
+    // reading "published" would be a finished word for unfinished work.
+    expect(screen.getByText(/publishing has started/i)).toBeInTheDocument();
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/published successfully/i);
+    expect(text).not.toMatch(/all done/i);
+
+    // And the screen around the card is told, so the state pill and the timeline stop
+    // showing a gate that has been passed.
+    expect(onApproved).toHaveBeenCalled();
+
+    // The control is gone: there is nothing left to approve.
+    expect(screen.queryByRole("button", { name: /approve/i })).toBeNull();
+  });
+
+  /**
+   * Refusal one. The API's own sentence names the ACTUAL state, which this screen cannot
+   * know better — so it is rendered rather than paraphrased, and the guidance added
+   * beside it is about a stale screen.
+   */
+  it("renders run_not_awaiting_approval's own sentence and re-reads the run", async () => {
+    const user = userEvent.setup();
+    stubApprove(
+      refused(
+        "run_not_awaiting_approval",
+        "This run is running, not waiting for approval. Only a run parked at the review gate can be approved.",
+      ),
+    );
+    const onApproved = vi.fn();
+    gate(APPROVABLE, onApproved);
+
+    await user.click(approveButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      /This run is running, not waiting for approval/,
+    );
+    // The refusal happened because the screen was out of date, so it re-reads rather than
+    // leaving the reader looking at the state that was already wrong.
+    expect(onApproved).toHaveBeenCalled();
+
+    // Not the other refusal's guidance, and not a generic failure.
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/nothing to publish/i);
+    expect(text).not.toMatch(/something went wrong/i);
+  });
+
+  /** Refusal two: parked before it produced anything, so there is nothing to approve. */
+  it("renders no_checkpoint's own sentence, and a different one", async () => {
+    const user = userEvent.setup();
+    stubApprove(
+      refused(
+        "no_checkpoint",
+        "This run has no checkpoint, so there is nothing to approve. It was parked before it produced anything.",
+      ),
+    );
+    gate(APPROVABLE);
+
+    await user.click(approveButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/no checkpoint/);
+    expect(screen.getByText(/Start a new run rather than approving this one/)).toBeInTheDocument();
+
+    // The whole point of two codes: the other refusal's guidance must not appear here.
+    const text = document.body.textContent ?? "";
+    expect(text).not.toMatch(/was out of date/i);
+    expect(text).not.toMatch(/something went wrong/i);
+  });
+
+  /**
+   * The two 409s must not be one message. Asserted by rendering both and comparing, so a
+   * future collapse into a shared "could not approve" string fails here rather than
+   * passing every individual test above.
+   */
+  it("keeps the two refusals as two different sentences", async () => {
+    async function refusalText(code: string, message: string): Promise<string> {
+      const user = userEvent.setup();
+      stubApprove(refused(code, message));
+      const { container, unmount } = render(
+        <ApproveGate runId="r1" runState={APPROVABLE} />,
+      );
+      await user.click(screen.getByRole("button", { name: /approve/i }));
+      await settle();
+      const text = container.textContent ?? "";
+      unmount();
+      vi.unstubAllGlobals();
+      return text;
+    }
+
+    const notAwaiting = await refusalText(
+      "run_not_awaiting_approval",
+      "This run is running, not waiting for approval.",
+    );
+    const noCheckpoint = await refusalText(
+      "no_checkpoint",
+      "This run has no checkpoint, so there is nothing to approve.",
+    );
+
+    expect(notAwaiting).not.toEqual(noCheckpoint);
+  });
+
+  /**
+   * Reject is deliberately absent — it needs a terminal state `runs.state`'s CHECK
+   * constraint does not have, so it is a schema change and an open decision, not a control
+   * somebody forgot. A disabled one would announce it as nearly here.
+   */
+  it("offers no reject control, disabled or otherwise", () => {
+    const { container } = render(<ApproveGate runId="r1" runState={APPROVABLE} />);
+
+    expect(screen.queryByRole("button", { name: /reject|decline|deny/i })).toBeNull();
+    expect(container.textContent?.toLowerCase() ?? "").not.toContain("reject");
   });
 });

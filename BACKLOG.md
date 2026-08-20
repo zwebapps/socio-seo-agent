@@ -1033,24 +1033,140 @@ A1 is the first code to create.
     no UI caller either. `DIAGRAMS.md` §4 documents the intent — `REVIEW --> [*]: rejected, reason
     feeds the feedback loop` — so the behaviour is specified; the code is not.
   **Split, because the two halves have different risk:**
-- [ ] **A10a · The approve control on the review screen** — pure UI, no schema, no decision: the
+- [x] **A10a · The approve control on the review screen** — pure UI, no schema, no decision: the
   route exists and its contract is settled (202, approver is the AUTHENTICATED user and never
   client-supplied, 409 `run_not_awaiting_approval` from any other state, 409 `no_checkpoint`, and
   deliberately NOT idempotent — a second approval is a 409, not a silent no-op).
   **done = a reviewer at the gate can approve from the screen; the button appears ONLY in
   `awaiting_approval`; both 409s render their own sentence rather than a generic failure; a test
   asserts the client never sends an approver.**
-- [ ] **A10b · Reject — `[DECISION NEEDED]`, because it needs a migration.** `runs.state` carries a
-  CHECK constraint of exactly six values (`queued, running, awaiting_approval, done, failed,
-  partial`), so a `rejected` terminal state is a schema change. Three questions for the architect,
-  none of which the loop should answer alone: (1) a new `rejected` state, or reuse `partial`?
-  `partial` currently means "the machine fell short with a stated reason", and a human saying no is
-  a different fact — but it is also the only terminal that already carries a reason, and the
-  diagram shows rejected as its own exit. (2) Does rejecting write a `feedback_service` rejection
-  so it counts toward distil at 3+, and if so against WHICH object — the run has no
-  `content_piece_id` until EXPORT, which a rejected run never reaches. (3) Is a reason required?
-  `feedback_service` says a reasonless rejection is accepted and contributes nothing to distil;
-  the gate could be stricter. **A10a does not depend on this and ships first.**
+- [ ] **A10b · Reject — RULED 2026-08-20 (architect); no longer a decision. A new terminal
+  `rejected` state, NO `feedback_service` write, and a reason is REQUIRED.** Backend only; the
+  control is A10c. The three questions, answered from what the code actually permits:
+  - **(1) A new `rejected` state, NOT `partial`.** Reusing `partial` makes a human's "no"
+    indistinguishable in SQL from a node that fell short, so "how often do reviewers refuse the
+    output" — the single number that says whether this product is any good — stops being askable,
+    and the run is painted `warn` as a shortfall the machine is to blame for. That is the exact
+    misattribution `partial`'s own colour rule exists to avoid, pointed the other way.
+    `DIAGRAMS.md` §4 already draws rejection as its own exit. It is **terminal and NOT
+    reversible**: the recovery from a rejection is a NEW run, which re-derives from current
+    documents rather than republishing what was refused. Approve-after-reject is therefore the
+    existing 409 `run_not_awaiting_approval` and needs no new vocabulary.
+  - **(2) NO — and this is not a judgement call, it is impossible without inventing data.**
+    `Feedback.content_piece_id` is `NOT NULL` with an FK to `content_pieces`, and verified
+    2026-08-20 the ONLY thing in the application that ever inserts a `content_pieces` row is
+    `content_store.create_landing_page`, reached from the `publish.page` actuator, which
+    `run_executor._build_actuator_resolver` resolves at **EXPORT — after the gate**. So NO run has
+    a content piece at REVIEW, approved or rejected; the review tabs are projected from
+    `runs.checkpoint` by `review_service`, not from a row. **The loop must NOT: create a
+    `ContentPiece` to hang the rejection on; make `feedback.content_piece_id` nullable; add a
+    `run_id` column to `feedback`; or call `feedback_service.record` from this route.** The
+    rejection is recorded on the run itself — `state` + `finished_reason` — and that is the whole
+    record. *Filed, and deliberately NOT part of A10b's done:* the day a run persists its draft as
+    a `content_pieces` row, a REVIEW rejection can carry piece-level feedback into `distil` and the
+    loop `DIAGRAMS.md` §4 describes closes for real. That wants its own item; today it would be a
+    fabrication, and `distil`'s theme table is style-specific while a gate rejection can be about
+    anything.
+  - **(3) A reason is REQUIRED** — `min_length=10`, `max_length=240`, measured after whitespace
+    collapse, refused 422 before anything is written. Required because a reasonless rejection is
+    the one input this product can do nothing with, and the reviewer is the only person who will
+    ever know why. 10 characters because it costs a real sentence nothing and it stops `x`/`no`/
+    `bad`; no validator stops a determined shrug and none should pretend to. 240 and not 255
+    because `runs.finished_reason` is `VARCHAR(255)` and `clamp_reason` TRUNCATES: silently
+    shortening a provider stack trace is a cosmetic loss, silently shortening a person's stated
+    reason is not — so the API's 422 is the only length refusal a human can ever meet, and the
+    clamp stays a backstop for machine-authored reasons.
+  - **The rejecter is deliberately NOT recorded — a difference from approve, not an oversight.**
+    `approved_by` exists because it authorises an outward publish and lands on every `actions` row;
+    a rejection authorises nothing and sends nothing. There is one user per business today
+    (`business_for_user`, no membership table), so a `rejected_by` column would store what
+    `business_id` already implies. When a business can have several users this becomes a `RunEvent`
+    (`node="REVIEW"`, a fifth `EventStatus`) — which also costs the CLOSED frontend union
+    `"started" | "done" | "failed" | "skipped"` in `runs/[runId]/page.tsx`, which is why it is
+    neither free nor now.
+  - **Migration** — hand-written like every other one here, in
+    `backend/app/db/migrations/versions/` (root `alembic.ini`, `script_location` points there;
+    CI applies it with `uv run alembic upgrade head`). File
+    `e6a1c3f5b28d_run_rejected_state.py`, `revision = "e6a1c3f5b28d"`,
+    `down_revision = "d4f18a6c93b7"` (verified head: nothing revises it). Template is
+    `1fc3f48597dc_user_role.py`.
+    `upgrade()`: `op.drop_constraint(op.f("ck_runs_state_valid"), "runs", type_="check")` then
+    `op.create_check_constraint(op.f("ck_runs_state_valid"), "runs", "state in ('queued',
+    'running','awaiting_approval','done','failed','partial','rejected')")` — no data write.
+    `downgrade()`: the surviving rows must be mapped FIRST or the six-value constraint refuses
+    them — `UPDATE runs SET state = 'partial' WHERE state = 'rejected'`, lossy and commented as
+    such (`finished_reason` still says why) — and **that UPDATE must be wrapped in `ALTER TABLE
+    runs NO FORCE ROW LEVEL SECURITY` / `... FORCE ROW LEVEL SECURITY`**: `runs` has FORCE RLS,
+    the GUC is unset inside a migration, so a bare UPDATE matches ZERO rows and the downgrade then
+    fails on rows it believes it fixed. The core-schema migration's own comment
+    (`3b8336ae2975`, above the RLS block) already states this rule — follow it rather than
+    rediscovering it. Mirror the seventh value in `models.py`'s `CheckConstraint` and in
+    `RunState`. **`AgentState`'s `Outcome` literal stays at six values**: the graph never concludes
+    a rejection, a person does, and `run_executor` already clamps graph outcomes to
+    `{done, failed, partial}`.
+  - **Contract** — `POST /api/v1/runs/{run_id}/reject`, body `{"reason": str}`. Mirrors approve
+    where the shapes agree and differs only where the meaning does:
+    - **200, not 202.** Approve is 202 because it starts minutes of work; reject starts none and is
+      complete when it returns. Body `RunDecisionResponse{runId, state, finishedReason}` — its own
+      model, and the third field is the point: the response echoes the STORED reason, so the screen
+      renders what was persisted rather than what it sent.
+    - **404 `run_not_found`** through the existing `_require_own_run`.
+    - **409 `run_not_awaiting_approval`** for every other state — the SAME code as approve, because
+      it is the same condition and one code lets one handler serve both buttons; the message says
+      "rejected". A second reject is therefore a 409, never a silent no-op: same doctrine.
+    - **422** from `Field(min_length=10, max_length=240)` on the request model — the same shape the
+      goal bounds already produce, so the client can mirror the numbers as it mirrors `GOAL_MIN`.
+    - **NO `no_checkpoint` refusal.** The one deliberate divergence: approve refuses a
+      checkpoint-less run because the approval is written INTO the checkpoint and approving nothing
+      is meaningless, whereas a rejection writes nothing there and a run parked having produced
+      nothing is exactly what a reviewer should be able to dismiss. **A reviewer must always be
+      able to say no.**
+    - **No `run_already_executing` guard either** — verified in `run_executor._execute`: after
+      `await_approval` the task returns and makes no further write, so the only window in which a
+      parked run is still in `_live` is one where nothing can overwrite the rejection. Guarding it
+      would refuse a legitimately parked run.
+    - The route calls `service.finish(run_id, outcome="rejected", reason=...)` and **never touches
+      the executor**. `runs.checkpoint` is left INTACT so the review tabs still render what was
+      refused; clearing it is forbidden.
+    - **`TERMINAL` in `api/runs.py` gains `rejected`**, or the SSE stream for a rejected run holds
+      open the full `MAX_STREAM_SECONDS` (15 minutes) waiting for events that cannot come.
+  **done = a reviewer's "no" is a terminal fact in the database that no other route can undo:
+  `POST /api/v1/runs/{id}/reject` with a valid reason answers 200 and leaves `state='rejected'`
+  with `finished_reason` = the cleaned reason; a missing, blank, too-short or over-long reason is
+  422 BEFORE any write; every non-`awaiting_approval` state is 409 `run_not_awaiting_approval`,
+  including a second reject; a run with NO checkpoint is still rejectable; `POST /approve` AND
+  `POST /resume` on a rejected run are both 409 and NEITHER reaches the executor — asserted by a
+  test that the executor was never submitted, because until `rejected` joins `resume`'s finished
+  set a rejected run sails straight past the review gate and publishes, which is the real hole
+  here; the checkpoint survives, proven by projecting the review after rejecting; and `alembic
+  upgrade head` then `alembic downgrade -1` both succeed on a database containing a rejected run.**
+- [ ] **A10c · The reject control, and a rejected run that reads as a decision rather than a
+  fault** — UI only, no schema. Depends on A10a (the decision card) and A10b (the route). The
+  control lives in the SAME card as approve, because a decision surface with one option is not a
+  decision; it is visually SECONDARY to approve (approve is the intended path) and NOT an alarming
+  red (nothing is broken). Two-step: choosing reject reveals the reason field, so "no" is never one
+  careless click and the required field is not a wall standing in front of the approve path.
+  `rejectRun(runId, reason)` + `REJECT_REASON_MIN`/`REJECT_REASON_MAX` (mirroring `GOAL_MIN`/
+  `GOAL_MAX`) + `canReject(state)` in `runs-api.ts` — the same predicate as `canApprove` today, its
+  own name so the day they diverge the seam already exists. Then the three places a new state
+  leaks, all of which are `string`-typed and fall through silently, which is why each needs an
+  explicit test rather than a shrug: `runStateTone("rejected")` → **`muted`**, explicitly NOT `err`
+  and NOT `warn` (a deliberate human "no" is neither a fault nor a shortfall, and a fault colour
+  tells the owner the machine broke) — asserted so it is intent and not the accident of the default
+  branch; `rejected` added to `TERMINAL_STATES` in `runs-api.ts` AND `TERMINAL` in
+  `runs/[runId]/page.tsx`, or the screen polls and holds a stream open forever on a run nothing will
+  ever move; and `nodeCaption` gains a `rejected` branch — a THIRD verb, because both existing ones
+  lie about it ("waiting at REVIEW" implies a decision still pending, "stopped at REVIEW" implies a
+  fault).
+  **done = a reviewer can say no from the screen and the screen then reads as a decision: the
+  reject control renders only in `awaiting_approval` and never as a disabled button; it refuses to
+  submit under `REJECT_REASON_MIN` in its own sentence rather than by round-tripping a 422; a test
+  asserts the client sends only a reason and never a rejecter; after rejecting, the state pill reads
+  `rejected` in `muted` (asserted, not inherited), polling and the event stream both stop, the
+  existing `finishedReason` well shows the typed reason under a heading that names the human
+  decision instead of "Why it stopped" in `warn`, the runs list captions it with its own verb, and
+  the review tabs stay MOUNTED so the refused draft is still readable — a rejected draft is
+  evidence, and hiding it would withhold work the owner already paid for.**
 
 - [ ] **A2c · A node that raises loses its retrieval trace along with everything else** — found
   by A2a, pre-existing, and deliberately not changed there. `GENERATE` and `CONVERT` raise
