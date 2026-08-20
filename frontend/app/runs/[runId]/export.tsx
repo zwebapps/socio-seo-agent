@@ -27,9 +27,18 @@
  * - **An empty section names the node that fills it**, exactly as the review tabs do. A
  *   blank panel is indistinguishable from a rendering bug, and "REPACK has not completed"
  *   is a different problem from "the download is broken".
- * - **No tracked short link is invented.** None exists for a run yet, and a
- *   plausible-looking one would be a dead URL in somebody's Instagram bio. The bio-link
- *   hub, which is real, is offered instead with what it does and does not contain stated.
+ * - **No tracked short link is invented — and now that some are real, none is implied
+ *   either.** A run that publishes a landing page mints one short link per channel CTA,
+ *   and those are rendered because they exist. A run that published nothing gets the
+ *   server's own sentence about the absence instead, and nothing that looks like an
+ *   address. Both halves matter: a plausible-looking `/l/xxxxxxxx` would be a dead URL in
+ *   somebody's Instagram bio, and a note explaining an absence that is not there would be
+ *   a contradiction on screen — so the note and the links are mutually exclusive here,
+ *   keyed on `trackedLinkNote` being non-null rather than on the list being empty.
+ * - **A published page is an address, not a publish claim.** The pack carries no publish
+ *   status by contract, so the page is rendered as a link and nothing more. A simulated
+ *   publish reaches this screen as `null`, which is why there is no "not published yet"
+ *   placeholder to be mistaken for one: the absence of the row IS the statement.
  *
  * The download is a plain `<a href>` to the Markdown rendering, not a scripted blob: it
  * works with JavaScript off, and the filename and the `attachment` disposition come from
@@ -405,6 +414,24 @@ function AnswerBlocksCard({ pack }: { pack: ExportPack }) {
   );
 }
 
+/**
+ * Where a click lands, and what counts it.
+ *
+ * Three addresses, and each one is rendered only when it exists:
+ *
+ * - the **published page**, when this run published one. It goes first because every
+ *   tracked link below points at it, so a reader deciding whether to paste one wants to
+ *   know where it lands. The label sits OUTSIDE the anchor deliberately — the anchor's
+ *   accessible name has to be the URL, both because a screen-reader user needs to hear the
+ *   destination and because a control named "published…" is exactly what the honest
+ *   labelling rule forbids on a screen that posts to no platform.
+ * - the **bio-link hub**, which is real and permanent for every business.
+ * - the **tracked links**, one per channel, with the code that attributes the click.
+ *
+ * The absence note is rendered when — and only when — the server sends one. It is not an
+ * `else` on the list being empty: that would put this screen in the business of deciding
+ * when an absence is worth explaining, and the server already decided.
+ */
 function LinksCard({ pack }: { pack: ExportPack }) {
   return (
     <section aria-labelledby="export-links">
@@ -412,6 +439,22 @@ function LinksCard({ pack }: { pack: ExportPack }) {
         Where the clicks go
       </h3>
       <SoftCard className="mt-3 p-5" size="md" as="div">
+        {pack.publishedPageUrl && (
+          <p className="mb-3 text-sm">
+            <span className="text-[11px] uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+              published page{" "}
+            </span>
+            <a
+              href={pack.publishedPageUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline"
+              style={{ color: "var(--text)" }}
+            >
+              {pack.publishedPageUrl}
+            </a>
+          </p>
+        )}
         {pack.hubUrl && (
           <p className="text-sm">
             <span className="text-[11px] uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
@@ -433,12 +476,57 @@ function LinksCard({ pack }: { pack: ExportPack }) {
             {pack.hubNote}
           </p>
         )}
-        {/* The absence, stated. A short link that does not exist must never be rendered as
-            though it did — it would 404 from somebody's Instagram bio, and the failure
-            would be invisible until the leads did not arrive. */}
-        <p className="mt-3 text-sm" style={{ color: "var(--warn)" }}>
-          {pack.trackedLinkNote}
-        </p>
+        {pack.trackedLinks.length > 0 && (
+          <div className="mt-4">
+            <h4 className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-faint)" }}>
+              Tracked links, one per channel
+            </h4>
+            {/* One link per channel rather than one for the run, so a click can be
+                attributed to the channel it came from — that separation is the whole
+                reason these exist, and it is worth a sentence because a reader who
+                shortens two channels to one link has quietly given up the measurement. */}
+            <p className="mt-1 text-xs" style={{ color: "var(--text-muted)" }}>
+              Each channel gets its own address, so its clicks are its own. Paste the
+              channel&rsquo;s link into that channel and nowhere else.
+            </p>
+            <ul className="mt-2 space-y-2 text-sm">
+              {pack.trackedLinks.map((link) => (
+                <li key={link.code}>
+                  <span style={{ color: "var(--text-muted)" }}>{channelLabel(link.channel)}: </span>
+                  <a
+                    href={link.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline"
+                    style={{ color: "var(--text)" }}
+                  >
+                    {link.url}
+                  </a>
+                  {/* The code, beside its URL: it is what a later report counts, so this
+                      is what lets an owner match a figure back to a paste. */}
+                  <span className="tabular ml-1.5 text-xs" style={{ color: "var(--text-faint)" }}>
+                    code {link.code}
+                  </span>
+                  {link.text && (
+                    <span className="block text-xs" style={{ color: "var(--text-muted)" }}>
+                      {link.text}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {/* The absence, stated — and only while it is an absence. A short link that does
+            not exist must never be rendered as though it did, because it would 404 from
+            somebody's Instagram bio and the failure would be invisible until the leads did
+            not arrive. The same sentence printed above a list of working links would be
+            the mirror-image error: this screen contradicting itself. */}
+        {pack.trackedLinkNote && (
+          <p className="mt-3 text-sm" style={{ color: "var(--warn)" }}>
+            {pack.trackedLinkNote}
+          </p>
+        )}
       </SoftCard>
     </section>
   );

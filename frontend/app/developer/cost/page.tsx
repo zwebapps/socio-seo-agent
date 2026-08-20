@@ -20,12 +20,27 @@
  * as the signed-in account's own business, so it is one tenant's spend and never a
  * platform total. A cross-business view would need a `SECURITY DEFINER` function written
  * for the purpose, not a looser session.
+ *
+ * That last paragraph is also why this screen supplies its own 403 sentence. The shared
+ * refusal is about platform-wide SETTINGS, which is right on the other three developer
+ * screens and false here: nothing on this page is a setting, so an owner who is refused
+ * was refused a NUMBER, and being told to ask about settings contradicted the header they
+ * had just read.
  */
 
 import { useCallback, useState } from "react";
 import { Pill, SoftCard, SoftSelect, SoftWell } from "../../components/soft";
 import { adminApi, type SpendRow } from "../../lib/admin-api";
 import { ErrorCard, Loading, PageHeader, useAdminResource } from "../shell";
+
+/**
+ * Why THIS screen is refused. Exported so the test asserts the shipped string rather than
+ * a copy of it — a second copy is what put the wrong sentence on this page in the first
+ * place.
+ */
+export const COST_REFUSAL =
+  "Spend reporting is limited to whoever operates this installation — ask them if you " +
+  "need a figure for your business.";
 
 const WINDOWS = [
   { value: "7", label: "Last 7 days" },
@@ -66,6 +81,7 @@ export default function CostPage() {
         <ErrorCard
           error={cost.error}
           returnTo="/developer/cost"
+          forbidden={COST_REFUSAL}
           onRetry={() => void cost.reload()}
         />
       )}

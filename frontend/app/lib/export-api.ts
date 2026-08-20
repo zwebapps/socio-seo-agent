@@ -10,10 +10,17 @@
  * - `notice`, `channelsNote`, `landingPageNote` and `trackedLinkNote` are the honest
  *   halves. Every one of them is a sentence the API wrote; none is a fallback this screen
  *   invents when a field is empty.
+ * - `publishedPageUrl` and `trackedLinks` are the opposite half — addresses that exist,
+ *   and only when they do. The server reads them back out of the `publish.page` outcome
+ *   the landing actuator recorded, refuses a simulated one, and drops any CTA missing a
+ *   channel, a code or a URL. So `null` and `[]` here are facts about the run, not
+ *   loading states, and there is nothing for this client to reconstruct or fill in.
  *
  * There is deliberately no `publish`, `schedule` or `send` function in this file. Nothing
  * in this product posts to a platform, so a client function named for it would be the
- * first half of a lie the UI would then have to tell.
+ * first half of a lie the UI would then have to tell. The published page is not the
+ * exception it looks like: the run publishes to our OWN public address, and this file only
+ * ever reads that address back.
  */
 
 import { request } from "./api";
@@ -67,6 +74,26 @@ export type ExportLandingPage = {
   channelCtas: ExportCta[];
 };
 
+/**
+ * One channel's short link, minted rather than composed.
+ *
+ * `code` is on the wire beside `url` because the code is what the click is attributed to
+ * — it is the `short_links` row's own key, and the number a later report counts against
+ * this channel. Showing it beside the URL is what lets an owner match a paste to a figure.
+ *
+ * Nothing in this client may build one of these. A `code` only ever arrives from a row
+ * that already exists, and a plausible-looking `/l/xxxxxxxx` assembled here would be a
+ * dead link in somebody's Instagram bio — invisible, because it looks exactly like a
+ * working one.
+ */
+export type ExportTrackedLink = {
+  channel: string;
+  /** The ask that goes with the link, so the paste is the whole post. */
+  text: string;
+  code: string;
+  url: string;
+};
+
 export type ExportAiBlocks = {
   targetKeyword: string | null;
   blocks: string[];
@@ -86,8 +113,25 @@ export type ExportPack = {
   aiBlocksNote: string | null;
   hubUrl: string | null;
   hubNote: string | null;
-  /** Why there is no tracked short link yet, and what to do instead. */
-  trackedLinkNote: string;
+  /**
+   * The public address of the page this run published, and `null` when it published none.
+   *
+   * An address to paste, not a publish claim — the pack deliberately carries no publish
+   * status at all, which is why this is a bare URL and not a state. `null` covers both "no
+   * page was published" and "the publish was simulated": a simulated one succeeds in every
+   * respect except reaching the world, so the server refuses it here rather than handing
+   * this screen a `fake://` reference to render as though it were live.
+   */
+  publishedPageUrl: string | null;
+  /** One per channel CTA, minted by the landing actuator. Empty until a run publishes. */
+  trackedLinks: ExportTrackedLink[];
+  /**
+   * Why there is no tracked short link, and what to do instead — `null` once there are
+   * some, because a sentence explaining an absence that is not there is a contradiction on
+   * the screen. So this field is not "the note", it is "the note IF the absence is real",
+   * and the UI has to key on it rather than render it unconditionally.
+   */
+  trackedLinkNote: string | null;
   factGaps: string[];
   errors: { node: string; code: string; message: string }[];
 };

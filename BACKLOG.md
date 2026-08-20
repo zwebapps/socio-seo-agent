@@ -719,7 +719,7 @@ A1 is the first code to create.
   `test_landing_actuator.py` currently asserts `run_id is None` WITH the reason — that
   assertion inverts when this lands, and it is the test that will notice.
 
-- [ ] **A1b · The published page and its real short links reach the export pack and the
+- [x] **A1b · The published page and its real short links reach the export pack and the
   Delivery tab** — depends on A1a. `review_service` currently hard-codes
   `_NO_LANDING_PAGE`/`trackedLinkNote` and `test_the_pack_never_invents_a_tracked_short_link`
   forbids `/l/` anywhere in the pack. Both were correct while nothing minted a link and
@@ -899,7 +899,7 @@ A1 is the first code to create.
   **done = both statements match the code, and a grader reading either document is not told
   about a screen that does not exist.**
 
-- [ ] **A9 · `/developer/cost` tells an owner two contradictory things, and the route's gate
+- [x] **A9 · `/developer/cost` tells an owner two contradictory things, and the route's gate
   is a category error** — found by live testing, and the ruling covers both halves so the
   loop does not have to choose. Verified: `backend/app/api/cost.py:63` gates `GET /cost` with
   `require_admin` (**platform_admin** — `api/admin_models.py:165`), while the same route
@@ -940,6 +940,19 @@ A1 is the first code to create.
   place in the frontend; and the Cost header no longer promises a view the gate refuses.
   `CRITERIA_MAP.md` §7 claims discipline is binding on UI copy, so this is the same class of
   fix as A8.**
+
+- [ ] **A9-i · The API's own 403 sentence is wrong for `/cost`, and only the frontend hides it**
+  — found while fixing A9. `admin_models.require_admin` answers every gated route with
+  `"Your account cannot change these settings."` It is route-agnostic because the dependency
+  cannot know which screen asked, and it is false on `/api/v1/cost`: there is no setting on
+  that route, the caller was refused a NUMBER. A9 stopped the console from RENDERING it (the
+  screen supplies its own sentence for a 403), but the string is still what the API emits, so
+  any other client, the OpenAPI schema, and anyone reading the response body still get the
+  false noun. Two candidate fixes, and the second is probably right: a per-route refusal
+  message, or drop the prose from the 403 body altogether since `code` is what callers act on
+  and the prose is the screen's job to get right — which is the principle A9 established.
+  **done = no gated route asserts what KIND of thing it is refusing unless it actually knows;
+  a test pins the cost route's 403 body against the claim it makes.**
 
 ## B · ⛔ BLOCKED — what the human must supply, and the exact question
 

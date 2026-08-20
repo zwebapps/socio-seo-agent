@@ -16,6 +16,9 @@
  *   retry button, and no login link — sending someone who is already signed in to the
  *   login page is a loop they cannot escape.
  * - anything else: retry, plus how to start the API if it is simply not running.
+ *
+ * The SHAPE is identical everywhere; the 403 sentence is not, and that is the one thing
+ * this card takes from the caller — see `SETTINGS_REFUSAL`.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -82,15 +85,42 @@ export function useAdminResource<T>(fetcher: () => Promise<T>): Resource<T> {
   return { data, error, busy, saved, reload, save };
 }
 
+/**
+ * The 403 sentence for a screen that really is platform-wide SETTINGS.
+ *
+ * Model routing, Sampling & prompts and Tool access are settings, so this is true on all
+ * three and stays the default. `/developer/cost` is not: it refuses DATA, and pointing
+ * somebody at "settings they need changed" on a screen that has no setting on it is how
+ * the console came to say two contradictory things at once — the header telling an owner
+ * these were their own business's numbers while the body called them settings.
+ *
+ * Neither sentence names the role required. `require_admin`'s own docstring gives the
+ * reason: naming the capability tells a customer exactly what to go phishing for, and it
+ * is not something they can act on legitimately either way.
+ */
+export const SETTINGS_REFUSAL =
+  "These are platform-wide settings. Ask whoever operates this installation if you " +
+  "need them changed.";
+
 export function ErrorCard({
   error,
   onRetry,
   returnTo,
+  forbidden = SETTINGS_REFUSAL,
 }: {
   error: LoadError;
   onRetry: () => void;
   /** Path to come back to after signing in. */
   returnTo: string;
+  /**
+   * What this screen in particular is refusing, shown for a 403 IN PLACE OF the server's
+   * message rather than under it. The API answers every one of these routes with the same
+   * route-agnostic sentence ("Your account cannot change these settings") because it
+   * cannot know which screen asked — so on Cost the server's own prose is the wrong noun,
+   * and stacking a correction beneath it would leave both on screen. The `code` is the
+   * load-bearing part of a 403; the prose is the screen's to get right.
+   */
+  forbidden?: string;
 }) {
   const terminal = error.code === "not_authenticated" || error.code === "forbidden";
 
@@ -105,16 +135,16 @@ export function ErrorCard({
                 ? "Not available on this account"
                 : "Something went wrong"}
           </p>
-          <p className="mt-1 text-sm">{error.message}</p>
+          {error.code === "forbidden" ? (
+            <p className="mt-1 text-sm" style={{ color: "var(--text-muted)" }}>
+              {forbidden}
+            </p>
+          ) : (
+            <p className="mt-1 text-sm">{error.message}</p>
+          )}
           {error.code === "network" && (
             <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
               Start the API with <code>make api</code>, then retry.
-            </p>
-          )}
-          {error.code === "forbidden" && (
-            <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
-              These are platform-wide settings. Ask whoever operates this installation if
-              you need them changed.
             </p>
           )}
           {error.code === "not_authenticated" && (

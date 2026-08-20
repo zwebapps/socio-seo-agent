@@ -11,6 +11,12 @@
  * a route is actually configured or just showing a default, whether cost can be
  * reported for the models chosen, and — for a local provider — whether anything is
  * reachable at all.
+ *
+ * The error card comes from `../shell` rather than living here. It was written here first
+ * and copied out, which left two of them, and the copies drifted the moment `/developer/
+ * cost` needed a 403 sentence that was true for a screen with no settings on it: this one
+ * kept claiming "platform-wide settings" on a page refusing a spend figure. Routing IS a
+ * platform-wide setting, so this screen wants the shell's default and passes no override.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -26,6 +32,7 @@ import {
 } from "../../components/soft";
 import { ApiError } from "../../lib/api";
 import { adminApi, type Catalogue, type Provider, type Route } from "../../lib/admin-api";
+import { ErrorCard } from "../shell";
 
 const TIERS = ["cheap", "mid", "strong", "embed"];
 
@@ -109,45 +116,11 @@ export default function ModelsAdminPage() {
       </header>
 
       {error && (
-        <SoftCard className="mb-8 p-5" size="md">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <p className="text-sm font-semibold" style={{ color: "var(--err)" }}>
-                {error.code === "not_authenticated"
-                  ? "Sign in required"
-                  : error.code === "forbidden"
-                    ? "Not available on this account"
-                    : "Something went wrong"}
-              </p>
-              <p className="mt-1 text-sm">{error.message}</p>
-              {error.code === "network" && (
-                <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
-                  Start the API with <code>make api</code>, then retry.
-                </p>
-              )}
-              {error.code === "forbidden" && (
-                <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
-                  These are platform-wide settings. Ask whoever operates this
-                  installation if you need them changed.
-                </p>
-              )}
-              {error.code === "not_authenticated" && (
-                <p className="mt-3 text-sm">
-                  <a
-                    href="/login?next=/developer/models"
-                    className="font-medium underline decoration-2 underline-offset-4"
-                    style={{ color: "var(--primary)" }}
-                  >
-                    Go to sign in
-                  </a>
-                </p>
-              )}
-            </div>
-            {error.code !== "not_authenticated" && error.code !== "forbidden" && (
-              <SoftButton onClick={() => void load()}>Retry</SoftButton>
-            )}
-          </div>
-        </SoftCard>
+        <ErrorCard
+          error={error}
+          returnTo="/developer/models"
+          onRetry={() => void load()}
+        />
       )}
 
       {!data && !error && <Loading />}

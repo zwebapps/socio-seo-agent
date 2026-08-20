@@ -21,7 +21,7 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ExportChannel, ExportPack } from "@/app/lib/export-api";
+import type { ExportChannel, ExportPack, ExportTrackedLink } from "@/app/lib/export-api";
 import { ExportPanel } from "@/app/runs/[runId]/export";
 
 /** The notes the API actually sends, each naming the node responsible. */
@@ -90,6 +90,31 @@ const INSTAGRAM: ExportChannel = {
   ],
 };
 
+/**
+ * What a run that actually published looks like on the wire.
+ *
+ * Shaped after the addresses `_published_addresses` reads back out of the `publish.page`
+ * outcome: an absolute page URL, and one minted short link per channel CTA. The default
+ * `pack()` below carries neither, because most runs have not published and the absence is
+ * the case the older tests here were written to protect.
+ */
+const PAGE_URL = "http://localhost:8100/p/6f1c9b02-0000-4000-8000-000000000001";
+
+const TRACKED: ExportTrackedLink[] = [
+  {
+    channel: "instagram",
+    text: "Link in der Bio",
+    code: "aB3xK9mQ",
+    url: "http://localhost:8100/l/aB3xK9mQ",
+  },
+  {
+    channel: "linkedin",
+    text: "Termin anfragen",
+    code: "Zq7Lp2Wd",
+    url: "http://localhost:8100/l/Zq7Lp2Wd",
+  },
+];
+
 function pack(over: Partial<ExportPack> = {}): ExportPack {
   return {
     hasPack: true,
@@ -102,11 +127,23 @@ function pack(over: Partial<ExportPack> = {}): ExportPack {
     aiBlocksNote: NOTES.aiBlocks,
     hubUrl: "http://localhost:8100/go/11111111-1111-1111-1111-111111111111",
     hubNote: NOTES.hub,
+    publishedPageUrl: null,
+    trackedLinks: [],
     trackedLinkNote: NOTES.trackedLink,
     factGaps: [],
     errors: [],
     ...over,
   };
+}
+
+/** A run that published: a real page, real codes, and therefore no absence to explain. */
+function published(over: Partial<ExportPack> = {}): ExportPack {
+  return pack({
+    publishedPageUrl: PAGE_URL,
+    trackedLinks: TRACKED,
+    trackedLinkNote: null,
+    ...over,
+  });
 }
 
 let body: ExportPack = pack();
@@ -301,6 +338,93 @@ describe("copying and downloading", () => {
   });
 });
 
+describe("a run that published its page", () => {
+  /**
+   * The published page reaches the screen as a real destination, not as a string.
+   *
+   * It has to be an anchor: this is the address a reader clicks to check what they are
+   * about to point a customer at, and it is the one thing on this tab that leaves the app.
+   * `target="_blank"` with `rel="noopener"` because losing the run you are reviewing in
+   * order to look at its output is a bad trade.
+   */
+  it("renders the published page as a link that goes to it", async () => {
+    body = published();
+    await mount();
+
+    const link = screen.getByRole("link", { name: PAGE_URL });
+    expect(link).toHaveAttribute("href", PAGE_URL);
+    expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
+  });
+
+  /**
+   * One link per channel, each with the code beside it.
+   *
+   * The code is not decoration: it is the `short_links` row's key and therefore what a
+   * later report counts, so it is what lets an owner match a figure back to the paste that
+   * earned it. A screen showing two indistinguishable URLs would make that match guesswork.
+   */
+  it("renders one tracked link per channel, with the code that attributes the click", async () => {
+    body = published();
+    await mount();
+
+    for (const link of TRACKED) {
+      expect(screen.getByRole("link", { name: link.url })).toHaveAttribute("href", link.url);
+      expect(screen.getByText(`code ${link.code}`)).toBeInTheDocument();
+    }
+    // Named per channel, and by the label the rest of the app uses — the raw `instagram`
+    // key on a customer surface is developer output leaking out.
+    expect(screen.getByText(/Instagram:/)).toBeInTheDocument();
+    expect(screen.getByText(/LinkedIn:/)).toBeInTheDocument();
+    // The ask travels with the link, so what is pasted is the whole post.
+    expect(screen.getByText("Link in der Bio")).toBeInTheDocument();
+  });
+
+  /**
+   * The mirror image of the absence rule, and the reason `trackedLinkNote` became
+   * nullable: a sentence saying no short link exists, printed above two working ones, is
+   * the screen contradicting itself. The server sends `null` once links exist; this test
+   * proves the client keys on that instead of rendering the note unconditionally.
+   */
+  it("does not explain an absence when the links are there", async () => {
+    body = published();
+    await mount();
+
+    expect(screen.queryByText(NOTES.trackedLink)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/No tracked short link/);
+  });
+
+  /**
+   * A page CAN be published with no tracked links behind it — a CTA missing its code is
+   * dropped by the server, and a page with no channel asks mints nothing. Then both halves
+   * are true at once, and each keys on its own field rather than on the other.
+   */
+  it("shows the page and still explains the missing links when only the page exists", async () => {
+    body = published({ trackedLinks: [], trackedLinkNote: NOTES.trackedLink });
+    await mount();
+
+    expect(screen.getByRole("link", { name: PAGE_URL })).toBeInTheDocument();
+    expect(screen.getByText(NOTES.trackedLink)).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/\/l\/[0-9a-zA-Z]{6,}/);
+  });
+
+  /**
+   * The honest-labelling rule again, on the controls this feature added — and it is a real
+   * risk rather than a formality: "published page" is the obvious thing to put inside the
+   * anchor, and it would name a control with the very word the rule forbids. The label
+   * stays outside; the accessible name is the destination.
+   */
+  it("adds no control named as though this screen published anything", async () => {
+    body = published();
+    await mount();
+
+    const names = controlNames();
+    expect(names).toContain(PAGE_URL);
+    for (const name of names) {
+      expect(name).not.toMatch(/publish|post|schedule|send|share|go live/i);
+    }
+  });
+});
+
 describe("a run with nothing in it yet", () => {
   /**
    * The same rule the review tabs keep: an empty section names the node that fills it. An
@@ -325,15 +449,30 @@ describe("a run with nothing in it yet", () => {
   });
 
   /**
-   * No run has a tracked short link yet, so the pack states the absence. Rendering a
-   * plausible `/l/xxxxxxxx` instead would put a dead URL in somebody's Instagram bio,
-   * where the failure is invisible until the leads do not arrive.
+   * A run that published nothing has no tracked short link, so the pack states the
+   * absence. Rendering a plausible `/l/xxxxxxxx` instead would put a dead URL in somebody's
+   * Instagram bio, where the failure is invisible until the leads do not arrive.
    */
   it("states that there is no tracked short link rather than showing one", async () => {
     await mount();
 
     expect(screen.getByText(NOTES.trackedLink)).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/\/l\/[0-9a-zA-Z]{6,}/);
+  });
+
+  /**
+   * And no page address either — which is the case a SIMULATED publish produces. The
+   * server refuses a `fake://` reference and sends `null`, and a simulated publish looks
+   * successful in every respect except reaching the world, so this is precisely the run
+   * where an invented-looking address would be believed. No placeholder stands in for it:
+   * there is nothing to click, and the note above already says why.
+   */
+  it("shows no published page address when the run published none", async () => {
+    await mount();
+
+    expect(document.body.textContent).not.toMatch(/\/p\/[0-9a-f-]{8,}/);
+    expect(screen.queryByRole("link", { name: /published/i })).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/published page/i);
   });
 });
 
