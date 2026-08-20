@@ -484,6 +484,264 @@ async def test_repack_reports_being_over_the_editorial_target_without_truncating
 
 
 # --------------------------------------------------------------------------- #
+# The four tools docs/AGENT_RUNTIME.md granted and nothing implemented
+# --------------------------------------------------------------------------- #
+
+
+class _Trace:
+    """A retrieval trace, in the shape `_passages` reads."""
+
+    outcome = "sufficient"
+
+    def __init__(self, text: str = "Notdienst rund um die Uhr, 89 EUR Anfahrt.") -> None:
+        self.chunks = [
+            type(
+                "Chunk", (), {"document_id": "doc-1", "ordinal": 0, "text": text, "source": None}
+            )()
+        ]
+
+
+async def test_opportunity_reads_the_businesss_own_documents() -> None:
+    """It held `kb.search` and never called it, so a topic was chosen from the crawl
+    and the SERP alone — which is exactly the evidence a competitor also has."""
+    asked: list[str] = []
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        asked.append(question)
+        return _Trace()
+
+    router = StubRouter({TaskClass.PRIORITISE: {"opportunities": [{"title": "t", "score": 70}]}})
+    await build_nodes(_deps(router, retrieve=retrieve))["OPPORTUNITY"](_state())
+
+    assert asked == ["more local leads"], "the run goal is what a topic is chosen against"
+
+
+async def test_plan_retrieves_against_the_chosen_opportunity_not_the_run_goal() -> None:
+    """The goal is "more local leads"; retrieving against it returns whatever is most
+    on-topic in general. An outline needs the material about the thing being written."""
+    asked: list[str] = []
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        asked.append(question)
+        return _Trace()
+
+    router = StubRouter({TaskClass.PLAN: {"target_keyword": "notdienst koblenz"}})
+    await build_nodes(_deps(router, retrieve=retrieve))["PLAN"](
+        _state(opportunity={"title": "Sanitärnotdienst nachts"})
+    )
+
+    assert asked == ["Sanitärnotdienst nachts"]
+
+
+async def test_generate_retrieves_against_the_target_keyword() -> None:
+    """This is the node where a missing passage becomes an invented sentence, so it is
+    the node where the unwired grant mattered most."""
+    asked: list[str] = []
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        asked.append(question)
+        return _Trace()
+
+    router = StubRouter(
+        {TaskClass.GENERATE: {"title": "t", "meta_description": "m", "html": "<h1>t</h1>"}}
+    )
+    await build_nodes(_deps(router, retrieve=retrieve))["GENERATE"](
+        _state(outline={"target_keyword": "notdienst koblenz", "headings": []})
+    )
+
+    assert asked == ["notdienst koblenz"]
+
+
+async def test_a_retrieval_failure_costs_the_passages_and_not_the_run() -> None:
+    """Grounding is an enhancement to a prompt. Losing it must not cost the run the
+    work every other source produced."""
+
+    async def exploding(question: str, **kwargs: Any) -> Any:
+        raise RuntimeError("pgvector is unreachable")
+
+    router = StubRouter(
+        {TaskClass.GENERATE: {"title": "t", "meta_description": "m", "html": "<h1>t</h1>"}}
+    )
+    updates = await build_nodes(_deps(router, retrieve=exploding))["GENERATE"](
+        _state(outline={"target_keyword": "k", "headings": []})
+    )
+
+    assert updates["draft"]["title"] == "t"
+
+
+async def test_harvest_audits_the_address_the_site_publishes_about_itself() -> None:
+    """`nap.audit` was granted to HARVEST and implemented by nothing, because nothing
+    produced listings. They come from the crawl summary now."""
+
+    async def crawl(url: str) -> dict[str, Any]:
+        return {
+            "pages": [],
+            "nap_sources": [
+                {
+                    "source": "website_jsonld",
+                    "trading_name": "Müller Sanitär GmbH",
+                    "postcode": "56068",
+                    "city": "Koblenz",
+                    "phone": "+49 261 999999",
+                }
+            ],
+        }
+
+    updates = await build_nodes(_deps(crawl_site=crawl))["HARVEST"](_state())
+
+    nap = updates["facts"]["nap"]
+    assert nap["sources"] == ["website_jsonld"]
+    assert isinstance(nap["consistency_score"], int)
+    # The scope travels with the score, because "94" will otherwise be read as "your
+    # address is consistent online" — which is a claim about directories we did not check.
+    assert "does not check external directories" in nap["scope"]
+
+
+async def test_a_site_that_publishes_no_address_is_a_gap_and_not_a_clean_audit() -> None:
+    """An audit of zero listings scores 100, which would tell a business its address is
+    consistent everywhere it is not listed."""
+
+    async def crawl(url: str) -> dict[str, Any]:
+        return {"pages": [], "nap_sources": []}
+
+    updates = await build_nodes(_deps(crawl_site=crawl))["HARVEST"](_state())
+
+    assert "nap" not in updates["facts"]
+    assert any("address consistency" in gap for gap in updates["fact_gaps"])
+
+
+async def test_harvest_carries_ai_visibility_as_evidence_with_its_denominator() -> None:
+    """An opportunity is worth more when the business is ABSENT from the answers people
+    already get, which is why this is evidence and not only a dashboard tile."""
+
+    async def probe(dna: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"headline": "12.5% — mentioned in 1 of 8 answers", "usable_answers": 8}
+
+    updates = await build_nodes(_deps(geo_probe=probe))["HARVEST"](_state())
+
+    assert updates["facts"]["visibility"]["usable_answers"] == 8
+
+
+async def test_an_unconfigured_probe_is_named_as_a_gap() -> None:
+    """The review screen shows this under what the work was written WITHOUT. Silence
+    would let the draft imply a visibility check that never happened."""
+    updates = await build_nodes(_deps())["HARVEST"](_state())
+
+    assert any("AI answer-engine visibility" in gap for gap in updates["fact_gaps"])
+
+
+class SearchingRouter(StubRouter):
+    """Asks for `web_search` once, then records the page.
+
+    The default `StubRouter` answers with `tools[0]`, which is the OUTPUT tool — that
+    ordering is what keeps every other test in this file on the normal path. This one
+    deliberately reaches for the search first.
+    """
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__({TaskClass.GENERATE: payload})
+        self.searched = 0
+
+    async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+        self.calls.append(task)
+        offered = {spec.name for spec in (kw.get("tools") or [])}
+        if "web_search" in offered and self.searched == 0:
+            self.searched += 1
+            return Completion(
+                text=None,
+                tool_calls=[
+                    ToolCall(
+                        name="web_search",
+                        arguments={"query": "notdienst preise koblenz"},
+                        call_id="s1",
+                    )
+                ],
+                usage=_usage(),
+                is_final=False,
+            )
+        return Completion(
+            text=None,
+            tool_calls=[
+                ToolCall(
+                    name="record_page", arguments=self.answers[TaskClass.GENERATE], call_id="c1"
+                )
+            ],
+            usage=_usage(),
+            is_final=False,
+        )
+
+
+async def test_generate_can_search_mid_draft_and_then_write() -> None:
+    """`web_search` was in GENERATE's allowlist with nothing behind it, so the node
+    could never do the thing the design says it can: notice that a fact is missing and
+    check it rather than guessing."""
+    queries: list[str] = []
+
+    async def search(query: str, **kwargs: Any) -> SerpPage:
+        queries.append(query)
+        return _serp_page(query)
+
+    router = SearchingRouter({"title": "t", "meta_description": "m", "html": "<h1>t</h1>"})
+    updates = await build_nodes(_deps(router, web_search=search))["GENERATE"](
+        _state(outline={"target_keyword": "k", "headings": []})
+    )
+
+    assert queries == ["notdienst preise koblenz"]
+    assert updates["draft"]["title"] == "t", "the search must not cost the page"
+
+
+async def test_an_unconfigured_search_is_never_offered_to_the_model() -> None:
+    """docs/AGENT_RUNTIME.md §4: a tool the node will not get is REMOVED rather than
+    refused on call, so the model never plans around a capability it cannot have. An
+    unwired search is exactly that — and handing back an empty result instead would be
+    read as "there is nothing to find", which the model would write around as though
+    the absence were a fact."""
+    router = SearchingRouter({"title": "t", "meta_description": "m", "html": "<h1>t</h1>"})
+    updates = await build_nodes(_deps(router, web_search=None))["GENERATE"](
+        _state(outline={"target_keyword": "k", "headings": []})
+    )
+
+    # The page still gets written, and the model was told the search did not happen.
+    assert updates["draft"]["title"] == "t"
+    assert router.searched == 0, "a tool that is not wired is not offered in the first place"
+
+
+async def test_the_search_loop_is_bounded() -> None:
+    """A model offered a third search after two will take it, and the node needs a
+    page, not a bibliography."""
+    calls = 0
+
+    class AlwaysSearching(StubRouter):
+        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+            nonlocal calls
+            calls += 1
+            offered = {spec.name for spec in (kw.get("tools") or [])}
+            if "web_search" in offered:
+                return Completion(
+                    text=None,
+                    tool_calls=[
+                        ToolCall(
+                            name="web_search", arguments={"query": "more"}, call_id=f"s{calls}"
+                        )
+                    ],
+                    usage=_usage(),
+                    is_final=False,
+                )
+            return Completion(text="prose", tool_calls=[], usage=_usage(), is_final=True)
+
+    async def search(query: str, **kwargs: Any) -> SerpPage:
+        return _serp_page(query)
+
+    with pytest.raises(ValueError, match="did not return a page"):
+        await build_nodes(_deps(AlwaysSearching(), web_search=search))["GENERATE"](
+            _state(outline={"target_keyword": "k", "headings": []})
+        )
+
+    # Two search rounds, then one final ask with the search withdrawn.
+    assert calls == 3
+
+
+# --------------------------------------------------------------------------- #
 # The set is complete and the graph can drive it
 # --------------------------------------------------------------------------- #
 

@@ -20,8 +20,8 @@ No database and no network: a tiny app, an ASGI transport, and a flag.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Any
+from collections.abc import AsyncIterator, Iterable
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -374,17 +374,31 @@ def middleware_classes(app: FastAPI) -> list[object]:
     return classes
 
 
-def test_the_shipped_application_applies_the_default_everywhere() -> None:
-    """No route is exempt today, and the middleware is actually installed.
+def test_the_shipped_application_raises_the_ceiling_for_uploads_and_nothing_else() -> None:
+    """The middleware is installed, and exactly ONE prefix is exempt from the default.
 
-    An override list nobody reads would be the easiest thing in this change to lose
-    in a merge, so the presence of the middleware in the shipped stack is asserted
-    rather than assumed.
+    The document-upload route legitimately receives a file, so 64 KiB would refuse
+    every real service brochure. Raising the default globally instead would be the
+    mistake: the default is what keeps an oversized login body away from argon2, and
+    an override list nobody reads is the easiest thing in this change to lose in a
+    merge — so the shape of the list is asserted rather than assumed.
     """
     app = create_app()
     classes = middleware_classes(app)
 
     assert classes.count(BodySizeLimitMiddleware) == 1
     entry = app.user_middleware[classes.index(BodySizeLimitMiddleware)]
-    assert not entry.kwargs, "the shipped app takes the documented default"
+
+    # `entry.kwargs` is `dict[str, Any]`, and the sequence below is the shape the
+    # middleware's own constructor declares -- named rather than cast at each use.
+    declared = cast("Iterable[BodyLimit]", entry.kwargs["overrides"])
+    overrides = tuple(declared)
+    assert [override.prefix for override in overrides] == ["/api/v1/documents"]
+    assert all(override.max_bytes > DEFAULT_MAX_BODY_BYTES for override in overrides)
+
+    # The default still applies to everything else, and the login field still fits
+    # inside it -- the two numbers this middleware exists to keep apart.
+    middleware = BodySizeLimitMiddleware(app, overrides=overrides)
+    assert middleware.limit_for("/api/v1/auth/login") == DEFAULT_MAX_BODY_BYTES
+    assert middleware.limit_for("/api/v1/documents") > DEFAULT_MAX_BODY_BYTES
     assert auth_api.MAX_PASSWORD_FIELD_CHARS < DEFAULT_MAX_BODY_BYTES

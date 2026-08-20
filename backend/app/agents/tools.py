@@ -227,9 +227,19 @@ class NodeToolbox:
     def available(self, tool: str) -> bool:
         """Granted AND wired up.
 
-        The distinction is deliberate: an allowlisted tool with no implementation
-        is a capability the design permits and the build has not reached, which is
-        a normal state (`kb.search` inside GENERATE today) and not a violation.
+        The distinction is deliberate, and its meaning has narrowed: an allowlisted
+        tool with no implementation used to mean "the build has not reached this yet"
+        (`kb.search` inside GENERATE, `geo.probe` and `nap.audit` in HARVEST,
+        `web_search` in GENERATE -- all four now implemented). What remains is the
+        stronger case: a tool deliberately left unwired because wiring it would be
+        DISHONEST. `serp.search` and `web_search` are wired only when the real provider
+        is configured, because a fake result that reaches a draft cannot be told apart
+        from a real one afterwards; `kb.search` is wired only when the business has
+        indexed something, because a retriever over an empty store answers "nothing
+        relevant" and that reads as a business whose own material had nothing to say.
+
+        So "not available" is now a fact about the DEPLOYMENT or the TENANT, and every
+        caller turns it into a named `fact_gap` rather than silence.
         """
         return self.allows(tool) and self.implementations.get(tool) is not None
 

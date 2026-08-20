@@ -30,7 +30,7 @@ no change here.
 
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Final, get_args
@@ -42,6 +42,7 @@ from backend.app.agents.nodes.prompts import (
     PLAN_TOOL,
     PROMPT_VERSION,
     REPACK_TOOL,
+    WEB_SEARCH_TOOL,
     fence,
     system,
 )
@@ -50,11 +51,14 @@ from backend.app.agents.tools import (
     CHANNEL_VALIDATE,
     CLAIMS_CHECK,
     CRAWL_SITE,
+    GEO_PROBE,
     KB_SEARCH,
     LANDING_CHECK,
     MEMORY_LOAD,
+    NAP_AUDIT,
     SEO_SCORE,
     SERP_SEARCH,
+    WEB_SEARCH,
     NodeToolbox,
     ToolImpl,
     ToolNotAllowedError,
@@ -75,6 +79,13 @@ from backend.app.engines.landing import (
     LandingPageSpec,
     ProofPoint,
     check_landing_page,
+)
+from backend.app.engines.nap import (
+    CanonicalNap,
+    DirectoryListing,
+    RawNap,
+    audit_nap,
+    normalise_nap,
 )
 from backend.app.engines.seo import SeoScoreRequest, score_page
 from backend.app.engines.serp import (
@@ -146,6 +157,15 @@ class NodeDeps:
     #: per node would let a mid-run edit change the brief halfway through, and produce a
     #: page written to two different sets of rules.
     load_memory: Callable[[], Awaitable[list[str]]] | None = None
+    #: AI-visibility probe over a fixed prompt set. None = no probe store or router
+    #: configured for this run; HARVEST then records the gap rather than reporting a
+    #: share of voice nobody measured.
+    geo_probe: Callable[..., Awaitable[Any]] | None = None
+    #: A live web search GENERATE may ask for mid-draft, to check a fact it is about
+    #: to write. Wired only when the SERP provider is real, for the same reason
+    #: `serp_search` is: a fake result that reads as research is worse than no
+    #: research, because it cannot be told apart from the real thing afterwards.
+    web_search: Callable[..., Awaitable[Any]] | None = None
     channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
     #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
     #:
@@ -183,6 +203,14 @@ def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
         # while being corrected in the eval harness. Deterministic, so always
         # available for the same reason the two guards above are.
         CHANNEL_VALIDATE: enforce_hashtags,
+        # Deterministic, so always available -- and now it has a SOURCE. The audit
+        # shipped in Phase 4 and HARVEST held the grant with nothing behind it,
+        # because nothing produced listings to diff. `engines/nap/extract` reads the
+        # business's own `LocalBusiness` JSON-LD and its Impressum, which is a
+        # narrower claim than a directory audit and one we can actually support.
+        NAP_AUDIT: _audit_own_nap,
+        GEO_PROBE: deps.geo_probe,
+        WEB_SEARCH: deps.web_search,
     }
     return {name: impl for name, impl in candidates.items() if impl is not None}
 
@@ -248,42 +276,162 @@ async def _ask(
     body: str,
     tool: ToolSpec,
     box: NodeToolbox,
+    extra_tools: Sequence[ToolSpec] = (),
+    max_tool_rounds: int = 2,
 ) -> tuple[dict[str, Any] | None, Decimal]:
-    """One model call: assemble, call, return the structured arguments and the cost.
+    """One model exchange: assemble, call, and return the structured arguments and cost.
 
     The tool list handed to the model is filtered through the node's allowlist
     (docs/AGENT_RUNTIME.md section 4: a tool the node cannot have is REMOVED, not
     refused on call, so the model never plans around a capability it will not get).
     A node whose own output tool is not in its allowlist is a wiring bug, and it
     raises rather than silently calling the model with no tools at all.
+
+    ``extra_tools`` turns this into a bounded LOOP rather than a single exchange. It
+    exists for GENERATE's `web_search`: a model part-way through a draft can notice
+    that a fact is missing and ask for it, which is the difference between research
+    and a plausible guess. Four rules keep the loop from being an open-ended agent:
+
+    * **the output tool is offered FIRST**, and that is load-bearing rather than
+      tidy — the deterministic `FakeProvider` answers with `tools[0]`, so putting the
+      record tool first is what keeps every hermetic test in this repo exercising the
+      normal path instead of the search path;
+    * **the loop is capped** at ``max_tool_rounds`` requests, after which the extra
+      tools are withdrawn and the model is asked for its answer with what it has;
+    * **an unwired or refused tool is answered honestly**, with a message saying the
+      search did not run, so the model does not silently treat an empty result as
+      "there is nothing to find";
+    * **every result is fenced as untrusted**, because a search result is text from a
+      page the business does not control — the same envelope harvested facts get.
     """
-    offered = box.offer([tool])
-    if not offered:
+    # Extra tools are offered only when they are granted AND WIRED. `box.offer`
+    # filters on the allowlist alone, which is right for an output tool -- a node
+    # missing its own is a wiring bug worth raising over -- but wrong for a capability
+    # the deployment simply does not have: docs/AGENT_RUNTIME.md §4's rule is that a
+    # tool the node will not get is REMOVED, so the model never plans around it. The
+    # "this search did not run" answer in `_tool_result` stays as the backstop for a
+    # revocation that lands between the offer and the call.
+    offered = box.offer([tool, *(spec for spec in extra_tools if box.available(spec.name))])
+    if not any(spec.name == tool.name for spec in offered):
         raise ToolNotAllowedError(box.node, tool.name, box.allowed)
 
-    messages = [
+    messages: list[Message] = [
         system(role, state["dna"], state["remembered"]),
         Message(role=Role.USER, content=body),
     ]
-    completion = await deps.router.complete(
-        task,
-        messages,
-        tools=offered,
-        # Current Claude models reject `temperature` outright, and every node here
-        # wants the provider default anyway.
-        temperature=None,
-        # Nothing passed this before, so EVERY llm span was recorded with an empty
-        # run_id, business_id and node -- `llm_span_fields` defaults them to "" and the
-        # no-op tracer meant nobody saw it. It is also what a `model_usage` row needs to
-        # be attributable to anything, so the ledger could not have been written
-        # correctly even once a writer existed.
-        trace={
-            "business_id": str(state.get("business_id") or ""),
-            "node": box.node,
-            "prompt_version": PROMPT_VERSION,
-        },
-    )
-    return _tool_arguments(completion, tool.name, box), Decimal(str(completion.usage.usd))
+    trace = {
+        "business_id": str(state.get("business_id") or ""),
+        "node": box.node,
+        "prompt_version": PROMPT_VERSION,
+    }
+    spent = Decimal("0")
+
+    for round_index in range(max_tool_rounds + 1):
+        # The last round withdraws everything except the output tool: a model that has
+        # already searched twice and is offered a third search will take it, and the
+        # node needs a page, not a bibliography.
+        tools = offered if round_index < max_tool_rounds else [tool]
+
+        completion = await deps.router.complete(
+            task,
+            messages,
+            tools=tools,
+            # Current Claude models reject `temperature` outright, and every node here
+            # wants the provider default anyway.
+            temperature=None,
+            # Nothing passed this before, so EVERY llm span was recorded with an empty
+            # run_id, business_id and node -- `llm_span_fields` defaults them to "" and
+            # the no-op tracer meant nobody saw it. It is also what a `model_usage` row
+            # needs to be attributable to anything, so the ledger could not have been
+            # written correctly even once a writer existed.
+            trace=trace,
+        )
+        spent += Decimal(str(completion.usage.usd))
+
+        args = _tool_arguments(completion, tool.name, box)
+        if args is not None:
+            return args, spent
+
+        requests = _requested(completion, {spec.name for spec in tools} - {tool.name}, box)
+        if not requests:
+            # Prose, or a tool nobody granted. Either way there is nothing more this
+            # exchange can produce, and each caller has its own correct response to
+            # `None` -- OPPORTUNITY treats it as "nothing found", PLAN as a failure.
+            return None, spent
+
+        # An empty assistant turn carrying only the tool calls, which is what both
+        # adapters expect to see replayed before the results.
+        messages.append(Message(role=Role.ASSISTANT, content="", tool_calls=list(requests)))
+        for call in requests:
+            messages.append(
+                Message(
+                    role=Role.TOOL,
+                    content=await _tool_result(deps, box, call),
+                    tool_call_id=call.call_id,
+                )
+            )
+
+    return None, spent
+
+
+def _requested(completion: Any, names: set[str], box: NodeToolbox) -> list[ToolCall]:
+    """The model's calls for tools OTHER than the output tool, allowlist-filtered.
+
+    Filtered through :meth:`NodeToolbox.accept`, which is the backstop against an
+    induced call: crawled page text can ask the model to reach for something, and the
+    node drops what it does not hold and records the refusal rather than executing it.
+    """
+    return [
+        call
+        for call in completion.tool_calls
+        if isinstance(call, ToolCall) and call.name in names and box.accept(call.name)
+    ]
+
+
+async def _tool_result(deps: NodeDeps, box: NodeToolbox, call: ToolCall) -> str:
+    """Run one model-requested tool and render its result as an untrusted payload.
+
+    Never raises. A search that fails, is unwired, or is refused comes back as a
+    SENTENCE saying so — because the alternative is handing the model an empty result,
+    which it will read as "there is nothing to find" and write around as though the
+    absence were a fact.
+    """
+    if call.name != WEB_SEARCH:
+        return f"{call.name} is not available in this step."
+
+    query = str(call.arguments.get("query", "")).strip()
+    if not query:
+        return "No query was given, so no search ran."
+    if not box.available(WEB_SEARCH):
+        return (
+            "Live web search is not configured on this deployment, so this search did "
+            "NOT run. Do not treat that as evidence either way — write only what the "
+            "supplied evidence supports, and leave the rest out."
+        )
+
+    try:
+        page = await box.call(WEB_SEARCH, query)
+    except ToolNotAllowedError:
+        raise
+    except Exception as exc:  # broad on purpose: a dead search must not end the run
+        logger.warning("%s: web search failed: %s", box.node, exc)
+        return (
+            f"The search for {query!r} failed and returned nothing. Do not treat that "
+            "as evidence either way."
+        )
+
+    results = getattr(page, "results", None) or []
+    if not results:
+        return f"The search for {query!r} returned no results."
+
+    lines = [
+        f"- {getattr(result, 'title', '') or 'untitled'} ({getattr(result, 'url', '')}): "
+        f"{(getattr(result, 'snippet', '') or '')[:300]}"
+        for result in results[:5]
+    ]
+    # Fenced, like every other thing a third party wrote. A search result is a page
+    # the business does not control, so it is quoted evidence and never instruction.
+    return f"Search results for {query!r}:\n" + fence("\n".join(lines))
 
 
 def _evidence(state: AgentState) -> str:
@@ -393,6 +541,40 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             except Exception as exc:  # broad on purpose, per-source degradation
                 logger.warning("harvest: retrieval failed: %s", exc)
                 gaps.append("uploaded documents")
+        else:
+            gaps.append("uploaded documents")
+
+        # The NAP audit needs no provider and no model: it diffs the business's own
+        # published address against itself. Its listings come from the crawl that just
+        # ran, so it is skipped -- and NAMED as skipped -- when the crawl produced
+        # nothing, rather than reporting a clean audit of zero listings.
+        if box.available(NAP_AUDIT) and facts.get("site"):
+            try:
+                audit = await box.call(NAP_AUDIT, dna, facts["site"])
+            except ToolNotAllowedError:
+                raise
+            except Exception as exc:  # broad on purpose, per-source degradation
+                logger.warning("harvest: nap audit failed: %s", exc)
+                gaps.append("address consistency")
+            else:
+                if audit is None:
+                    # Nothing published a NAP we could read. Not a finding, and not a
+                    # pass either: an audit of no listings would score 100 and tell a
+                    # business its address is consistent everywhere it is not listed.
+                    gaps.append("address consistency (no address published on the site)")
+                else:
+                    facts["nap"] = audit
+
+        if box.available(GEO_PROBE):
+            try:
+                facts["visibility"] = await box.call(GEO_PROBE, dna)
+            except ToolNotAllowedError:
+                raise
+            except Exception as exc:  # broad on purpose, per-source degradation
+                logger.warning("harvest: visibility probe failed: %s", exc)
+                gaps.append("AI answer-engine visibility")
+        else:
+            gaps.append("AI answer-engine visibility (no probe configured)")
 
         return _with_refusals(
             state, box, {"facts": facts, "fact_gaps": [*state["fact_gaps"], *gaps]}
@@ -405,6 +587,13 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         it. Inventing a topic to fill the slot is the failure mode here.
         """
         box = _toolbox("OPPORTUNITY", deps)
+        # The business's own material, against the run's goal. `docs/AGENT_RUNTIME.md`
+        # granted this node `kb.search` and nothing called it, so the ranking was made
+        # from the crawl and the SERP alone -- which is exactly the evidence a
+        # competitor also has. What a business can uniquely write about is in its own
+        # documents, so a topic chosen without reading them is a topic anyone could
+        # have chosen.
+        passages = await _retrieved(box, state["goal"], "opportunity")
         args, cost = await _ask(
             deps,
             box=box,
@@ -416,7 +605,8 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             ),
             state=state,
             body=(
-                f"Goal: {state['goal']}\n\nEvidence:\n{_evidence(state)}\n\n"
+                f"Goal: {state['goal']}\n\nEvidence:\n{_evidence(state)}\n"
+                f"{passages}\n"
                 "Call record_opportunities. Score each 0-100 on likely lead impact "
                 "against effort."
             ),
@@ -437,6 +627,12 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         """Outline the page. A target keyword is mandatory."""
         box = _toolbox("PLAN", deps)
         opp = state.get("opportunity") or {}
+        # Retrieved against the CHOSEN opportunity, not the run goal: the goal is "more
+        # local leads" and retrieving against it returns whatever is most on-topic for
+        # the business in general. An outline needs the material about the thing being
+        # written, which is what makes a section heading answerable from evidence.
+        question = str(opp.get("title") or "").strip() or state["goal"]
+        passages = await _retrieved(box, question, "plan")
         args, cost = await _ask(
             deps,
             box=box,
@@ -448,7 +644,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             state=state,
             body=(
                 f"Opportunity: {json.dumps(opp, ensure_ascii=False, default=str)}\n\n"
-                f"Evidence:\n{_evidence(state)}\n\nCall record_outline."
+                f"Evidence:\n{_evidence(state)}\n{passages}\nCall record_outline."
             ),
             tool=PLAN_TOOL,
         )
@@ -488,6 +684,12 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         if claims and not claims.get("passed", True) and claims.get("fix_hint"):
             retry += "\n\n" + str(claims["fix_hint"])
 
+        # The business's own material, against the keyword the page is being written
+        # for. This is the node where a missing passage becomes an invented sentence,
+        # so it is the node where the grant mattered most and had nothing behind it.
+        keyword = str(outline.get("target_keyword") or "").strip() or state["goal"]
+        passages = await _retrieved(box, keyword, "generate")
+
         args, cost = await _ask(
             deps,
             box=box,
@@ -500,9 +702,12 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             state=state,
             body=(
                 f"Outline: {json.dumps(outline, ensure_ascii=False, default=str)}\n\n"
-                f"Evidence:\n{_evidence(state)}{retry}\n\nCall record_page."
+                f"Evidence:\n{_evidence(state)}\n{passages}{retry}\n\n"
+                "Call record_page. If a fact you need is genuinely missing, you may "
+                "call web_search ONCE for it rather than guessing."
             ),
             tool=GENERATE_TOOL,
+            extra_tools=(WEB_SEARCH_TOOL,),
         )
         if not args:
             raise ValueError("the model did not return a page; expected a record_page tool call")
@@ -859,6 +1064,98 @@ def _clean_tags(declared: Any) -> list[str]:
         seen.add(tag.lower())
         out.append(tag)
     return out
+
+
+async def _retrieved(box: NodeToolbox, question: str, node: str) -> str:
+    """Passages from the business's own documents, fenced and labelled — or nothing.
+
+    The same shape CONVERT has used since it shipped, lifted out so OPPORTUNITY, PLAN
+    and GENERATE can use it too. Those three held `kb.search` in their allowlist and
+    never called it, which is the difference between a documented capability and a
+    working one.
+
+    A missing knowledge base is a NORMAL state and returns an empty string: the caller
+    then writes from the DNA and the harvested facts, which is what a business with no
+    uploaded documents legitimately has. A retrieval that raises is logged and also
+    returns empty — grounding is an enhancement to a prompt, and losing it must not
+    cost the run the work every other source produced. An allowlist refusal is
+    re-raised, because that is a wiring fault or an attack and must be loud.
+    """
+    if not box.available(KB_SEARCH):
+        return ""
+    try:
+        trace = await box.call(KB_SEARCH, question)
+    except ToolNotAllowedError:
+        raise
+    except Exception as exc:  # broad on purpose: grounding is an enhancement
+        logger.warning("%s: retrieval failed: %s", node, exc)
+        return ""
+    return _passages(trace)
+
+
+def _audit_own_nap(dna: Mapping[str, Any], site: Any) -> dict[str, Any] | None:
+    """Diff the business's own published NAP against the profile it confirmed.
+
+    The `nap.audit` implementation, and the reason HARVEST's grant is no longer empty.
+    Returns ``None`` when the site published no readable address, because an audit of
+    zero listings scores 100 -- which would tell a business its address is consistent
+    everywhere it is not listed.
+
+    The canonical record comes from the Business DNA the owner confirmed at
+    onboarding, which is the right authority: it is the one version of the address a
+    human has looked at and approved. Everything else -- the JSON-LD, the Impressum --
+    is a copy that may have drifted from it.
+    """
+    raw = site.get("nap_sources") if isinstance(site, Mapping) else None
+    if not isinstance(raw, list) or not raw:
+        return None
+    # Extracted by `run_executor.summarise_crawl`, which is the last place the full
+    # page facts exist: the summary carried in state drops the JSON-LD blocks and keeps
+    # only an excerpt of each body, so extracting here would find nothing. The node
+    # only ever DIFFS -- which is the engine boundary working as intended.
+    listings = [DirectoryListing.model_validate(entry) for entry in raw]
+
+    canonical = _canonical_nap(dna)
+    result = audit_nap(canonical, listings)
+    return {
+        "consistency_score": result.consistency_score,
+        "sources_checked": result.sources_checked,
+        "sources": sorted({listing.source for listing in listings}),
+        "findings": [finding.model_dump(mode="json") for finding in result.findings],
+        # Stated in the payload, not only in a docstring, because this number will be
+        # read as "your address is consistent online" if nothing says otherwise.
+        "scope": (
+            "Compares the address published on your own website (structured data and "
+            "Impressum) against your confirmed profile. It does not check external "
+            "directories."
+        ),
+    }
+
+
+def _canonical_nap(dna: Mapping[str, Any]) -> CanonicalNap:
+    """The confirmed profile as the one true NAP record.
+
+    `normalise_nap` produces both the display and the comparison forms, so the audit
+    can be brutal about equivalence while the advice stays correct German -- which is
+    the distinction the `nap` engine's contract exists to preserve.
+    """
+    return normalise_nap(
+        RawNap(
+            legal_name=_optional_str(dna.get("legal_name")) or _optional_str(dna.get("name")),
+            trading_name=_optional_str(dna.get("name")),
+            street=_optional_str(dna.get("street")),
+            house_number=_optional_str(dna.get("house_number")),
+            postcode=_optional_str(dna.get("postcode")),
+            city=_optional_str(dna.get("city")),
+            phone=_optional_str(dna.get("phone")),
+            email=_optional_str(dna.get("email")),
+        )
+    )
+
+
+def _optional_str(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
 
 
 def _cta_channels(channels: tuple[str, ...]) -> tuple[str, ...]:

@@ -155,6 +155,37 @@ PLAN_TOOL = ToolSpec(
     },
 )
 
+#: The one tool in this file the model calls to ASK for something rather than to
+#: record an answer.
+#:
+#: GENERATE has held `web_search` in its allowlist since the allowlist was written,
+#: with nothing behind it, so the node could never do the thing the design says it can:
+#: notice mid-draft that a fact it needs is missing and go and check rather than
+#: guessing. The schema is deliberately minimal -- a query and nothing else -- because
+#: every extra knob is a way for injected page text to steer a live search.
+WEB_SEARCH_TOOL = ToolSpec(
+    name="web_search",
+    description=(
+        "Search the web for ONE fact you need and do not have. Use it only when the "
+        "supplied evidence genuinely does not contain the fact; never to research the "
+        "topic in general, and never for anything the business's own documents would "
+        "answer."
+    ),
+    parameters={
+        "type": "object",
+        "required": ["query"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to look up, as a short search query.",
+                "maxLength": 200,
+            }
+        },
+    },
+)
+
+
 GENERATE_TOOL = ToolSpec(
     name="record_page",
     description=(

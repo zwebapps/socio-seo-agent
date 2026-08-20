@@ -37,6 +37,11 @@ dependencies = [
     # Password hashing. Argon2id, not bcrypt: it is the current OWASP first
     # choice and resists GPU cracking far better.
     "argon2-cffi>=25.1.0",
+    # Multipart parsing, which FastAPI needs to accept an uploaded file at all.
+    # Added with the document-upload route: the knowledge base had extractors, a
+    # vector store and an agentic retrieval loop, and no way for a customer to put a
+    # document into any of it.
+    "python-multipart>=0.0.32",
 ]
 
 # Still phase-gated, added when the phase that needs them lands:

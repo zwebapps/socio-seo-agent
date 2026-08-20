@@ -237,9 +237,15 @@ async def test_a_refusal_of_our_own_code_is_still_recorded_before_it_raises() ->
 
 
 def test_available_distinguishes_ungranted_from_unwired() -> None:
-    """Two different states that must not be conflated. `kb.search` is granted to
-    GENERATE and not implemented there yet, which is a build state; `publish` is not
-    granted at all, which is a design decision."""
+    """Two different states that must not be conflated: NOT GRANTED is a design
+    decision, NOT WIRED is a deployment fact.
+
+    The example changed when the last unwired grant was implemented. `serp.search` is
+    the honest one now: it is granted to HARVEST and deliberately left unwired unless
+    the real provider is configured, because a FAKE search result that reaches a draft
+    cannot be told apart from a real one afterwards. `publish` is not granted anywhere
+    but EXPORT, whatever is installed.
+    """
     box = NodeToolbox(node="HARVEST", implementations={CRAWL_SITE: lambda url: None})
 
     assert box.allows(CRAWL_SITE) and box.available(CRAWL_SITE)
@@ -326,6 +332,38 @@ def test_the_conversion_node_cannot_reach_the_open_web() -> None:
     assert "web_search" not in tools
     assert tools & ACTUATOR_TOOLS == frozenset()
     assert "kb.search" in tools, "proof has to come from the business's own material"
+
+
+async def test_an_induced_search_from_a_node_that_lacks_it_is_dropped_not_executed() -> None:
+    """GENERATE can now really search, which makes this the case that matters: a
+    crawled page can talk a model into asking for a live search from a node that does
+    not hold one, and the answer must be a recorded refusal rather than a request.
+
+    Asserted on CONVERT specifically because it is the node whose output carries a
+    form, and because a search there would be a second untrusted-text intake feeding a
+    page the business will publish.
+    """
+    ran: list[str] = []
+
+    async def search(query: str) -> str:
+        ran.append(query)
+        return "should never happen"
+
+    box = NodeToolbox(node="CONVERT", implementations={"web_search": search})
+
+    assert box.accept("web_search") is False
+    assert not ran, "the implementation must not be reached at all"
+    assert any(refusal.tool == "web_search" for refusal in box.refusals)
+    assert any(error.code == "tool_not_allowed" for error in box.node_errors())
+
+
+def test_the_node_that_may_search_is_the_one_that_writes_the_article() -> None:
+    """`web_search` is granted to GENERATE alone among the writing nodes, and it is now
+    implemented rather than only documented. The grant is narrow on purpose: GENERATE is
+    where a missing fact becomes an invented sentence, so it is the one node where
+    checking beats guessing."""
+    assert "web_search" in NODE_TOOLS["GENERATE"]
+    assert [node for node, tools in NODE_TOOLS.items() if "web_search" in tools] == ["GENERATE"]
 
 
 def test_the_landing_audit_belongs_to_the_node_with_no_model_in_it() -> None:

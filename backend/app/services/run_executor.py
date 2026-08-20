@@ -50,6 +50,7 @@ from backend.app.agents.nodes import NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
 from backend.app.agents.state_graph import run_state_graph
 from backend.app.core.config import get_settings
+from backend.app.engines.nap import extract_nap_listings
 from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
 from backend.app.services.usage_recorder import UsageRecorder
@@ -155,6 +156,13 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
         "pages_summarised": len(summarised),
         "truncated": bool(getattr(result, "truncated", False)),
         "error_count": len(list(getattr(result, "errors", []) or [])),
+        # The NAP the site publishes about itself, extracted HERE because this is the
+        # last point at which the full page facts exist. The summary deliberately
+        # drops `jsonld_blocks` and keeps only an excerpt of the body, so an extractor
+        # running later would find nothing -- and widening the summary to carry every
+        # JSON-LD block would put them in the checkpoint, which is rewritten on every
+        # node. A handful of listings is small; the blocks are not.
+        "nap_sources": [listing.model_dump(mode="json") for listing in extract_nap_listings(pages)],
     } | {"pages": summarised}
 
 
@@ -222,13 +230,160 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         crawl_site=crawl_site,
         serp_search=serp_search,
         revoked_tools=await _load_revocations(),
-        # Retrieval and memory need a database session per call, and wiring them is
-        # the next step rather than this one -- see the module docstring in
-        # `kb_service.retrieve` for the embedder/store it also needs. Left None so
-        # HARVEST records the gap instead of pretending it looked.
-        retrieve=None,
-        load_memory=None,
+        retrieve=await _build_retrieve(business_id, router),
+        load_memory=_build_load_memory(business_id),
+        geo_probe=_build_geo_probe(business_id, router),
+        # Same rule as `serp_search` and for the same reason: a FAKE search result
+        # reaching a draft is worse than no search at all, because afterwards nothing
+        # can tell it apart from a real one. GENERATE then reports that the search did
+        # not run rather than treating an empty answer as a finding.
+        web_search=serp_search,
     )
+
+
+def _build_geo_probe(business_id: UUID, router: ModelRouter) -> Callable[..., Awaitable[Any]]:
+    """AI answer-engine visibility, as a compact fact HARVEST can carry.
+
+    `geo.probe` has been in HARVEST's allowlist since the allowlist was written and
+    was implemented by nothing, so share of voice was measurable only from the
+    standalone probe screen and never as evidence a run could reason about -- which is
+    the point of measuring it: an opportunity is worth more when the business is
+    ABSENT from the answers people already get.
+
+    Returns a SUMMARY, never the raw answers. The checkpoint is rewritten on every
+    node, so anything in state is paid for repeatedly, and a probe's answers are
+    paragraphs of model prose.
+
+    `using_fake_provider` and the caveats travel with the number, because a share of
+    voice measured against a deterministic fake is not a measurement and a screen that
+    shows the figure without the caveat presents it as one. `no_answer` stays out of
+    the denominator inside the service: a model outage recorded as brand absence is
+    the difference between a measurement and a fabrication.
+    """
+
+    async def geo_probe(dna: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        from backend.app.db.adapters.probe_store import PostgresProbeStore
+        from backend.app.engines.geo import BrandIdentity, build_prompt_set
+        from backend.app.services.geo_service import probe_visibility
+
+        name = str(dna.get("name") or "").strip()
+        city = str(dna.get("city") or "").strip()
+        if not name or not city:
+            # `build_prompt_set` refuses a blank brand or city, and it is right to: a
+            # prompt set built around an empty string still runs, still costs money
+            # and measures nothing. Raising here lets HARVEST name the gap.
+            raise ValueError(
+                "an AI-visibility probe needs a business name and a city; this "
+                "business profile has " + ("no name" if not name else "no city")
+            )
+
+        prompts = build_prompt_set(
+            business_name=name,
+            city=city,
+            services=[str(service) for service in (dna.get("services") or [])],
+            locale=str(dna.get("locale") or "de"),
+        )
+        report = await probe_visibility(
+            business_id=business_id,
+            brand=BrandIdentity(
+                name=name,
+                aliases=[str(alias) for alias in (dna.get("aliases") or [])],
+                domains=[str(dna["website"])] if dna.get("website") else [],
+            ),
+            prompts=prompts,
+            store=PostgresProbeStore(),
+            router=router,
+        )
+        sov = report.share_of_voice
+        return {
+            # `headline` rather than a bare percentage, and that is the engine's own
+            # rule enforced at the call site: it is a rendering that physically cannot
+            # print a share without its denominator, so a model reading this evidence
+            # cannot write "22% of AI answers" off the back of nine usable samples.
+            "headline": sov.headline,
+            "mention_share_pct": sov.mention_share_pct,
+            "unprompted_mention_share_pct": sov.unprompted_mention_share_pct,
+            "usable_answers": sov.usable_answers,
+            "no_answer_count": sov.no_answer_count,
+            "probes_planned": report.probes_planned,
+            "probes_run": report.probes_run,
+            "models": report.models,
+            "using_fake_provider": report.using_fake_provider,
+            "caveats": list(report.caveats),
+        }
+
+    return geo_probe
+
+
+def _build_load_memory(business_id: UUID) -> Callable[[], Awaitable[list[str]]]:
+    """Business memory, as the prompt lines INTAKE carries for the whole run.
+
+    Wired unconditionally, unlike retrieval and search. There is no honesty problem to
+    manage here: this is our own data, not a provider that might be faked, so an empty
+    result means "this business has remembered nothing yet" and nothing else. INTAKE
+    already degrades to a `fact_gap` if the read fails.
+
+    Until this existed, `state["remembered"]` was threaded correctly into the system
+    prompt and nothing ever populated it in a real run: the `/memory` screen wrote
+    preferences that no model ever saw, which made "the agent updates persistent
+    business preferences from explicit feedback" true of the test suite only.
+    """
+
+    async def load_memory() -> list[str]:
+        from backend.app.db.session import business_session
+        from backend.app.services.memory_service import load_memory as read_memory
+        from backend.app.services.memory_service import to_prompt_lines
+
+        async with business_session(business_id) as session:
+            memory = await read_memory(business_id, session=session)
+        return to_prompt_lines(memory)
+
+    return load_memory
+
+
+async def _build_retrieve(
+    business_id: UUID, router: ModelRouter
+) -> Callable[..., Awaitable[Any]] | None:
+    """Agentic retrieval over this business's own documents -- or None if it has none.
+
+    **Wired only when there is something to retrieve**, which is the same rule this
+    function applies to the search provider one screen up, and for the same reason. A
+    retriever over an empty store answers "nothing relevant", and that reads as a
+    business whose own material had nothing to say about the topic. `None` instead
+    makes HARVEST record "uploaded documents" in `fact_gaps`, which the review screen
+    shows the customer under what the work was written WITHOUT. One is a measurement;
+    the other is a fabrication with a friendly face.
+
+    The count is one indexed-chunk query per run, which is cheap next to a run.
+    """
+    from backend.app.db.adapters.chunk_store import PgVectorChunkStore
+    from backend.app.db.adapters.document_store import PostgresDocumentStore
+    from backend.app.llm.embedder import RouterEmbedder
+    from backend.app.services.kb_service import retrieve as retrieve_chunks
+
+    try:
+        indexed = await PostgresDocumentStore(business_id).chunk_count()
+    except Exception:
+        logger.exception("could not count indexed chunks; leaving retrieval unwired")
+        return None
+
+    if not indexed:
+        return None
+
+    embedder = RouterEmbedder(router=router)
+    store = PgVectorChunkStore()
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        return await retrieve_chunks(
+            question,
+            business_id=business_id,
+            router=router,
+            embedder=embedder,
+            store=store,
+            **kwargs,
+        )
+
+    return retrieve
 
 
 class RunExecutor:
@@ -395,9 +550,21 @@ class RunExecutor:
                     "serp.search": deps.serp_search is not None,
                     "kb.search": deps.retrieve is not None,
                     "memory.load": deps.load_memory is not None,
+                    "geo.probe": deps.geo_probe is not None,
+                    "web_search": deps.web_search is not None,
                 }.items()
                 if is_wired
             )
+            summary = "tools wired: " + (", ".join(wired) or "none")
+            if deps.retrieve is not None:
+                # Retrieval with hash-arithmetic vectors is not retrieval, and a
+                # timeline that does not say so presents it as though it were. Same
+                # rule as the search provider: name the fake rather than hide it.
+                from backend.app.llm.embedder import RouterEmbedder
+
+                if RouterEmbedder(router=deps.router).using_fake:
+                    summary += " (embeddings: FAKE provider — vectors are arithmetic "
+                    summary += "over a hash, so retrieval quality is not meaningful)"
             await service.record_event(
                 run_id,
                 # Its own label, not a node name. This line is the executor's, not
@@ -410,7 +577,7 @@ class RunExecutor:
                 # silently. A first version of this passed `tools_wired` and recorded an
                 # event with an empty payload, which is worse than not recording one:
                 # it looks like the information was captured.
-                payload={"summary": "tools wired: " + (", ".join(wired) or "none")},
+                payload={"summary": summary},
             )
         except Exception:
             logger.exception("run %s: could not record provider status", run_id)

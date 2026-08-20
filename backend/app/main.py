@@ -19,6 +19,7 @@ from backend.app.api import (
     admin_models,
     auth,
     cost,
+    documents,
     feedback,
     health,
     leads,
@@ -27,7 +28,7 @@ from backend.app.api import (
     pages,
     runs,
 )
-from backend.app.core.body_limit import BodySizeLimitMiddleware
+from backend.app.core.body_limit import BodyLimit, BodySizeLimitMiddleware
 from backend.app.core.config import DEFAULT_SESSION_SECRET, Settings, get_settings
 from backend.app.core.cookies import session_cookie_name
 from backend.app.core.csrf import OriginCsrfMiddleware
@@ -129,6 +130,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(admin_models.router)
     app.include_router(cost.router)
+    app.include_router(documents.router)
     app.include_router(onboarding.router)
     app.include_router(runs.router)
     app.include_router(feedback.router)
@@ -161,7 +163,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     #
     # Both outside the routes, which is the whole point: an oversized login body must
     # not reach argon2, and a forged write must not reach a database session.
-    app.add_middleware(BodySizeLimitMiddleware)
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        # One override, and it is the only route in the product that legitimately
+        # receives a file. The default ceiling is 64 KiB -- enough for every JSON body
+        # here and far too small for a service brochure -- so the limit is raised for
+        # this prefix ALONE rather than globally: an oversized login body must still
+        # not reach argon2, which is what the default is protecting.
+        #
+        # 25 MiB is a generous price list and a mean-spirited photo album. The file is
+        # read into memory to be extracted, so this number is also a bound on what one
+        # request can make this process allocate.
+        overrides=(BodyLimit("/api/v1/documents", 25 * 1024 * 1024),),
+    )
     app.add_middleware(
         OriginCsrfMiddleware,
         allowed_origins=settings.cors_origins,

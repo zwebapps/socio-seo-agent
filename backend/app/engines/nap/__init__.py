@@ -12,8 +12,12 @@ Two functions, both pure:
     canonical = normalise_nap(raw)                  # one true record + comparison forms
     result    = audit_nap(canonical, listings)      # findings + a 0-100 score
 
-Deterministic, no I/O, no network, no LLM. Listing data is fetched by the crawl
-layer and passed in; this engine only computes. The LLM's job elsewhere is to
+Deterministic, no I/O, no network, no LLM. Listing data comes from `extract.py`,
+which reads the business's own crawled pages -- its `LocalBusiness` JSON-LD and its
+Impressum -- because those are the two places a German business publishes its NAP and
+they routinely disagree with each other. Directory scraping is deliberately NOT in
+scope (see that module's docstring), so this is a self-consistency audit and the copy
+says so rather than implying we checked Gelbe Seiten. The LLM's job elsewhere is to
 explain what an inconsistency costs -- never to find one.
 
 The normaliser is the load-bearing part. A false "inconsistency" from a naive
@@ -36,6 +40,7 @@ from .contract import (
     RawNap,
     Severity,
 )
+from .extract import IMPRESSUM_SOURCE, JSONLD_SOURCE, extract_nap_listings
 from .normalise import (
     comparison_form,
     fold_for_comparison,
@@ -54,6 +59,8 @@ from .normalise import (
 )
 
 __all__ = [
+    "IMPRESSUM_SOURCE",
+    "JSONLD_SOURCE",
     "CanonicalNap",
     "DirectoryListing",
     "NapAuditResult",
@@ -66,6 +73,7 @@ __all__ = [
     "audit_nap",
     "comparison_form",
     "consistency_score",
+    "extract_nap_listings",
     "fold_for_comparison",
     "normalise_business_name",
     "normalise_city",
