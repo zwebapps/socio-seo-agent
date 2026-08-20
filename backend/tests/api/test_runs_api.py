@@ -592,4 +592,58 @@ async def test_an_owner_with_no_runs_gets_an_empty_list_not_an_error() -> None:
         response = await client.get("/api/v1/runs")
 
     assert response.status_code == 200
-    assert response.json() == {"runs": []}
+    assert response.json() == {"runs": [], "nextCursor": None}
+
+
+# --------------------------------------------------------------------------- #
+# Pagination: it used to be a cap, so older runs were unreachable
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_cursor_walks_the_whole_history_without_repeating_or_skipping() -> None:
+    """It was a cap, not pagination: a business past the ceiling could not reach its
+    older runs at all. Walked in pages of two here, because an off-by-one in a cursor
+    shows up as a duplicated or a missing row, and both are invisible on one page."""
+    store = InMemoryRunStore()
+    service = RunService(store)
+    created = [await service.start(business_id=BUSINESS, goal=f"goal {i}") for i in range(5)]
+    newest_first = [str(run.id) for run in reversed(created)]
+
+    walked: list[str] = []
+    cursor: str | None = None
+    async with _client(service) as client:
+        for _ in range(5):  # bounded: a cursor bug must fail, not loop forever
+            url = "/api/v1/runs?limit=2" + (f"&cursor={cursor}" if cursor else "")
+            body = (await client.get(url)).json()
+            walked.extend(run["runId"] for run in body["runs"])
+            cursor = body["nextCursor"]
+            if cursor is None:
+                break
+
+    assert walked == newest_first
+    assert cursor is None, "the last page must not offer another one"
+
+
+async def test_the_last_page_offers_no_cursor() -> None:
+    """`nextCursor` is how the button knows to disappear. Offering one on a full-but-
+    final page would leave a control that fetches nothing."""
+    store = InMemoryRunStore()
+    service = RunService(store)
+    for i in range(2):
+        await service.start(business_id=BUSINESS, goal=f"goal {i}")
+
+    async with _client(service) as client:
+        body = (await client.get("/api/v1/runs?limit=2")).json()
+
+    assert len(body["runs"]) == 2
+    assert body["nextCursor"] is None
+
+
+async def test_a_malformed_cursor_is_refused_rather_than_silently_restarting() -> None:
+    """Quietly returning page one looks exactly like the "older runs" button not
+    working, which is the bug report nobody can reproduce."""
+    async with _client(RunService(InMemoryRunStore())) as client:
+        response = await client.get("/api/v1/runs?cursor=not-a-cursor")
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "bad_cursor"

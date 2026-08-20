@@ -196,6 +196,16 @@ class UserOut(CamelModel):
     id: UUID
     email: str
     is_active: bool
+    #: The business this account acts for, or ``None`` for an account that has none.
+    #:
+    #: ``null`` rather than an error, because an account without a business is a
+    #: legitimate state (mid-signup, or one whose business was removed) and it is the
+    #: screen's job to say "finish onboarding", not this endpoint's to refuse.
+    #:
+    #: Exposed because every authenticated screen needs it and none of them had it: the
+    #: memory routes derive the tenant from the session instead of taking a path id
+    #: like their `proposals` sibling, precisely because the client could not know it.
+    business_id: UUID | None = None
     #: Exposed so the UI can tell an operator from a customer and hide what the
     #: customer cannot use anyway. It is NOT the authorisation decision — the server
     #: re-checks the role on every admin call.
@@ -561,5 +571,19 @@ async def logout(
     response_model_by_alias=True,
     summary="The signed-in user",
 )
-async def me(user: CurrentUser) -> UserOut:
-    return UserOut(id=user.id, email=user.email, is_active=user.is_active, role=user.role)
+async def me(user: CurrentUser, db: Annotated[AsyncSession, Depends(db_session)]) -> UserOut:
+    """Who the caller is, and which business they act for.
+
+    The business is resolved with the SAME query `runs.current_business` uses, imported
+    rather than repeated -- two lookups answering "whose business is this" is how a
+    screen and an authorisation check start disagreeing.
+    """
+    from backend.app.api.runs import business_for_user
+
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        is_active=user.is_active,
+        role=user.role,
+        business_id=await business_for_user(user.id, session=db),
+    )

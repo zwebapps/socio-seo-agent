@@ -437,6 +437,24 @@ async def test_me_returns_the_user_with_a_cookie(db: AsyncSession) -> None:
     assert "password_hash" not in response.text
 
 
+async def test_me_names_the_business_the_account_acts_for(db: AsyncSession) -> None:
+    """Every authenticated screen needs this and none of them had it, which is why the
+    memory routes derive the tenant from the session instead of taking a path id like
+    their `proposals` sibling: the client could not know it.
+
+    Signup creates the user and the business in one transaction, so a freshly signed-up
+    account always has one — and it must be that account's own, which is the half worth
+    asserting.
+    """
+    email = _email()
+    async with _client(db) as client:
+        signup = await _signup(client, email)
+        response = await client.get("/api/v1/auth/me")
+
+    assert response.status_code == 200
+    assert response.json()["businessId"] == signup.json()["businessId"]
+
+
 async def test_me_is_401_for_a_tampered_cookie(db: AsyncSession) -> None:
     email = _email()
     async with _client(db) as client:

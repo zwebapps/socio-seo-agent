@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response,
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.auth import CurrentUser
 from backend.app.db.adapters.run_store import PostgresRunStore
@@ -37,6 +38,8 @@ from backend.app.services.run_service import (
     MAX_RUN_LIST_LIMIT,
     RunRecord,
     RunService,
+    decode_cursor,
+    encode_cursor,
 )
 
 router = APIRouter(prefix="/api/v1/runs", tags=["runs"])
@@ -53,21 +56,40 @@ MAX_STREAM_SECONDS = 15 * 60
 TERMINAL = frozenset({"awaiting_approval", "done", "failed", "partial"})
 
 
+async def business_for_user(user_id: UUID, *, session: AsyncSession) -> UUID | None:
+    """The business this user owns, or ``None``.
+
+    Its own function because there are now two callers with different correct
+    responses to a missing business: this module's dependency raises 409 (a run cannot
+    be started without one), while `/auth/me` reports ``null`` (an account mid-signup
+    is a fact about the account, not an error). One query, two readings -- and one
+    place to change when a user can own more than one business.
+
+    Takes the session rather than opening one, so the caller decides. `/auth/me` passes
+    the request's session, which is what a test can override; a function reaching for
+    the module-level engine would make every auth test open a real connection to
+    answer a question about a fixture.
+    """
+    from sqlalchemy import select
+
+    from backend.app.db.models import Business
+
+    found: UUID | None = (
+        await session.execute(select(Business.id).where(Business.owner_id == user_id).limit(1))
+    ).scalar_one_or_none()
+    return found
+
+
 async def current_business(user: CurrentUser) -> UUID:
     """The business this caller is acting for.
 
     One business per user today, so it is derived rather than passed: accepting a
     business_id from the client would be an authorisation decision made by the client.
     """
-    from sqlalchemy import select
-
-    from backend.app.db.models import Business
     from backend.app.db.session import session
 
-    async with session() as s:
-        business_id = (
-            await s.execute(select(Business.id).where(Business.owner_id == user.id).limit(1))
-        ).scalar_one_or_none()
+    async with session() as db:
+        business_id = await business_for_user(user.id, session=db)
 
     if business_id is None:
         raise HTTPException(
@@ -178,6 +200,12 @@ class RunSummaryOut(CamelModel):
 
 class RunListResponse(CamelModel):
     runs: list[RunSummaryOut]
+    #: Pass back as ``?cursor=`` for the next page, or ``null`` when this is the last.
+    #:
+    #: Present rather than a total count, and that is the honest shape: counting every
+    #: run a business has ever had costs a second query to render a number nobody acts
+    #: on, while "there is more" is exactly what the button needs to know.
+    next_cursor: str | None = None
 
 
 async def _require_own_run(run_id: UUID, business_id: UUID, service: RunService) -> RunRecord:
@@ -223,6 +251,7 @@ async def list_runs(
     service: Annotated[RunService, Depends(get_run_service)],
     response: Response,
     limit: Annotated[int, Query(ge=1, le=MAX_RUN_LIST_LIMIT)] = DEFAULT_RUN_LIST_LIMIT,
+    cursor: Annotated[str | None, Query(max_length=120)] = None,
 ) -> RunListResponse:
     """The list an owner reaches a run from.
 
@@ -233,6 +262,11 @@ async def list_runs(
 
     **Newest first, and that is part of the contract.** A run takes minutes and its id is
     not memorable, so "the one I just started" has to be the top row.
+
+    **Paginated by cursor, not by offset.** It used to be a cap: a business past the
+    ceiling could not reach its older runs at all. A keyset cursor is what makes the
+    boundary exact while runs are still being started -- an offset shifts by a row every
+    time a new run appears above it, which silently skips one.
 
     **No timeline, no checkpoint.** The store selects named columns, so the draft is never
     even read -- see :meth:`PostgresRunStore.list_runs`. A single run's events are a
@@ -248,7 +282,24 @@ async def list_runs(
     """
     response.headers["Cache-Control"] = "no-store"
 
-    runs = await service.recent(limit=limit)
+    before = None
+    if cursor:
+        try:
+            before = decode_cursor(cursor)
+        except ValueError as exc:
+            # 422 rather than a silent first page: a client whose cursor is malformed
+            # wants to be told, because quietly restarting the list looks exactly like
+            # the "older runs" button not working.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={"code": "bad_cursor", "message": "That page cursor is not valid."},
+            ) from exc
+
+    # One more than asked for, which is how "is there another page" is answered without
+    # a second query and without claiming a total.
+    found = await service.recent(limit=min(limit + 1, MAX_RUN_LIST_LIMIT + 1), before=before)
+    mine = [run for run in found if run.business_id == business_id]
+    page = mine[:limit]
     return RunListResponse(
         runs=[
             RunSummaryOut(
@@ -260,9 +311,13 @@ async def list_runs(
                 finished_reason=run.finished_reason,
                 created_at=run.created_at.isoformat(),
             )
-            for run in runs
-            if run.business_id == business_id
-        ]
+            for run in page
+        ],
+        next_cursor=(
+            encode_cursor((page[-1].created_at, page[-1].id))
+            if page and len(mine) > len(page)
+            else None
+        ),
     )
 
 

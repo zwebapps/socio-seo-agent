@@ -16,6 +16,7 @@ The store is a Protocol with an in-memory implementation, so the service is test
 without a database and the Postgres adapter is a separate, replaceable thing.
 """
 
+import base64
 import json
 import logging
 from collections.abc import Sequence
@@ -95,6 +96,52 @@ class RunSummaryRecord(BaseModel):
     created_at: datetime
 
 
+#: Where a page of runs starts: the ``(created_at, id)`` of the last row of the
+#: previous page. KEYSET, not an offset, and the reason is correctness rather than
+#: speed at this scale: a run started while somebody is reading page one shifts every
+#: offset by a row, so `OFFSET 50` then skips a run that has moved down into it. A
+#: cursor names a position in the ORDER, which new rows above it cannot move.
+RunCursor = tuple[datetime, UUID]
+
+
+def encode_cursor(cursor: RunCursor) -> str:
+    """The cursor as one URL-safe string the client hands back unchanged.
+
+    base64url, and not for obfuscation: a timestamp's ISO form contains ``+`` for its
+    UTC offset, and a ``+`` in a query string decodes as a SPACE. A raw cursor
+    therefore breaks the moment anything builds a URL by concatenation, which is what
+    every client does. Encoding it removes a whole class of "the next-page button
+    sometimes 422s" bug.
+
+    Deliberately NOT signed. It carries no authority: the store is already scoped to
+    one tenant by row-level security, so the worst a forged cursor can do is ask for a
+    page of the caller's OWN runs starting somewhere odd. Signing it would imply it was
+    a capability, which invites treating it as one.
+    """
+    stamp, run_id = cursor
+    raw = f"{stamp.isoformat()}|{run_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_cursor(raw: str) -> RunCursor:
+    """Parse a cursor, or raise ``ValueError``.
+
+    Raises rather than silently returning the first page, because a client that mistyped
+    a cursor wants to be told: quietly restarting the list looks exactly like the "older
+    runs" button not working, which is the bug report nobody can reproduce.
+    """
+    padded = raw + "=" * (-len(raw) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode()).decode()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("a run cursor is base64url of '<timestamp>|<uuid>'") from exc
+
+    stamp, separator, run_id = decoded.partition("|")
+    if not separator or not stamp or not run_id:
+        raise ValueError("a run cursor is base64url of '<timestamp>|<uuid>'")
+    return datetime.fromisoformat(stamp), UUID(run_id)
+
+
 def check_list_limit(limit: int) -> None:
     """Refuse a limit outside the band, in the STORE rather than only at the route.
 
@@ -138,7 +185,7 @@ class RunStore(Protocol):
     ) -> Sequence[RunEventRecord]: ...
 
     async def list_runs(
-        self, *, limit: int = DEFAULT_RUN_LIST_LIMIT
+        self, *, limit: int = DEFAULT_RUN_LIST_LIMIT, before: RunCursor | None = None
     ) -> Sequence[RunSummaryRecord]: ...
 
 
@@ -188,16 +235,29 @@ class InMemoryRunStore:
     async def list_events(self, run_id: UUID, *, after_seq: int = 0) -> Sequence[RunEventRecord]:
         return [e for e in self._events.get(run_id, []) if e.seq > after_seq]
 
-    async def list_runs(self, *, limit: int = DEFAULT_RUN_LIST_LIMIT) -> Sequence[RunSummaryRecord]:
+    async def list_runs(
+        self, *, limit: int = DEFAULT_RUN_LIST_LIMIT, before: RunCursor | None = None
+    ) -> Sequence[RunSummaryRecord]:
         """Newest first, by INSERTION order rather than by the stamp.
 
         The Postgres store orders by ``created_at DESC``, which is the same intent; here
         insertion order is used because two runs started in the same test land on the same
         clock reading often enough to make a timestamp sort flap. The stamp is still
         carried, because the screen renders it -- it is just not what the order rests on.
+
+        ``before`` therefore has to be applied by POSITION here rather than by comparing
+        stamps: with several runs sharing a clock reading, a `created_at < cursor` filter
+        in this store would drop the rest of that batch. The Postgres store, whose order
+        really is `(created_at DESC, id DESC)`, compares the tuple.
         """
         check_list_limit(limit)
-        newest_first = reversed(list(self._runs.values()))
+        newest_first = list(reversed(list(self._runs.values())))
+        if before is not None:
+            _, cursor_id = before
+            position = next(
+                (index for index, run in enumerate(newest_first) if run.id == cursor_id), None
+            )
+            newest_first = newest_first[position + 1 :] if position is not None else []
         in_scope = (
             run for run in newest_first if self._scope is None or run.business_id == self._scope
         )
@@ -278,7 +338,9 @@ class RunService:
         """
         return await self._store.get(run_id)
 
-    async def recent(self, *, limit: int = DEFAULT_RUN_LIST_LIMIT) -> list[RunSummaryRecord]:
+    async def recent(
+        self, *, limit: int = DEFAULT_RUN_LIST_LIMIT, before: RunCursor | None = None
+    ) -> list[RunSummaryRecord]:
         """This store's runs, newest first.
 
         Named ``recent`` rather than ``list``: the word describes the ORDER, which is the
@@ -289,8 +351,11 @@ class RunService:
         that row-level security answers "whose runs are these", rather than a lookup
         carved out from under RLS. Accepting one here would put that question back in the
         caller's hands, which is the bug the store's docstring exists to describe.
+
+        ``before`` continues an earlier page. See :data:`RunCursor` for why it is a
+        keyset position rather than an offset.
         """
-        return list(await self._store.list_runs(limit=limit))
+        return list(await self._store.list_runs(limit=limit, before=before))
 
     async def record_event(
         self,
@@ -387,6 +452,7 @@ __all__ = [
     "MAX_RUN_LIST_LIMIT",
     "EventStatus",
     "InMemoryRunStore",
+    "RunCursor",
     "RunEventRecord",
     "RunRecord",
     "RunService",
@@ -395,4 +461,6 @@ __all__ = [
     "RunSummaryRecord",
     "check_list_limit",
     "clamp_reason",
+    "decode_cursor",
+    "encode_cursor",
 ]

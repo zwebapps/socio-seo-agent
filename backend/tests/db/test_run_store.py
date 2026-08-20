@@ -331,3 +331,42 @@ async def test_listing_never_reads_the_checkpoint_column(
     assert len(listed) == 1
     assert "checkpoint" not in RunSummaryRecord.model_fields
     assert "unpublished draft" not in listed[0].model_dump_json()
+
+
+async def test_a_cursor_page_misses_nothing_across_a_walk(
+    two_businesses: tuple[UUID, UUID], scoped_sessions: None
+) -> None:
+    """Against real Postgres, because the page boundary is a row-value comparison.
+
+    `created_at < stamp` alone would drop every run sharing that microsecond and
+    `created_at <= stamp` would repeat it, so the tuple comparison is the whole point
+    — and an in-memory double cannot get that wrong on your behalf. Rows are created in
+    one loop, which on a fast machine genuinely does land several in the same
+    microsecond.
+    """
+    business, _ = two_businesses
+    store = PostgresRunStore(business)
+    created = []
+    for index in range(7):
+        created.append(
+            await store.create(
+                RunRecord(
+                    id=uuid4(),
+                    business_id=business,
+                    goal=f"goal {index}",
+                    state="queued",
+                )
+            )
+        )
+
+    walked: list[UUID] = []
+    cursor: tuple[datetime, UUID] | None = None
+    for _ in range(7):  # bounded, so a cursor bug fails instead of looping
+        page = list(await store.list_runs(limit=3, before=cursor))
+        if not page:
+            break
+        walked.extend(run.id for run in page)
+        cursor = (page[-1].created_at, page[-1].id)
+
+    assert len(walked) == len(set(walked)), "a run must not appear on two pages"
+    assert set(walked) == {run.id for run in created}, "no run may be skipped"

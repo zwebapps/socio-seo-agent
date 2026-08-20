@@ -13,12 +13,13 @@ error rather than a silently reordered timeline, which is the failure mode you w
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select, tuple_
 
 from backend.app.db.models import Run, RunEvent
 from backend.app.db.session import business_session
 from backend.app.services.run_service import (
     DEFAULT_RUN_LIST_LIMIT,
+    RunCursor,
     RunEventRecord,
     RunRecord,
     RunSummaryRecord,
@@ -133,7 +134,9 @@ class PostgresRunStore:
                 )
             )
 
-    async def list_runs(self, *, limit: int = DEFAULT_RUN_LIST_LIMIT) -> Sequence[RunSummaryRecord]:
+    async def list_runs(
+        self, *, limit: int = DEFAULT_RUN_LIST_LIMIT, before: RunCursor | None = None
+    ) -> Sequence[RunSummaryRecord]:
         """This business's runs, newest first.
 
         **There is no ``WHERE business_id = ...`` here, and that is the design.** The
@@ -149,29 +152,40 @@ class PostgresRunStore:
         and discard a draft per row to render a column of goals -- and the largest thing a
         run produces would be sitting in the query result of the most frequently loaded
         screen in the product.
+
+        ``before`` continues a previous page from its last row. Keyset rather than
+        offset: a run started while somebody reads page one shifts every offset by a
+        row, so ``OFFSET 50`` then skips a run that has moved down into it.
         """
         check_list_limit(limit)
         async with business_session(self._business_id) as s:
-            rows = (
-                await s.execute(
-                    select(
-                        Run.id,
-                        Run.business_id,
-                        Run.goal,
-                        Run.state,
-                        Run.current_node,
-                        Run.resumed_count,
-                        Run.finished_reason,
-                        Run.created_at,
-                    )
-                    # `id` breaks the tie, so two runs created in the same microsecond
-                    # come back in a stable order across requests rather than in whatever
-                    # order the plan happens to produce -- a list that reshuffles between
-                    # two polls looks like runs appearing and disappearing.
-                    .order_by(Run.created_at.desc(), Run.id.desc())
-                    .limit(limit)
+            query = select(
+                Run.id,
+                Run.business_id,
+                Run.goal,
+                Run.state,
+                Run.current_node,
+                Run.resumed_count,
+                Run.finished_reason,
+                Run.created_at,
+            )
+            if before is not None:
+                # Row-value comparison against the SAME tuple the order is built from,
+                # which is what makes the page boundary exact: `created_at < stamp`
+                # alone would drop every other run sharing that microsecond, and
+                # `created_at <= stamp` would repeat them.
+                query = query.where(
+                    tuple_(Run.created_at, Run.id) < tuple_(literal(before[0]), literal(before[1]))
                 )
-            ).all()
+            query = (
+                # `id` breaks the tie, so two runs created in the same microsecond come
+                # back in a stable order across requests rather than in whatever order
+                # the plan happens to produce -- a list that reshuffles between two
+                # polls looks like runs appearing and disappearing. It is also half the
+                # cursor, which is why the two have to stay identical.
+                query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit)
+            )
+            rows = (await s.execute(query)).all()
         return [
             RunSummaryRecord(
                 id=row.id,
