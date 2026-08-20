@@ -166,9 +166,10 @@ _NO_LANDING: Final = (
 #: Instagram bio, which is worse than an honest gap because the failure is invisible.
 #:
 #: Worded as a fact about THIS pack — a short link is not in it — rather than as a claim
-#: about which node is missing. The node that would mint one is being built, and a
-#: sentence naming it goes stale the day it lands, at which point the honest note becomes
-#: the misleading one.
+#: about which node is missing. That wording is what saved it: `publish.page` became a
+#: real actuator, so the note is now the EXCEPTION rather than the rule, and it appears
+#: only when a run genuinely published nothing. A sentence naming the missing node would
+#: have gone stale on the day it landed.
 _NO_TRACKED_LINK: Final = (
     "No tracked short link is in this pack. A short link is minted when a landing page is "
     "published to a public address, and that has not happened for this run — so put your "
@@ -847,6 +848,23 @@ class ExportLandingPage(_Wire):
     channel_ctas: tuple[ExportCta, ...]
 
 
+class ExportTrackedLink(_Wire):
+    """One channel's tracked short link, as actually minted.
+
+    Every field here is read back from what the landing actuator reported doing — there is
+    no code path that constructs a `code` from anything but a `short_links` row that
+    already exists. That is the whole prohibition this type has to keep: a
+    plausible-looking `/l/xxxxxxxx` in a pack is a dead link in somebody's Instagram bio,
+    and the failure is invisible because it looks exactly like a working one.
+    """
+
+    channel: str
+    #: The ask that goes with the link, so the paste is the whole post.
+    text: str
+    code: str
+    url: str
+
+
 class ExportPack(_Wire):
     """Everything Tier 3 needs, and every gap in it named.
 
@@ -869,7 +887,15 @@ class ExportPack(_Wire):
     #: and the only route at all on the channels that cannot carry a link.
     hub_url: str | None
     hub_note: str | None
-    tracked_link_note: str
+    #: The public address of the page this run PUBLISHED, when it published one. An
+    #: address to paste, which is what this pack is for — not a publish claim, which the
+    #: class note below correctly keeps out.
+    published_page_url: str | None
+    #: One per channel CTA, minted by the landing actuator. Empty until a run publishes.
+    tracked_links: tuple[ExportTrackedLink, ...]
+    #: Why there is no tracked link — and `None` once there are some, because a note
+    #: explaining an absence that is not there is just a contradiction on the screen.
+    tracked_link_note: str | None
     fact_gaps: tuple[str, ...]
     errors: tuple[dict[str, str], ...]
     # Deliberately NOT carrying `published`/`measurement`. The pack is the thing a human
@@ -1042,6 +1068,67 @@ def _landing_page(checkpoint: Mapping[str, Any]) -> ExportLandingPage | None:
     )
 
 
+def _published_addresses(
+    checkpoint: Mapping[str, Any],
+) -> tuple[str | None, tuple[ExportTrackedLink, ...]]:
+    """The page URL and tracked links a run actually published, or nothing.
+
+    Read out of the `publish.page` outcome's own `detail`, which is the only source that
+    can honestly supply them: the landing actuator wrote the `content_pieces` row and
+    minted each `short_links` row in the same call, so a code appearing here is a code
+    that exists. Nothing is reconstructed, and nothing is inferred from the presence of a
+    landing-page SPEC — a spec means CONVERT wrote a page, not that anyone published it.
+
+    Only a `succeeded` outcome counts, and `fake` is refused outright. A simulated publish
+    carries a `fake://` reference, and putting that in a pack a human pastes is precisely
+    the invisible failure the tracked-link note was written to avoid.
+    """
+    published = checkpoint.get("published")
+    if not isinstance(published, Mapping):
+        return None, ()
+
+    refs = published.get("refs")
+    if not isinstance(refs, Sequence):
+        return None, ()
+
+    for row in refs:
+        if not isinstance(row, Mapping):
+            continue
+        if row.get("action_type") != "publish.page" or row.get("status") != "succeeded":
+            continue
+        if row.get("fake"):
+            # Simulated. It has no address, and inventing one is the whole hazard.
+            continue
+
+        detail = row.get("detail")
+        detail = detail if isinstance(detail, Mapping) else {}
+        url = _text(row.get("external_ref")) or None
+
+        links: list[ExportTrackedLink] = []
+        raw = detail.get("ctas")
+        for cta in raw if isinstance(raw, Sequence) else ():
+            if not isinstance(cta, Mapping):
+                continue
+            code = _text(cta.get("code"))
+            link_url = _text(cta.get("url"))
+            channel = _text(cta.get("channel"))
+            # All three or none: a link with no code cannot be attributed, and a link
+            # with no URL is not a link. Dropping the row is better than half of one.
+            if not (code and link_url and channel):
+                continue
+            links.append(
+                ExportTrackedLink(
+                    channel=channel,
+                    text=_text(cta.get("text")),
+                    code=code,
+                    url=link_url,
+                )
+            )
+        return url, tuple(links)
+
+    return None, ()
+
+
 def project_export_pack(
     checkpoint: Mapping[str, Any] | None,
     *,
@@ -1070,6 +1157,8 @@ def project_export_pack(
             ai_blocks_note=_NO_CHECKPOINT,
             hub_url=hub_url,
             hub_note=_HUB_NOTE if hub_url else None,
+            published_page_url=None,
+            tracked_links=(),
             tracked_link_note=_NO_TRACKED_LINK,
             fact_gaps=(),
             errors=(),
@@ -1078,6 +1167,7 @@ def project_export_pack(
     channels = _export_channels(checkpoint)
     landing = _landing_page(checkpoint)
     ai_blocks, ai_note = _ai_blocks(checkpoint)
+    page_url, tracked = _published_addresses(checkpoint)
 
     return ExportPack(
         has_pack=bool(channels or landing or (ai_blocks and ai_blocks.blocks)),
@@ -1090,7 +1180,10 @@ def project_export_pack(
         ai_blocks_note=ai_note,
         hub_url=hub_url,
         hub_note=_HUB_NOTE if hub_url else None,
-        tracked_link_note=_NO_TRACKED_LINK,
+        published_page_url=page_url,
+        tracked_links=tracked,
+        # The note explains an absence, so it goes the moment there is nothing absent.
+        tracked_link_note=None if tracked else _NO_TRACKED_LINK,
         fact_gaps=_strings(checkpoint.get("fact_gaps")),
         errors=_errors(checkpoint),
     )
@@ -1202,11 +1295,23 @@ def render_export_markdown(pack: ExportPack) -> str:
         lines.append("")
 
     lines += ["## Links", ""]
+    # The published page first: every tracked link below points at it, so a reader who
+    # pastes one wants to know where it lands.
+    if pack.published_page_url:
+        lines += [f"Published page: {pack.published_page_url}", ""]
     if pack.hub_url:
         lines += [f"Bio-link hub: {pack.hub_url}", ""]
         if pack.hub_note:
             lines += [pack.hub_note, ""]
-    lines += [pack.tracked_link_note, ""]
+    if pack.tracked_links:
+        lines += ["Tracked links — one per channel, so each channel's clicks are its own:", ""]
+        lines += [
+            f"- {link.channel}: {link.url}" + (f" — {link.text}" if link.text else "")
+            for link in pack.tracked_links
+        ]
+        lines.append("")
+    if pack.tracked_link_note:
+        lines += [pack.tracked_link_note, ""]
 
     if pack.fact_gaps or pack.errors:
         lines += ["## What this was written without", ""]

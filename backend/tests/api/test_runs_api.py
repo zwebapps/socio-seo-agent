@@ -7,6 +7,7 @@ whole run, and a stream that never terminates leaks a connection per reload.
 
 import json
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -279,7 +280,7 @@ INSTAGRAM_TAGS = ["#Notar", "#Koblenz", "#Immobilien"]
 LINKEDIN_BODY = "Kurz erklärt: was ein Notar beurkundet. #Notar"
 
 
-async def _exportable_run(service: RunService) -> UUID:
+async def _exportable_run(service: RunService, *, published: dict[str, Any] | None = None) -> UUID:
     """A run with two channels and a landing page, checkpointed through the real state.
 
     Two channels on purpose, and specifically LinkedIn and Instagram: one carries a
@@ -326,6 +327,11 @@ async def _exportable_run(service: RunService) -> UUID:
         ctas=[ChannelCta(channel="instagram", text="Link in der Bio")],
     ).model_dump(mode="json")
     state["fact_gaps"] = ["uploaded documents"]
+    if published is not None:
+        # Set on the state rather than merged into a read-back checkpoint: the stored
+        # form is already JSON (`caps` is a dict), so re-checkpointing it would fail on
+        # the dataclass the real state carries.
+        state["published"] = published
     await service.checkpoint(run.id, state=state, current_node="REVIEW")
     await service.await_approval(run.id)
     return run.id
@@ -456,9 +462,15 @@ async def test_a_run_that_has_saved_nothing_at_all_says_that_instead() -> None:
 
 
 async def test_the_pack_never_invents_a_tracked_short_link() -> None:
-    """Nothing mints a short link for a run yet (`publish_landing_page` has no caller),
-    so a plausible-looking `/l/xxxxxxxx` in the pack would be a URL that 404s in
-    somebody's Instagram bio. The hub URL is real and is offered instead."""
+    """A run that published NOTHING offers no short link, and says why.
+
+    The premise has changed and the prohibition has not. `publish.page` is a real
+    actuator now, so a pack CAN carry a tracked link — but only one that was actually
+    minted. This run stops at REVIEW without publishing, so there is no `short_links` row
+    behind any code, and a plausible-looking `/l/xxxxxxxx` here would be a URL that 404s
+    in somebody's Instagram bio: worse than an honest gap, because the failure is
+    invisible. The hub URL is real and is offered instead.
+    """
     service = RunService(InMemoryRunStore())
     run_id = await _exportable_run(service)
 
@@ -467,9 +479,124 @@ async def test_the_pack_never_invents_a_tracked_short_link() -> None:
 
     assert body["trackedLinkNote"], "the absence has to be stated, not left as an empty field"
     assert body["hubUrl"].endswith(f"/go/{BUSINESS}")
-    assert "/l/" not in json.dumps(body), "no short link may be fabricated anywhere in the pack"
+    assert body["trackedLinks"] == []
+    assert body["publishedPageUrl"] is None
+    assert "/l/" not in json.dumps(body), "no short link may appear without a row behind it"
     for channel in body["channels"]:
         assert "trackedLink" not in channel
+
+
+async def test_a_simulated_publish_puts_no_link_in_the_pack() -> None:
+    """The fabrication guard, now that it can actually fire.
+
+    A simulated publish produces a real outcome row marked `fake`, with a `fake://`
+    reference and no minted codes. Reading addresses out of that row is the one way this
+    projection could put a dead link in front of a customer — the outcome LOOKS
+    successful, because in every respect except reaching the world it was. So `fake` is
+    refused before anything is read, and the honest note comes back instead.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(
+        service,
+        published={
+            "approved_by": "user:owner-1",
+            "attempted": 1,
+            "refs": [
+                {
+                    "action_type": "publish.page",
+                    "target": "landing_page",
+                    "status": "succeeded",
+                    "external_ref": "fake://publish.page/landing_page#deadbeef",
+                    "replayed": False,
+                    "fake": True,
+                    "error": None,
+                    "summary": "publish.page -> landing_page: done (SIMULATED)",
+                    "at": "2026-08-20T10:00:00+00:00",
+                    "detail": {"simulated": True},
+                }
+            ],
+            "not_published": [],
+            "simulated": True,
+            "note": "Published 1 of 1 -- SIMULATED",
+        },
+    )
+
+    async with _client(service) as client:
+        body = (await client.get(f"/api/v1/runs/{run_id}/export")).json()
+
+    assert body["publishedPageUrl"] is None
+    assert body["trackedLinks"] == []
+    assert body["trackedLinkNote"], "a simulated publish is still an absence, and says so"
+    assert "fake://" not in json.dumps(body)
+
+
+async def test_a_real_publish_puts_its_page_and_its_codes_in_the_pack() -> None:
+    """The other half: what A1a mints has to reach the thing a human pastes.
+
+    The addresses come from the `publish.page` outcome's own `detail`, which is where the
+    landing actuator recorded what it wrote — so a code in this pack is a code that has a
+    `short_links` row behind it. The note disappears, because a sentence explaining an
+    absence that is not there is a contradiction on the screen.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _exportable_run(
+        service,
+        published={
+            "approved_by": "user:owner-1",
+            "attempted": 1,
+            "refs": [
+                {
+                    "action_type": "publish.page",
+                    "target": "landing_page",
+                    "status": "succeeded",
+                    "external_ref": "https://sma.example/p/6f1c9b02-0000-4000-8000-000000000001",
+                    "replayed": False,
+                    "fake": False,
+                    "error": None,
+                    "summary": "publish.page -> landing_page: done",
+                    "at": "2026-08-20T10:00:00+00:00",
+                    "detail": {
+                        "content_piece_id": "6f1c9b02-0000-4000-8000-000000000001",
+                        "path": "/p/6f1c9b02-0000-4000-8000-000000000001",
+                        "status": "published",
+                        "score": 88,
+                        "ctas": [
+                            {
+                                "channel": "instagram",
+                                "text": "Link in der Bio",
+                                "code": "aB3xK9mQ",
+                                "path": "/l/aB3xK9mQ",
+                                "url": "https://sma.example/l/aB3xK9mQ",
+                            }
+                        ],
+                    },
+                }
+            ],
+            "not_published": [],
+            "simulated": False,
+            "note": "Published 1 of 1",
+        },
+    )
+
+    async with _client(service) as client:
+        response = await client.get(f"/api/v1/runs/{run_id}/export")
+        body = response.json()
+        markdown = (
+            await client.get(f"/api/v1/runs/{run_id}/export", params={"format": "markdown"})
+        ).text
+
+    assert body["publishedPageUrl"].endswith("/p/6f1c9b02-0000-4000-8000-000000000001")
+    assert [link["code"] for link in body["trackedLinks"]] == ["aB3xK9mQ"]
+    assert body["trackedLinks"][0]["channel"] == "instagram"
+    assert body["trackedLinkNote"] is None
+
+    # The markdown is the point of the tier: nobody pastes an escaped JSON string.
+    assert "https://sma.example/l/aB3xK9mQ" in markdown
+    assert "Published page:" in markdown
+
+    # The pack still refuses to claim a publication. These are addresses to paste, and
+    # what EXPORT did with them belongs on the review screen.
+    assert "sends nothing to any platform" in body["notice"]
 
 
 async def test_the_pack_never_claims_anything_was_published() -> None:

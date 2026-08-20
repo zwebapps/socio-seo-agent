@@ -1522,6 +1522,13 @@ def _outcome_row(outcome: ActuationOutcome) -> dict[str, Any]:
         "error": outcome.error,
         "summary": outcome.summary(),
         "at": outcome.at.isoformat(),
+        # The actuator's own structured result. Carried rather than dropped because it is
+        # the ONLY path by which a real published address reaches a surface: the export
+        # pack is a pure projection of this checkpoint, so a tracked short link the
+        # landing actuator actually minted is either in here or it is nowhere. Already
+        # JSON primitives by the `Actuation.payload` rule -- an audit row that cannot
+        # serialise is an audit row that ends the run.
+        "detail": dict(outcome.detail),
     }
 
 
