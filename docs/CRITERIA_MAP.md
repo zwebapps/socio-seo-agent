@@ -29,7 +29,7 @@ a separate file would have been a second copy to let rot:
 | Core functionality | 10-node graph: intake → harvest → opportunity → plan → generate → validate → repack → review → export → measure | `agents/graph.py` | 3–11 |
 | User interactions | onboarding, document upload, opportunity selection, edit, approve/reject, brand voice, tool toggles, model settings | `frontend/app/(app)/` | 2–12 |
 | User-friendly UI for **all** functionality | every backend capability has a screen; user mode vs `/developer` mode | `frontend/` | 2–13 |
-| Appropriate tools/libraries | LangGraph, FastAPI, Pydantic, pgvector, Next.js, Langfuse, Ragas | `pyproject.toml`, `ARCHITECTURE.md` §5 | — |
+| Appropriate tools/libraries | LangGraph (`StateGraph`, genuinely imported — see the note below), FastAPI, Pydantic, pgvector, Next.js, Langfuse, **DeepEval** (not Ragas — see the note below), Vitest + React Testing Library | `pyproject.toml`, `ARCHITECTURE.md` §5, §14 | — |
 | Error handling | typed engine errors, bounded retries, provider fallback (403/404 falls through the chain, 401/402 fails fast), partial-failure degradation, caps, and two deliberate **fail-open** decisions with the reasoning recorded — a breach-lookup outage must not stop signups, and a rate-limit backend outage must not lock everyone out | `ARCHITECTURE.md` §7, §14, `ROADMAP.md` §10 | 6, 9 |
 | Real-world usage | resumable runs, idempotent actuators, budgets, rate limits, RLS, audit log | `ARCHITECTURE.md` §3, §6, §7 | 9 |
 | Documentation | 6 documents + in-app help assistant | `docs/`, `README.md` | 13 |
@@ -38,7 +38,7 @@ a separate file would have been a second copy to let rot:
 | **Function calling** | Pydantic schema → tool_call → validate args → execute → tool message → re-plan; one repair turn on invalid args | §4 below, `tools/registry.py` | 4 |
 | Code organisation | Engines / Actuators / Agents, layer direction enforced by test | `ARCHITECTURE.md` §3–4 | — |
 | Edge cases | 13 named scenarios with handling | `ROADMAP.md` §10 | 6, 9 |
-| Knowledge base / RAG | pgvector over the business's own documents, retrieved agentically | `engines/kb/`, §5 below | 5 |
+| Knowledge base / RAG | pgvector over the business's own documents, retrieved agentically — and **reachable**: `POST /api/v1/documents` + the `/documents` screen ingest them, and `build_real_deps` wires `retrieve` into a real run once a business has indexed something. Until 2026-08-20 every piece of this existed and none of it was reachable: `ingest_document` had twenty tests and no caller | `engines/kb/`, `api/documents.py`, `services/document_service.py`, §5 below | 3, 5 |
 | Security | **request layer:** body-size cap enforced on the header AND every chunk (`core/body_limit.py`), Origin/Referer CSRF on cookie-bearing writes (`core/csrf.py`), `__Host-` session cookie with no `Domain`, ever (`core/cookies.py`), per-IP/per-email throttles with a refund on success (`core/rate_limit.py`), HIBP k-anonymity password check (`core/pwned.py`), proxy-trust detection (`core/proxy_trust.py`) · **agent layer:** per-node tool allowlist enforced at runtime and drift-tested against the docs (`agents/tools.py`), regulated-claim gate that blocks approval (`engines/claims/`), 10-mechanism prompt-injection corpus, escaped untrusted-content envelope · **data layer:** RLS on every business-scoped table with a cross-tenant test, anonymous reads through SECURITY DEFINER functions rather than a privileged connection, SSRF guard on crawling | `ARCHITECTURE.md` §9, §14; `tests/core/test_{body_limit,csrf,cookies,rate_limit,pwned,proxy_trust}.py`, `tests/agents/test_{tool_allowlist,prompt_injection}.py`, `tests/db/test_tenant_isolation.py` | 9 |
 | Measurement honesty | 20-case eval with a deterministic rubric (no LLM judge), an **oracle** column separating "retrieval found nothing" from "there was nothing to find", a report header that names the actual provider so a fake run cannot pass as a live one, `--live` that refuses to run if the router resolved to the fake, and `--prompt-version v1` kept executable so a prompt improvement is re-measurable rather than asserted | `evals/`, `evals/report.md` | 12 |
 | Reflection | known limits, weaknesses volunteered, improvement backlog — including the ones found by our own tooling: CI never ran a test, the rubric penalised the RAG arm for citing, text extraction is not a security boundary | `ROADMAP.md` §11, `ARCHITECTURE.md` §15, `BACKLOG.md` | 13 |
@@ -180,6 +180,37 @@ Overstating is the fastest way to lose credibility under questioning. These are 
 
 ---
 
+### Two library claims worth stating precisely
+
+**LangGraph.** Until `862e7e9` this was a declared dependency that nothing imported:
+the machine was a hand-written driver, and "LangGraph state machine" was a true claim
+about the SHAPE (bounded steps, a human interrupt at a defined point, resumable,
+per-node evaluation) and not a claim about the code. `agents/state_graph.py` now
+compiles the same machine with the library, the nodes were already the right shape
+(`async (AgentState) -> dict` is LangGraph's own node signature), and every branch of
+the machine is tested against BOTH runtimes. What the library does NOT own is the
+checkpoint: durable run state stays in `runs.checkpoint`, because the review screen,
+the timeline and the resume path already read it and two stores for the same fact is
+worse than one. Say "compiled as a LangGraph `StateGraph`", not "built on LangGraph's
+persistence".
+
+**Ragas → DeepEval.** The criteria say "Ragas or DeepEval" and this project uses
+**DeepEval**, for a reason rather than a preference: `ragas>=0.4.3` depends on
+`instructor`, which caps `openai<3.0.0`, and this project pins `openai>=3.2.0`
+deliberately (v3 is built on httpx2 — see the dev-dependency comment about respx);
+`ragas==0.3.1` imports `langchain_community.chat_models.vertexai`, which no longer
+exists in langchain-community 1.x. Both are recorded in `BACKLOG.md` as an OPEN item
+rather than quietly substituted. The five deterministic scorers are unchanged and still
+gate drafts — the LLM-judged metrics are added ALONGSIDE them, which is also what makes
+it possible to show where a judge and arithmetic disagree.
+
+**One demo step below is aspirational and is marked so.** Step 5 ("open the retrieval
+trace") has no UI: `RetrievalTrace` is produced, carries every grade and the fallback
+decision, and is not rendered anywhere yet. Demo it from the API response or the run
+timeline, and do not claim a screen that does not exist.
+
+---
+
 ## 8. The demo — 13 steps, under 8 minutes
 
 One scenario: **"Analyse my business and create a growth plan."** Run it against the real benchmark business, three rehearsals before submission.
@@ -190,7 +221,7 @@ One scenario: **"Analyse my business and create a growth plan."** Run it against
 | 2 | Paste the URL → crawl + extracted Business DNA, user confirms | onboarding, interaction |
 | 3 | Upload a service PDF → ingested, chunk count shown | knowledge base |
 | 4 | Start the run → timeline streams nodes and **tool calls with live cost** | agent principles, function calling, cost tracking |
-| 5 | Open the **retrieval trace**: query → chunks → grades → fallback decision | **agentic RAG (Hard #1)** |
+| 5 | Open the **retrieval trace**: query → chunks → grades → fallback decision — **no UI yet**, so show it from the API response; the trace itself is real | **agentic RAG (Hard #1)** |
 | 6 | Point at a node that degraded (a source that failed) and the run continuing | error handling, edge cases |
 | 7 | Ranked opportunities with impact and effort | core functionality |
 | 8 | The draft: SEO score 87 with findings, and the retry that raised it from 79 | deterministic validation |
