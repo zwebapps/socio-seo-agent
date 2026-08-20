@@ -129,7 +129,7 @@ This is my answer to "build the whole Agent OS first": don't build the *depth*, 
 
 | Seam | Implementation | Why now |
 |---|---|---|
-| **Resumable run state** | LangGraph Postgres checkpointer; `runs` table with `state`, `plan[]`, `completed[]`, `pending[]`, `budget` | Worker dies at step 4 → resume at step 4, not step 0 |
+| **Resumable run state** | `runs.checkpoint` (JSONB), written by `RunService.checkpoint` after every node; `runs` carries `state`, `current_node`, `resumed_count`, `finished_reason`. **NOT** a LangGraph Postgres checkpointer — see `ARCHITECTURE.md` §14: the column is what the review screen, the timeline and the resume path already read, and a second durable store for the same state would be two answers to "where is this run" | Worker dies at step 4 → resume at step 4, not step 0 |
 | **Idempotency** | `idempotency_key = business_id:workflow_id:task_id:action_type`, unique index on `actions`; check-before-execute, return prior result | Publish must never happen twice |
 | **Approval policy table** | `action_type → auto | notify | approve | human`, data not code | Turning a capability on later is a row, not a release |
 | **Budget + step caps** | per-run USD and step ceiling, checked *before* each model call; per-business monthly cap | Autonomous loops burn money without this |
@@ -149,7 +149,7 @@ Same libraries you've used before, installed fresh here — nothing inherited fr
 | Layer | Choice | Why |
 |---|---|---|
 | Backend | Python 3.13 · FastAPI · Pydantic v2 | your stack; LangGraph is Python-first |
-| Agent runtime | **LangGraph** | explicit state machine, Postgres checkpointing, `interrupt()` for human approval — all three are graded topics |
+| Agent runtime | **LangGraph** `StateGraph` | explicit state machine and a human interrupt at a defined point, both now the library's rather than a hand-written driver's (`862e7e9`). Checkpointing is deliberately OURS, in `runs.checkpoint` — see `ARCHITECTURE.md` §14 |
 | LLM access | **OpenRouter** (OpenAI-compatible SDK) | one integration = multi-model, per-task cost routing, fallbacks, no lock-in |
 | DB | Postgres 16 + **pgvector** · SQLAlchemy · Alembic | app data + RAG in one store |
 | Frontend | **Next.js 16 · React 19 · Tailwind 4 · shadcn/ui** | grading criterion is "uses a front-end library"; Streamlit forfeits it |
@@ -258,7 +258,7 @@ Timeboxes are part-time days. Each phase ends green: ruff + mypy + pytest pass a
 | **2** | Seams: router, ledger, idempotency, budget | 1 | OpenRouter client, task→tier routing with fallback, `model_usage` writes, `actions` idempotency table, per-run/per-business caps. **DoD:** a run shows per-node cost; replaying an action returns the prior result instead of re-executing |
 | **3** | `seo` + `serp` engines | 2 | Deterministic scorer (0–100, itemised), JSON-LD builder + validator, keyword expansion, SERP snapshot, competitor discovery. **DoD:** engine tests for success/timeout/malformed; **a test asserts `engines/` imports no LLM module** |
 | **4** | `geo` engine — AI visibility | 1.5 | Prompt-set model, probe 2–3 models via OpenRouter, parse mention/citation, share-of-voice score, run-over-run diff. **DoD:** produces a real SoV number for a real brand and a chart of two runs |
-| **5** | The graph | 2.5 | All ten nodes, checkpointer, `interrupt()`, caps, SSE stream. **DoD:** one run → article ≥ 85 + 4 social posts + AI-answer blocks, streamed, resumable after approval |
+| **5** | The graph | 2.5 | All ten nodes, our own checkpoint column, the runtime's `interrupt_before`, caps, SSE stream. **DoD:** one run → article ≥ 85 + 4 social posts + AI-answer blocks, streamed, resumable after approval |
 | **6** | Lead loop | 1.5 | CTA + landing-page generation, hosted form endpoint, `leads` table, UTM builder, content→lead attribution view. **DoD:** submit a test form → lead appears attributed to the content piece that produced the link |
 | **7** | UI | 2 | **User mode:** onboarding → documents → opportunities → run timeline (nodes, tool calls, live cost) → draft / SEO score / social / AI-answer tabs → edit → approve → export. **Developer mode** `/developer`, role-gated server-side: model picker, temperature & max-tokens sliders, prompt-version selector, tool toggles, raw trace. Brand voice (professional/friendly/concise) sits in *user* mode — it's a brand decision, not an LLM knob. Empty states, skeletons, retryable error toasts, WCAG AA. **DoD:** a non-technical person completes onboarding → approved content unaided |
 | **8** | Auth, memory, feedback | 1.5 | JWT cookie + argon2; all data scoped per user+business with a cross-tenant test; short-term = thread checkpoint, long-term = DNA + `learned_style`; thumbs + 4-axis rubric + reject reason. **DoD:** two users cannot see each other's businesses (asserted) |

@@ -120,7 +120,7 @@ Prompt-set model, probe 2–3 models via the router, parse mention + citation, c
 ---
 
 ### Phase 6 — The full graph · 2 d
-All ten nodes, Postgres checkpointer, `interrupt()` at REVIEW, opportunity ranking, parallel harvest, SSE events persisted so a reload replays the timeline.
+All ten nodes, the `runs.checkpoint` column (ours, not a LangGraph checkpointer — `ARCHITECTURE.md` §14), an `interrupt_before` at the human gate, opportunity ranking, parallel harvest, SSE events persisted so a reload replays the timeline.
 
 **DoD:** one run → ranked opportunities → article ≥ 85 + 4 social posts + AI-answer blocks · kill the worker mid-run and it resumes at the failed node with `resumed_count` incremented.
 **Visible:** the node-by-node timeline with tool calls, and a crash-resume you can demo on purpose.
@@ -132,7 +132,7 @@ All ten nodes, Postgres checkpointer, `interrupt()` at REVIEW, opportunity ranki
 
 | Kind | Holds | Lifetime | Where |
 |---|---|---|---|
-| Working state | current `AgentState` | one run | LangGraph checkpoint |
+| Working state | current `AgentState` | one run | `runs.checkpoint` |
 | Business memory | brand voice, banned claims, audience, preferred formats, decisions made | permanent, editable | `businesses.dna` + `learned_style` |
 | Episodic | past approved pieces, past rejections with reasons | permanent | `content_pieces`, `feedback` |
 
