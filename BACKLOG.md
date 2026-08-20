@@ -975,7 +975,7 @@ A1 is the first code to create.
   key set gets `AesGcmCipher` where CI gets `NotConfiguredCipher` — the class of divergence that
   ends in "works in CI, fails on the box", which this repo has already been bitten by once.
   A3's own tests inject the cipher explicitly and are immune; other suites may not be.
-- [ ] **A3-iv · No frontend screen for platform connections** — the four routes exist and are
+- [x] **A3-iv · No frontend screen for platform connections** — the four routes exist and are
   tested; nothing renders them, so a business still cannot connect an account from the UI.
   Deliberately out of A3's scope (routes + tests only).
   **done = a settings screen lists connections with their derived usability, starts a connect,
@@ -1001,6 +1001,20 @@ A1 is the first code to create.
   Exception`: that hides genuine defects, and `platform_oauth.OAuthProvider` documents
   `OAuthError` as the contract today. Worth doing only when a real provider client is written —
   which is itself gated on App Review, so this waits on §B.
+
+- [ ] **A3-vi · A connect flow cannot COMPLETE, and the screen is the thing that proves it**
+  — surfaced by A3-iv, which is why it is filed rather than hidden. `get_oauth_provider` returns
+  `FakeOAuthProvider` for every platform and its authorization URL is
+  `https://fake-oauth.invalid/…` — RFC 2606 reserved, so no browser can ever reach the callback
+  and **no platform connection can be created from the UI at all**. The screen states that
+  instead of rendering a link into a browser error, which is correct behaviour and not a
+  workaround. The only two ways out are (a) a real provider adapter, which is ⛔ on App Review,
+  or (b) a development shortcut that calls the callback directly — and (b) means forging the
+  signed-state cookie flow the CSRF control exists for, so it needs a decision about whether a
+  test-only bypass may exist in a path that guards a real security property. **That is a founder
+  call, not the loop's.** Note this makes the four A3 routes provably correct and, today,
+  un-completable end to end by a human — which is worth saying out loud rather than leaving a
+  reader to discover by clicking.
 
 ## B · ⛔ BLOCKED — what the human must supply, and the exact question
 

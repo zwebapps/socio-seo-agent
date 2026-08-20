@@ -110,6 +110,11 @@ export default function Home() {
                 blurb="The preferences carried into every run — and the exact lines the next one receives."
               />
               <NavRow
+                href="/connections"
+                title="Platform accounts"
+                blurb="Which accounts are connected, and whether a publish step would actually be accepted."
+              />
+              <NavRow
                 href="/onboard"
                 title="Onboard a business"
                 blurb="Paste a website URL and let it read the business for itself."
