@@ -259,8 +259,12 @@ export function Pill({
   // style choice. Measured against `--bg`: `--accent` (#ef7215) as text is 2.54:1, which
   // fails 1.4.3 AA for an 11px label — and this pill is used for a run's
   // `awaiting_approval` state and for the target keyword, both of which are information.
-  // `--accent-ink` on `--accent` measures 6.09:1 light and 7.14:1 dark, and it is the
-  // token that exists for exactly this: it keeps the brand orange instead of darkening it.
+  // `--accent-ink` on `--accent` measures 6.09:1 — MEASURED in the browser against the
+  // shipped stylesheet, not computed from the source — and it is the token that exists for
+  // exactly this: it keeps the brand orange instead of darkening a colour used app-wide.
+  // (The dark palette gives 7.14:1 on the same pair, which is arithmetic about a palette
+  // that does not currently render: `layout.tsx` pins `data-theme="light"` on purpose. It
+  // is checked so that lifting the pin is not a contrast regression.)
   //
   // The other four tones stay text-on-surface because they pass there (`--ok` 5.28:1,
   // `--warn` 4.71:1, `--err` 5.05:1, `--text-muted` 4.6:1 against `--bg`). Filling all
