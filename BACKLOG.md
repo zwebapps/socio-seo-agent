@@ -562,11 +562,20 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   avoids `innerHTML`, a check satisfiable only by deleting the explanation. `vite-raw.d.ts`
   declares the `?raw` suffix that scan imports through, narrowly — a wildcard shim would type
   a typo as `any`.
-- [ ] **`statusTone(status)` remains status-only for callers that have no document.**
+- [x] **`statusTone(status)` remains status-only for callers that have no document.**
   `documentTone(document)` is what the screens use, and it is what lets a zero-passage
   `indexed` file avoid a green pill. The narrower function is kept because a caller with
   only a status string is a real case, but the two must not drift — if a third colour rule
-  appears, fold them.
+  appears, fold them. — the note is now ENFORCED rather than recorded: a drift-guard block
+  in `documents-api.test.ts` asserts the RELATIONSHIP (`documentTone` is `statusTone` plus
+  exactly one documented exception) instead of each function in isolation, which is what
+  the four existing per-function tests did — they would all still pass while the two
+  diverged. It computes which statuses diverge and asserts that set is exactly
+  `["indexed"]`, holds the count irrelevant on every other status, and pins both to the
+  four tones `Pill` can render. Mutation-tested: adding a `failed`+zero-chunk rule to
+  `documentTone` alone turns 3 of 19 red. Note for whoever folds them — `statusTone` has
+  no caller outside `documentTone` and the test file today, so the "real case" it is kept
+  for is still hypothetical
 - [ ] **The Docker `images` CI job is unverified against the new frontend test files.**
   `docker build -f frontend/Dockerfile` ran past 15 minutes locally and was killed. Local
   `pnpm build` exercises the same compile-and-typecheck path with the test files present

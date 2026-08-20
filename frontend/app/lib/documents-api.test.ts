@@ -143,3 +143,57 @@ describe("documentTone", () => {
     expect(documentTone(doc({ status: "failed", chunkCount: 0 }))).toBe("err");
   });
 });
+
+/**
+ * The drift guard.
+ *
+ * Two functions return the same four colours from overlapping inputs, and only ONE of
+ * them is called by a screen. That is a standing invitation to divergence: a colour rule
+ * added to `statusTone` shows up everywhere, a colour rule added to `documentTone` shows
+ * up nowhere else, and either way the tests above still pass because each describes its
+ * own function in isolation.
+ *
+ * So the relationship itself is asserted: `documentTone` IS `statusTone` plus exactly one
+ * documented exception. If a third colour rule appears in either, one of these fails and
+ * the note in BACKLOG.md ("the two must not drift — if a third colour rule appears, fold
+ * them") gets acted on instead of rediscovered.
+ */
+describe("statusTone and documentTone must not drift", () => {
+  // Every status the backend can send, plus values it cannot, because the fallthrough is
+  // part of the contract — an unknown status must be muted rather than throw.
+  const STATUSES = ["indexed", "no_text", "failed", "pending", "quarantined", "", "INDEXED"];
+
+  it("agrees with statusTone on every status when passages exist", () => {
+    for (const status of STATUSES) {
+      expect(documentTone(doc({ status, chunkCount: 3 }))).toBe(statusTone(status));
+    }
+  });
+
+  it("diverges on exactly one input, and that input is the zero-passage indexed file", () => {
+    const diverging = STATUSES.filter(
+      (status) => documentTone(doc({ status, chunkCount: 0 })) !== statusTone(status),
+    );
+
+    expect(diverging).toEqual(["indexed"]);
+  });
+
+  it("keeps the exception narrow: the count only matters while the status is indexed", () => {
+    // A zero count on any OTHER status must not quietly acquire its own colour rule.
+    for (const status of STATUSES.filter((s) => s !== "indexed")) {
+      expect(documentTone(doc({ status, chunkCount: 0 }))).toBe(
+        documentTone(doc({ status, chunkCount: 99 })),
+      );
+    }
+  });
+
+  it("returns one of the four known tones for every input, from both functions", () => {
+    // Neither may grow a fifth tone without `Pill` learning to render it.
+    const tones = ["ok", "warn", "err", "muted"];
+    for (const status of STATUSES) {
+      for (const chunkCount of [0, 1, 99]) {
+        expect(tones).toContain(documentTone(doc({ status, chunkCount })));
+      }
+      expect(tones).toContain(statusTone(status));
+    }
+  });
+});
