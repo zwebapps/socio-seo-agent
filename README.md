@@ -38,12 +38,15 @@ marketers, and small agencies running several clients.
 
 ## Documentation
 
+The architecture, the run, and the attribution loop are **drawn inline below** — you do not
+have to open anything to see how this works. These are for going deeper.
+
 | Document | What it answers |
 |---|---|
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Strategy, scope, honest constraints |
 | [docs/FEATURES.md](docs/FEATURES.md) | Every feature, and how each one produces a lead |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical design; architecture → business benefit |
-| [docs/DIAGRAMS.md](docs/DIAGRAMS.md) | All 14 diagrams: context, request flow, state machine, data model, deployment |
+| [docs/DIAGRAMS.md](docs/DIAGRAMS.md) | All 14 diagrams. The three that matter most are inline below — context, request flow, tool loop, agentic RAG, model routing, data model and deployment are there |
 | [docs/AGENT_RUNTIME.md](docs/AGENT_RUNTIME.md) | How the agents work: state, nodes, tool loop, prompts, memory, caps |
 | [docs/BUILD_ORDER.md](docs/BUILD_ORDER.md) | **The execution plan — build from this** |
 | [docs/CHANNELS.md](docs/CHANNELS.md) | What we can actually publish, and per-platform content |
@@ -207,6 +210,107 @@ convention:
 `tests/test_engine_boundary.py` walks the AST of every module under
 `backend/app/engines/` and fails the build on a forbidden import. The rule was
 installed before the first engine existed, so it can never need retrofitting.
+
+```mermaid
+flowchart TB
+    agents["<b>AGENTS</b> · the LLM decides<br/>plan · prioritise · interpret · write<br/><i>non-deterministic, evaluated</i>"]
+
+    engines["<b>ENGINES</b> · read + compute<br/>crawl · parse · score · count<br/><i>no LLM · no DB · no side effects</i>"]
+
+    actuators["<b>ACTUATORS</b> · external side effects<br/>publish · post · send<br/><i>idempotency key · approval · audit</i>"]
+
+    guard{{"tests/test_engine_boundary.py<br/>fails the build on a forbidden import"}}
+
+    agents -->|"read facts"| engines
+    agents -->|"request action"| actuators
+    engines --> readonly["read-only outside world<br/>HTML · documents · read APIs"]
+    actuators --> writes["mutating outside world<br/>CMS · social · email"]
+    guard -.->|"enforces"| engines
+```
+
+Agents can *request* an action and never perform one. If that boundary rots, every
+guarantee built on top of it silently stops being true — which is why it is a test and
+not a paragraph.
+
+## The run, drawn
+
+Eleven nodes, and every exit is deliberate and named. There is no path that loops
+forever and no path that fails silently — the two ways an autonomous system usually
+burns money.
+
+```mermaid
+stateDiagram-v2
+    [*] --> INTAKE
+
+    INTAKE --> HARVEST: DNA present
+    INTAKE --> [*]: no business DNA — ask, never guess
+
+    HARVEST --> OPPORTUNITY: facts gathered, partial acceptable
+
+    OPPORTUNITY --> PLAN: opportunity chosen
+    OPPORTUNITY --> [*]: none found — return the audit instead
+
+    PLAN --> GENERATE: outline has a target keyword
+    PLAN --> PLAN: outline rejected, retry once
+
+    GENERATE --> CONVERT: the article is written
+    CONVERT --> VALIDATE: landing page + one CTA per channel
+
+    VALIDATE --> GENERATE: draft failed — score below 85 or a banned claim, max 2 loops
+    VALIDATE --> CONVERT: only the landing page failed — the article is fine
+    VALIDATE --> REPACK: passed
+
+    REPACK --> REVIEW
+
+    REVIEW --> EXPORT: approved
+    REVIEW --> GENERATE: edits requested
+    REVIEW --> [*]: rejected, reason feeds the feedback loop
+
+    EXPORT --> MEASURE
+    MEASURE --> [*]
+
+    GENERATE --> PARTIAL: step or cost cap hit
+    VALIDATE --> PARTIAL: still failing after 2 loops
+    VALIDATE --> BLOCKED: a banned claim survived 2 loops
+    BLOCKED --> [*]: publication_blocked — REVIEW is never reached, so it cannot be approved
+    PARTIAL --> [*]: returned with a stated reason, never an infinite loop
+```
+
+**`EXPORT` and `MEASURE` sit after `REVIEW`, and are unreachable without it.** That is
+what makes "nothing publishes without a person" a property of the machine rather than a
+promise in a README. `BLOCKED` never reaches `REVIEW` at all, so a surviving banned claim
+cannot be approved by someone clicking through.
+
+Worth knowing before you run it: on fake providers the canned text genuinely does not
+pass the SEO gate, so a run ends `PARTIAL` after its two revision loops and reports the
+score. That is the diagram working, not a failure.
+
+## How a lead gets attributed
+
+The part that makes this measurable in leads rather than in vibes:
+
+```mermaid
+flowchart TB
+    content["Content piece<br/>article · social post · email"] --> cta["CTA with a short link<br/>/l/{code}"]
+
+    cta --> ig["Instagram / TikTok<br/><b>captions carry no clickable link</b>"]
+    cta --> inline["LinkedIn · Facebook · YouTube · Email<br/>inline link"]
+
+    ig --> hub["Link hub /go/{business}"]
+    hub --> short
+    inline --> short["Short-link service<br/>302 + record channel, piece, campaign"]
+
+    short --> landing["Landing page with a form"]
+    landing --> post["POST /public/forms/{id}<br/>honeypot · rate limit · strict schema"]
+    post --> lead[("leads<br/>content_piece_id · utm · fields")]
+    lead --> notify["Instant notification<br/>email + webhook"]
+    lead --> inbox["Lead inbox<br/>attributed to the piece that caused it"]
+    inbox --> loop["Feeds the next opportunity"]
+```
+
+**Attribution is decoupled from publishing.** The short-link service is ours, so a
+channel we cannot post to is still fully measurable — which is what makes an export-only
+channel worth having.
 
 ## Layout
 
