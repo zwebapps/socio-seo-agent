@@ -92,7 +92,7 @@ export default function ModelsAdminPage() {
   }
 
   return (
-    <main className="mx-auto max-w-5xl px-6 py-12">
+    <main className="mx-auto w-full max-w-[1800px] px-6 lg:px-10 xl:px-14 py-12">
       <header className="mb-10">
         <p
           className="text-[11px] font-semibold uppercase tracking-[0.18em]"
@@ -101,7 +101,7 @@ export default function ModelsAdminPage() {
           Admin · Developer settings
         </p>
         <h1 className="mt-2 text-[28px] font-semibold tracking-tight">Model routing</h1>
-        <p className="mt-2 max-w-2xl text-sm" style={{ color: "var(--text-muted)" }}>
+        <p className="mt-2 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
           Choose which model serves each task, and which providers may be used. Changes
           take effect on the next run — no redeploy. An unconfigured task uses the
           built-in default.

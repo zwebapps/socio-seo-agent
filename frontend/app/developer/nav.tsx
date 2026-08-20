@@ -36,7 +36,7 @@ export function DeveloperNav() {
   const pathname = usePathname();
 
   return (
-    <nav aria-label="Developer settings" className="mx-auto max-w-5xl px-6 pt-10">
+    <nav aria-label="Developer settings" className="mx-auto w-full max-w-[1800px] px-6 lg:px-10 xl:px-14 pt-10">
       <ul className="flex flex-wrap gap-2">
         {SECTIONS.map((section) => {
           // `startsWith` rather than equality, so a future nested route

@@ -30,6 +30,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
+import { Shell } from "@/app/components/page-shell";
 import { Pill, SoftButton, SoftCard, SoftWell } from "@/app/components/soft";
 import { ApiError } from "@/app/lib/api";
 import {
@@ -66,7 +67,7 @@ export default function LeadsPage() {
   }, [load]);
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-12">
+    <Shell className="py-12">
       <p
         className="text-[11px] font-semibold uppercase tracking-[0.18em]"
         style={{ color: "var(--accent)" }}
@@ -74,7 +75,7 @@ export default function LeadsPage() {
         Leads
       </p>
       <h1 className="mt-2 text-[26px] font-semibold tracking-tight">Who got in touch</h1>
-      <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
+      <p className="mt-3 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
         Every lead is recorded against the landing page whose form captured it and the short
         link the visitor arrived by. That chain is what makes a lead traceable to a specific
         piece of content rather than to a guess.
@@ -131,7 +132,7 @@ export default function LeadsPage() {
           Back to the dashboard
         </Link>
       </p>
-    </main>
+    </Shell>
   );
 }
 
@@ -254,14 +255,14 @@ function Attribution({ lead, who }: { lead: Lead; who: string }) {
       </h3>
 
       {nothing && (
-        <p className="mt-2 text-sm" style={{ color: "var(--text-muted)" }}>
+        <p className="mt-2 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
           Nothing recorded. The form was reached without a tracked link, so this lead cannot
           be attributed to a piece of content.
         </p>
       )}
 
       {lead.contentPieceId && (
-        <p className="mt-2 text-sm">
+        <p className="mt-2 max-w-[70ch] text-sm">
           <a
             href={landingPageUrl(lead.contentPieceId)}
             target="_blank"

@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+
+import { Shell } from "@/app/components/page-shell";
 import {
   ApiError,
   confirmOnboarding,
@@ -51,7 +53,7 @@ export default function OnboardPage() {
   }
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-14">
+    <Shell className="py-14">
       <p
         className="text-xs font-semibold uppercase tracking-widest"
         style={{ color: "var(--accent)" }}
@@ -104,7 +106,7 @@ export default function OnboardPage() {
           </>
         )}
       </div>
-    </main>
+    </Shell>
   );
 }
 
@@ -171,11 +173,11 @@ function Confirm({
       >
         {state.kind === "saving" ? "Saving…" : "This is correct — save it"}
       </button>
-      <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+      <p className="mt-2 max-w-[70ch] text-xs" style={{ color: "var(--text-muted)" }}>
         Until you save, this draft is not used by anything.
       </p>
       {state.kind === "failed" ? (
-        <p className="mt-2 text-sm" style={{ color: "var(--err)" }}>
+        <p className="mt-2 max-w-[70ch] text-sm" style={{ color: "var(--err)" }}>
           {state.message}
         </p>
       ) : null}
@@ -221,7 +223,7 @@ function ErrorPanel({ code, message }: { code: string; message: string }) {
         {message}
       </p>
       {nextStep[code] && (
-        <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
+        <p className="mt-3 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
           {nextStep[code]}
         </p>
       )}

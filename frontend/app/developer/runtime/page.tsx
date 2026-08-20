@@ -60,7 +60,7 @@ export default function RuntimePage() {
   const error = sampling.error ?? prompts.error;
 
   return (
-    <main className="mx-auto max-w-5xl px-6 py-12">
+    <main className="mx-auto w-full max-w-[1800px] px-6 lg:px-10 xl:px-14 py-12">
       <PageHeader title="Sampling and prompts">
         How much freedom each task class gets, and how long its answer may be. Changes take
         effect on the next run — no redeploy. A task with nothing set sends no sampling

@@ -19,15 +19,22 @@
  * API is unreachable" is a designed state rather than a build-time failure, which is why the
  * backend status element survives at the bottom of the page.
  *
- * Two columns at `lg:`, inside `max-w-5xl`. At `max-w-2xl` this was a 672px column on a
- * 1440px screen and read as unfinished rather than as restraint. The split is at `lg:` and
- * not `md:` because the right column is a list of runs whose rows carry their own wrapped
- * text; breaking the page at tablet width puts a list inside a grid inside about 350px.
+ * Two columns at `lg:`, inside the shared `Shell` (fills the viewport to 1800px). It was
+ * `max-w-5xl` — a 1024px column on a 1440px screen, which read as unfinished rather than
+ * as restraint, the same complaint the earlier `max-w-2xl` earned. The split is at `lg:`
+ * and not `md:` because the right column is a list of runs whose rows carry their own
+ * wrapped text; breaking the page at tablet width puts a list inside a grid inside about
+ * 350px. The extra room at `xl:` goes to that list rather than to the goal input: a text
+ * field does not read better at 800px, and a run row with a wrapped stop-reason does —
+ * but it needs SOME of it: at 22rem the goal input and its button shared 352px and the
+ * placeholder truncated mid-word, so the left column grows to 26/30rem and the rest of
+ * the gain still goes right.
  */
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
+import { Shell } from "@/app/components/page-shell";
 import { RunRows, useRuns } from "@/app/components/run-rows";
 import { Pill, SoftButton, SoftCard } from "@/app/components/soft";
 import { StartRunForm } from "@/app/components/start-run";
@@ -52,7 +59,7 @@ export default function Home() {
   const { state: runs, live, reload } = useRuns(RECENT_RUNS);
 
   return (
-    <main className="mx-auto max-w-5xl px-6 py-14">
+    <Shell className="py-14">
       <p
         className="text-[11px] font-semibold uppercase tracking-[0.18em]"
         style={{ color: "var(--accent)" }}
@@ -62,13 +69,16 @@ export default function Home() {
       <h1 className="mt-2 text-[28px] font-semibold tracking-tight">
         Social Marketing Agent
       </h1>
-      <p className="mt-3 max-w-2xl text-base" style={{ color: "var(--text-muted)" }}>
+      <p className="mt-3 max-w-[70ch] text-base" style={{ color: "var(--text-muted)" }}>
         Give it a goal. It gathers evidence about your business, picks something worth
         writing, writes it, scores it against the SEO rules, adapts it per channel — and
         hands it back to you to approve.
       </p>
 
-      <div className="mt-10 grid items-start gap-10 lg:grid-cols-2 lg:gap-14">
+      {/* Two columns from `lg`, and the right-hand list gets the extra room at `xl`
+          rather than the form growing: a goal input does not read better at 800px, and
+          a list of runs with wrapped goals and stop-reasons does. */}
+      <div className="mt-10 grid items-start gap-10 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(0,30rem)_minmax(0,1fr)] lg:gap-14 xl:gap-20">
         {/* Left: the thing to DO. */}
         <div>
           <SoftCard className="p-6" size="lg">
@@ -152,7 +162,7 @@ export default function Home() {
       </div>
 
       <BackendStatus />
-    </main>
+    </Shell>
   );
 }
 

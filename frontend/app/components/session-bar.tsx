@@ -83,7 +83,7 @@ export function SessionBar() {
 
   return (
     <div
-      className="mx-auto flex max-w-5xl flex-wrap items-center justify-end gap-3 px-6 pt-6"
+      className="mx-auto flex w-full max-w-[1800px] flex-wrap items-center justify-end gap-3 px-6 pt-6 lg:px-10 xl:px-14"
       // `aria-live` so the sign-out transition is announced rather than silently
       // replacing the row a screen-reader user was on.
       aria-live="polite"

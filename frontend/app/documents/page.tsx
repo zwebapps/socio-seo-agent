@@ -30,6 +30,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { Shell } from "@/app/components/page-shell";
 import { Pill, SoftButton, SoftCard, SoftWell } from "@/app/components/soft";
 import { ApiError } from "@/app/lib/api";
 import {
@@ -119,7 +120,7 @@ export default function DocumentsPage() {
   }
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-12">
+    <Shell className="py-12">
       <p
         className="text-[11px] font-semibold uppercase tracking-[0.18em]"
         style={{ color: "var(--accent)" }}
@@ -127,7 +128,7 @@ export default function DocumentsPage() {
         Knowledge base
       </p>
       <h1 className="mt-2 text-[26px] font-semibold tracking-tight">Your own material</h1>
-      <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
+      <p className="mt-3 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
         Upload the documents that already contain your answers — a price list, a service
         sheet, a quote explainer. The agent reads them when it decides what to write, when
         it outlines a page, and when it looks for a proof point, so what it publishes says
@@ -136,7 +137,7 @@ export default function DocumentsPage() {
 
       <SoftCard className="mt-8 p-6" size="lg">
         <h2 className="text-sm font-semibold">Add a document</h2>
-        <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+        <p className="mt-2 max-w-[70ch] text-xs" style={{ color: "var(--text-muted)" }}>
           {ACCEPTED_SUFFIXES.join(", ")} — up to 25 MB. Indexing takes a few seconds and
           happens while you wait, so you find out straight away whether the file could be
           read.
@@ -229,7 +230,7 @@ export default function DocumentsPage() {
           Back to the dashboard
         </Link>
       </p>
-    </main>
+    </Shell>
   );
 }
 

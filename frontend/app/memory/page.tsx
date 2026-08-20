@@ -31,6 +31,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { Shell } from "@/app/components/page-shell";
 import { Pill, SoftButton, SoftCard, SoftInput, SoftWell } from "../components/soft";
 import { ApiError } from "../lib/api";
 import {
@@ -102,7 +103,7 @@ export default function MemoryPage() {
   );
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-12">
+    <Shell className="py-12">
       <p
         className="text-[11px] font-semibold uppercase tracking-[0.18em]"
         style={{ color: "var(--accent)" }}
@@ -112,7 +113,7 @@ export default function MemoryPage() {
       <h1 className="mt-2 text-[26px] font-semibold tracking-tight">
         What I remember about your business
       </h1>
-      <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
+      <p className="mt-3 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
         These are carried into every run — read once when a run starts, then included in
         the instructions for every step of it. Change them here and the next run obeys the
         change without being told again.
@@ -178,7 +179,7 @@ export default function MemoryPage() {
           <FromOnboarding memory={memory} />
         </>
       )}
-    </main>
+    </Shell>
   );
 }
 
@@ -303,7 +304,7 @@ function Preferences({
             Remember this
           </SoftButton>
         </div>
-        <p id="new-preference-help" className="mt-2 text-xs" style={{ color: "var(--text-faint)" }}>
+        <p id="new-preference-help" className="mt-2 max-w-[70ch] text-xs" style={{ color: "var(--text-faint)" }}>
           {full ? (
             <span style={{ color: "var(--warn)" }}>
               You have the maximum of {memory.maxPreferences}. Remove one before adding
@@ -407,7 +408,7 @@ function PreferenceRow({
                 Cancel
               </SoftButton>
             </div>
-            <p id={`counter-${id}`} className="mt-2 text-xs" style={{ color: "var(--text-faint)" }}>
+            <p id={`counter-${id}`} className="mt-2 max-w-[70ch] text-xs" style={{ color: "var(--text-faint)" }}>
               <span
                 className="tabular"
                 style={{ color: text.trim().length > maxLength ? "var(--warn)" : undefined }}

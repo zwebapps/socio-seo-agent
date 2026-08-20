@@ -47,7 +47,7 @@ export default function ToolsPage() {
   const tools = useAdminResource(useCallback(() => adminApi.tools(), []));
 
   return (
-    <main className="mx-auto max-w-5xl px-6 py-12">
+    <main className="mx-auto w-full max-w-[1800px] px-6 lg:px-10 xl:px-14 py-12">
       <PageHeader title="Tool access">
         What each node in the graph is allowed to call. Tools can be switched off here and
         cannot be switched on — see below for why.

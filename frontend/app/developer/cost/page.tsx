@@ -41,7 +41,7 @@ export default function CostPage() {
   );
 
   return (
-    <main className="mx-auto max-w-5xl px-6 py-12">
+    <main className="mx-auto w-full max-w-[1800px] px-6 lg:px-10 xl:px-14 py-12">
       <PageHeader title="Cost">
         Model spend for your own business, summed from the <code>model_usage</code> ledger.
         The ledger is under row-level security and is read as your business, so these are
@@ -81,7 +81,7 @@ export default function CostPage() {
             <SoftCard className="p-6" size="md">
               <div className="flex flex-wrap items-start gap-3">
                 <Pill tone="warn">not recorded</Pill>
-                <p className="max-w-2xl text-sm leading-relaxed">{cost.data.report.message}</p>
+                <p className="max-w-[70ch] text-sm leading-relaxed">{cost.data.report.message}</p>
               </div>
               <p className="mt-4 text-xs leading-relaxed" style={{ color: "var(--text-muted)" }}>
                 The breakdowns below are the queries that will answer this once usage is
