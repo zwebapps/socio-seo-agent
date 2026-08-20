@@ -21,17 +21,36 @@ instruction, so the count is not its job.
     result.removed       # how many had to be taken out
     result.shortfall     # how many are still missing (never fabricated)
 
-Limits arrive as **arguments**, not from a table in this module. There are already
-two channel-limit tables in this repo that disagree with each other
-(`agents/nodes.CHANNEL_LIMITS` holds plain int ceilings under different channel
-names; `evals/rubric.CHANNEL_LIMITS` holds the richer spec the rubric grades
-against), and adding a third would make the drift worse. A caller passes the
-numbers it is held to; when the `channel_specs` table lands in Phase 6 it becomes
-the single source and nothing here changes.
+Limits arrive as **arguments**, not from a table in `hashtags.py`. There used to be
+two channel-limit tables in this repo that disagreed with each other, and the
+resolution is `specs.py` next door: ONE table, keyed on the channel names the
+product already stores, with the eval harness's names as aliases. A caller reads
+`spec_for(channel)` and passes the numbers it is held to, so this module still
+computes rather than deciding -- which is what keeps it usable by both the runtime
+and the rubric that grades the runtime.
 
 No I/O, no model, no database -- `tests/test_engine_boundary.py` enforces that.
 """
 
 from backend.app.engines.channel.hashtags import HashtagEnforcement, enforce_hashtags
+from backend.app.engines.channel.specs import (
+    CHANNEL_ALIASES,
+    CHANNEL_SPECS,
+    ChannelSpec,
+    canonical_channel,
+    hard_char_limits,
+    has_spec,
+    spec_for,
+)
 
-__all__ = ["HashtagEnforcement", "enforce_hashtags"]
+__all__ = [
+    "CHANNEL_ALIASES",
+    "CHANNEL_SPECS",
+    "ChannelSpec",
+    "HashtagEnforcement",
+    "canonical_channel",
+    "enforce_hashtags",
+    "hard_char_limits",
+    "has_spec",
+    "spec_for",
+]

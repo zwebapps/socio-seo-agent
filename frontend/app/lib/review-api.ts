@@ -41,12 +41,29 @@ export type SeoReport = {
 export type SocialPost = {
   channel: string;
   body: string;
-  /**
-   * Measured server-side. There is deliberately no per-channel limit on the wire: two
-   * limit tables already disagree in the backend, so the review screen does not publish
-   * a third. REPACK has already trimmed to its ceiling by the time a post is stored.
-   */
+  /** Measured server-side, so the count on the screen is the count the server took. */
   characters: number;
+  /** What REPACK asked the model for and code then brought inside the channel's range. */
+  hashtags: string[];
+  /**
+   * How many hashtags code had to remove, and how many are still missing.
+   *
+   * Rendered, not hidden. This is evidence about the MODEL: three tidy hashtags shown
+   * without saying five were cut out in code reports the renderer's competence as the
+   * model's. `shortfall` is never filled by inventing a tag.
+   */
+  hashtagsRemoved: number;
+  hashtagsShortfall: number;
+  /**
+   * The channel's editorial target, its platform ceiling, and its hashtag cap — from the
+   * one spec table the runtime renders to and the eval grades against. `null` for a
+   * channel that table does not cover, because "0 / 0" would be a false limit.
+   */
+  characterTarget: number | null;
+  characterLimit: number | null;
+  hashtagLimit: number | null;
+  /** Over the target, inside the limit: publishable, and longer than it should be. */
+  overTarget: boolean;
 };
 
 export type AiBlocks = {

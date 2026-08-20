@@ -113,7 +113,20 @@ class AgentState(TypedDict):
     #: dumped to primitives, because this is checkpointed to a JSONB column and a
     #: state that cannot serialise cannot resume.
     landing_page: NotRequired[dict[str, Any] | None]
-    renderings: dict[str, str]
+    #: Channel -> the finished post for that channel, as
+    #: ``{"body", "hashtags", "hashtags_removed", "hashtags_shortfall", "over_target"}``.
+    #:
+    #: A dict rather than the bare body string it used to be, because REPACK asks the
+    #: model for hashtags and was throwing them away: `REPACK_TOOL` accepts
+    #: `posts[].hashtags`, the node stored only the body, so they never reached the
+    #: checkpoint and the review screen could not show them. The enforcement counters
+    #: travel with the post for a second reason -- `removed` is evidence about the
+    #: MODEL, and a screen that shows a clean post without saying nine hashtags were
+    #: cut out of it is reporting the renderer's competence as the model's.
+    #:
+    #: Checkpoints written before this change hold a plain string here. Readers must
+    #: tolerate both; nothing migrates a JSONB column for a display field.
+    renderings: dict[str, dict[str, Any]]
 
     # Deterministic verdicts.
     seo_report: NotRequired[dict[str, Any] | None]

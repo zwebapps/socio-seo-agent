@@ -502,8 +502,12 @@ function SocialPanel({ posts, note }: { posts: SocialPost[]; note: string | null
               {CHANNEL_LABEL[post.channel] ?? post.channel}
             </h3>
             <div className="flex items-center gap-3">
-              <span className="tabular text-[11px]" style={{ color: "var(--text-faint)" }}>
-                {post.characters} characters
+              <span className="tabular text-[11px]" style={{ color: "var(--text-muted)" }}>
+                {/* Against the channel's own target when there is one, because "1,240
+                    characters" answers nothing on its own. */}
+                {post.characters.toLocaleString()}
+                {post.characterTarget !== null && ` / ${post.characterTarget.toLocaleString()}`}{" "}
+                characters
               </span>
               <CopyButton text={post.body} label={`Copy the ${post.channel} post`} />
             </div>
@@ -513,14 +517,84 @@ function SocialPanel({ posts, note }: { posts: SocialPost[]; note: string | null
               {post.body}
             </p>
           </SoftWell>
+
+          {post.hashtags.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-center gap-1.5">
+              {post.hashtags.map((tag) => (
+                <span
+                  key={tag}
+                  className="soft-flat px-2 py-0.5 text-[11px] font-medium"
+                  style={{ borderRadius: "var(--r-pill)", color: "var(--text-muted)" }}
+                >
+                  {tag}
+                </span>
+              ))}
+              {post.hashtagLimit !== null && (
+                <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                  max {post.hashtagLimit}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/*
+            What code had to correct, said out loud. A clean post shown without this
+            credits the model for the renderer's work — and the hashtag engine exists
+            because a measured run produced 21 tags against a prompt whose last line
+            said "Keine Hashtags".
+          */}
+          <PostNotes post={post} />
         </SoftCard>
       ))}
-      <p className="text-xs" style={{ color: "var(--text-faint)" }}>
-        Length was already enforced in code when the post was written — the model is never
-        asked to count characters, because it gets it wrong and the platform then rejects
-        the post.
+      <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+        Length and hashtag counts were enforced in code after the post was written — the
+        model is never asked to count, because it gets it wrong and the platform then
+        rejects the post. The targets shown are the same ones the evaluation grades
+        against.
       </p>
     </div>
+  );
+}
+
+/**
+ * The corrections and the shortfalls, or nothing at all.
+ *
+ * Three different facts, and they are not interchangeable. `removed` is work code did
+ * that the model should not have needed. `shortfall` is a gap deliberately left open —
+ * the engine refuses to fabricate a hashtag, so a channel wanting three and given one
+ * says so. `overTarget` is publishable copy that is longer than it should be, which is
+ * NOT the same as a post the platform would reject.
+ */
+function PostNotes({ post }: { post: SocialPost }) {
+  const notes: string[] = [];
+  if (post.hashtagsRemoved > 0) {
+    notes.push(
+      `${post.hashtagsRemoved} hashtag${post.hashtagsRemoved === 1 ? "" : "s"} removed to ` +
+        `stay inside this channel's cap`,
+    );
+  }
+  if (post.hashtagsShortfall > 0) {
+    notes.push(
+      `${post.hashtagsShortfall} short of this channel's hashtag minimum — none were ` +
+        `invented to fill it`,
+    );
+  }
+  if (post.overTarget && post.characterTarget !== null) {
+    notes.push(
+      `over the ${post.characterTarget.toLocaleString()}-character target, inside the ` +
+        `platform limit — publishable, and longer than it should be`,
+    );
+  }
+  if (notes.length === 0) return null;
+
+  return (
+    <ul className="mt-3 space-y-1">
+      {notes.map((note) => (
+        <li key={note} className="text-[11px]" style={{ color: "var(--warn)" }}>
+          {note}
+        </li>
+      ))}
+    </ul>
   );
 }
 

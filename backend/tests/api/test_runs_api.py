@@ -156,7 +156,15 @@ async def _reviewable_run(service: RunService) -> UUID:
             }
         ],
     }
-    state["renderings"] = {"linkedin": "Kurz erklärt: was ein Notar beurkundet."}
+    state["renderings"] = {
+        "linkedin": {
+            "body": "Kurz erklärt: was ein Notar beurkundet.",
+            "hashtags": [],
+            "hashtags_removed": 0,
+            "hashtags_shortfall": 0,
+            "over_target": False,
+        }
+    }
     state["fact_gaps"] = ["uploaded documents"]
     await service.checkpoint(run.id, state=state, current_node="REVIEW")
     await service.await_approval(run.id)

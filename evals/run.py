@@ -71,7 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # by default would bill every run. `--live` loads it explicitly inside `main()` -- and
 # then asserts it actually got a provider, so the flag cannot claim to spend money
 # while quietly measuring FakeProvider.
-from backend.app.engines.channel import HashtagEnforcement, enforce_hashtags
+from backend.app.engines.channel import HashtagEnforcement, enforce_hashtags, spec_for
 from backend.app.llm.contract import BudgetState, Message, ModelTier, Role, TaskClass
 from backend.app.llm.router import TASK_TIERS, TIER_CHAINS, ModelRouter, config_status
 from backend.app.obs import Tracer, get_tracer, llm_span_fields, tracing_status
@@ -82,7 +82,6 @@ from backend.app.services.kb_service import (
 )
 from evals.dataset import CASES, EvalCase
 from evals.rubric import (
-    CHANNEL_LIMITS,
     ChannelLimits,
     Rendering,
     RubricResult,
@@ -494,7 +493,7 @@ def _user_prompt_v1(case: EvalCase, passages: Mapping[str, str] | None) -> str:
     prompts -- the model was never actually breaching a hashtag cap, so that engine is
     currently insurance rather than load-bearing.
     """
-    limits = CHANNEL_LIMITS[case.channel]
+    limits = spec_for(case.channel)
     parts = [
         f"Business: {case.business.name}, {case.business.vertical} in "
         f"{case.business.city}. Services: {', '.join(case.business.services)}.",
@@ -517,7 +516,7 @@ def _user_prompt_v1(case: EvalCase, passages: Mapping[str, str] | None) -> str:
 
 
 def _user_prompt_v2(case: EvalCase, passages: Mapping[str, str] | None) -> str:
-    limits = CHANNEL_LIMITS[case.channel]
+    limits = spec_for(case.channel)
     rules = _format_rules(case.channel, limits)
     parts = [
         f"Business: {case.business.name}, {case.business.vertical} in "
@@ -590,7 +589,7 @@ def _enforce_channel_format(case: EvalCase, text: str) -> HashtagEnforcement:
     formatting it -- so length stays a genuine measurement of the model, which is
     why the `format` column can still fail on it.
     """
-    limits = CHANNEL_LIMITS[case.channel]
+    limits = spec_for(case.channel)
     return enforce_hashtags(
         text,
         minimum=limits.hashtags_min,
@@ -1214,10 +1213,11 @@ def _render_limitations() -> list[str]:
         "5. **Retrieval quality beyond term overlap.** The harness embeds with a hashed "
         "bag of words, so a synonym does not retrieve. A retrieval miss here may be the "
         "embedder rather than the query rewrite.",
-        "6. **Channel limits.** `CHANNEL_LIMITS` mirrors `docs/CHANNELS.md` §6, whose own "
-        "instruction is to verify every number against provider documentation. Until the "
-        "`channel_specs` config table lands, the rubric holds a second copy of those "
-        "limits, which is exactly the drift risk the table exists to prevent.",
+        "6. **Channel limits.** The rubric now grades against the SAME table the runtime "
+        "renders to (`backend/app/engines/channel/specs.py`), so the eval can no longer "
+        "disagree with the product it is grading -- the second copy that used to live here "
+        "is gone. The numbers themselves still carry `docs/CHANNELS.md` §6's own "
+        "instruction: verify every one against provider documentation.",
         "7. **Prompt v1 vs v2 and cheap vs strong model.** `docs/BUILD_ORDER.md` Phase 12 "
         "asks for both comparisons. Neither is implemented: there is one harness prompt "
         "per arm and the router picks the tier. The columns are absent rather than "

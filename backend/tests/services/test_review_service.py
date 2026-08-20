@@ -163,11 +163,58 @@ def test_the_fix_hint_survives_verbatim_because_it_is_the_actionable_half() -> N
 
 
 def test_a_social_post_carries_the_character_count_the_server_measured() -> None:
-    """Arithmetic over the text in hand. Deliberately NOT a per-channel limit: two limit
-    tables already disagree in this repo, and publishing one would make this a third."""
+    """Arithmetic over the text in hand."""
     review = project_review({"renderings": {"linkedin": "abcde"}})
 
     assert review.social[0].characters == 5
+
+
+def test_an_old_flat_string_rendering_still_projects() -> None:
+    """REPACK stored a bare body string before hashtags were kept, and those rows are
+    still in the database. Nothing migrates a JSONB display field, so an older run must
+    keep rendering -- with no hashtag information, which is true of it."""
+    review = project_review({"renderings": {"linkedin": "Kurz erklärt."}})
+
+    post = review.social[0]
+    assert post.body == "Kurz erklärt."
+    assert post.hashtags == ()
+    assert post.hashtags_removed == 0
+
+
+def test_a_social_post_carries_the_hashtags_and_the_limits_it_was_held_to() -> None:
+    """The limits ship now because there is one spec table the runtime renders to and
+    the rubric grades against -- so the number on the screen is the number the post was
+    actually held to, rather than a third copy that can contradict either."""
+    review = project_review(
+        {
+            "renderings": {
+                "linkedin": {
+                    "body": "Kurz erklärt. #Notar",
+                    "hashtags": ["#Notar"],
+                    "hashtags_removed": 4,
+                    "hashtags_shortfall": 0,
+                    "over_target": False,
+                }
+            }
+        }
+    )
+
+    post = review.social[0]
+    assert post.hashtags == ("#Notar",)
+    assert post.hashtags_removed == 4, "what code had to cut is evidence about the model"
+    assert post.character_target == 1_700
+    assert post.character_limit == 3_000
+    assert post.hashtag_limit == 3
+
+
+def test_a_channel_with_no_spec_reports_no_limits_rather_than_zeros() -> None:
+    """`0 / 0` would be a false limit, and a screen showing one is worse than a screen
+    showing none."""
+    review = project_review({"renderings": {"pigeon_post": {"body": "hello"}}})
+
+    post = review.social[0]
+    assert post.character_limit is None
+    assert post.hashtag_limit is None
 
 
 def test_the_projection_does_not_re_sort_the_channels() -> None:
@@ -252,7 +299,15 @@ def test_the_projection_reads_a_checkpoint_the_real_state_produced() -> None:
             locale="de",
         )
     ).model_dump(mode="json")
-    state["renderings"] = {"linkedin": "Was ein Notar beurkundet — kurz erklärt."}
+    state["renderings"] = {
+        "linkedin": {
+            "body": "Was ein Notar beurkundet — kurz erklärt. #Notar",
+            "hashtags": ["#Notar"],
+            "hashtags_removed": 0,
+            "hashtags_shortfall": 0,
+            "over_target": False,
+        }
+    }
     state["fact_gaps"] = ["uploaded documents"]
     state["cost_usd"] = Decimal("0.0123")
 

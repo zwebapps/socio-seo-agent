@@ -47,6 +47,7 @@ from backend.app.agents.nodes.prompts import (
 )
 from backend.app.agents.state import AgentState, NodeError
 from backend.app.agents.tools import (
+    CHANNEL_VALIDATE,
     CLAIMS_CHECK,
     CRAWL_SITE,
     KB_SEARCH,
@@ -57,6 +58,13 @@ from backend.app.agents.tools import (
     NodeToolbox,
     ToolImpl,
     ToolNotAllowedError,
+)
+from backend.app.engines.channel import (
+    CHANNEL_SPECS,
+    ChannelSpec,
+    canonical_channel,
+    enforce_hashtags,
+    hard_char_limits,
 )
 from backend.app.engines.claims import ClaimCheckRequest, check_claims
 from backend.app.engines.landing import (
@@ -84,12 +92,15 @@ Node = Callable[[AgentState], Awaitable[dict[str, Any]]]
 #: Hard character ceilings per channel. Length is arithmetic, so Python enforces it
 #: after generation rather than asking the model to count -- it will get it wrong, and
 #: the platform will reject the post.
-CHANNEL_LIMITS: Mapping[str, int] = {
-    "linkedin": 3000,
-    "facebook": 2000,
-    "instagram": 2200,
-    "x": 280,
-}
+#:
+#: DERIVED, not declared. This used to be its own table and it disagreed with the one
+#: the eval harness graded against -- different channel names, and LinkedIn's 3,000
+#: was a plain ceiling here and a *hard* max there. It is now the platform reject
+#: thresholds out of `engines/channel/specs.py`, which the rubric reads too. Note what
+#: that changed: Facebook's ceiling is its real 63,206 rather than the 2,000 that used
+#: to live here, because 2,000 is an editorial target and truncating good copy at a
+#: target is not enforcement. Being over the target is REPORTED instead (see `repack`).
+CHANNEL_LIMITS: Mapping[str, int] = hard_char_limits()
 
 DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
 
@@ -165,6 +176,13 @@ def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
         # Same reasoning: a landing page whose conversion audit was skipped because
         # nobody wired it would look like a page that passed.
         LANDING_CHECK: check_landing_page,
+        # Granted to REPACK since the allowlist was written, and implemented by
+        # nothing until now -- so `enforce_hashtags` had never once run inside a run,
+        # and the engine's own measured finding (a prompt ending in the literal words
+        # "Keine Hashtags" produced 21 of them) was going uncorrected in the product
+        # while being corrected in the eval harness. Deterministic, so always
+        # available for the same reason the two guards above are.
+        CHANNEL_VALIDATE: enforce_hashtags,
     }
     return {name: impl for name, impl in candidates.items() if impl is not None}
 
@@ -698,18 +716,27 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             tool=REPACK_TOOL,
         )
         banned = [str(c) for c in (state["dna"].get("banned_claims") or [])]
-        renderings: dict[str, str] = {}
+        renderings: dict[str, dict[str, Any]] = {}
         blocked: list[NodeError] = []
         for post in (args or {}).get("posts", []):
             channel = str(post.get("channel", "")).lower().strip()
             body = str(post.get("body", "")).strip()
             if not channel or not body:
                 continue
-            limit = CHANNEL_LIMITS.get(channel)
+            spec = CHANNEL_SPECS.get(canonical_channel(channel))
+            limit = CHANNEL_LIMITS.get(canonical_channel(channel))
             if limit and len(body) > limit:
                 # Trim on a word boundary. The platform would reject the post
                 # outright, so shipping it over-length is not an option.
                 body = body[: limit - 1].rsplit(" ", 1)[0] + "…"
+
+            # Hashtags: the model's declared list AND whatever it wrote inline, both
+            # brought inside the channel's range in code. The engine's docstring
+            # explains why this is not the model's job -- a count is arithmetic, and a
+            # negative count instruction is the one kind a model reliably disobeys.
+            body, tags, removed, shortfall = await _bring_hashtags_in_range(
+                box, spec, body, post.get("hashtags")
+            )
 
             # Checked AFTER trimming, because the trimmed text is what would be
             # published. A rendering is separate content from the page: the page can
@@ -733,7 +760,17 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                     )
                 )
                 continue
-            renderings[channel] = body
+            renderings[channel] = {
+                "body": body,
+                "hashtags": list(tags),
+                "hashtags_removed": removed,
+                "hashtags_shortfall": shortfall,
+                # Over the EDITORIAL target, which is not the same as over the
+                # platform's limit and must not be treated as one: a 1,900-character
+                # LinkedIn post publishes fine and is simply longer than it should be.
+                # Reported so the review screen can say so; never truncated to it.
+                "over_target": bool(spec and len(body) > spec.max_chars),
+            }
 
         updates: dict[str, Any] = {"renderings": renderings, "_cost": cost}
         if blocked:
@@ -755,6 +792,73 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         "REPACK": repack,
         "REVIEW": review,
     }
+
+
+async def _bring_hashtags_in_range(
+    box: NodeToolbox,
+    spec: ChannelSpec | None,
+    body: str,
+    declared: Any,
+) -> tuple[str, list[str], int, int]:
+    """Enforce the channel's hashtag range, and return the tags that survived.
+
+    Two sources have to be reconciled, because the model uses both: hashtags written
+    INLINE in the post, and the separate ``hashtags`` array `REPACK_TOOL` asks for.
+    The body is the published artifact, so `channel.validate` runs on that; the
+    declared array then tops the list up to the cap, in the order the model gave, and
+    only with tags the body does not already carry.
+
+    A shortfall is reported and never filled. Inventing ``#Zahnarzt`` here would be a
+    node writing marketing copy from a counter, and the engine refuses to do it for
+    exactly that reason -- so a channel wanting three tags and given one says so.
+
+    A channel with no spec (a run configured for something the spec table does not
+    cover) is left alone rather than defaulted to zero: silently stripping every
+    hashtag off a post because we have no numbers for it would be enforcement by
+    accident.
+    """
+    if spec is None:
+        return body, _clean_tags(declared), 0, 0
+
+    if box.available(CHANNEL_VALIDATE):
+        result = await box.call(
+            CHANNEL_VALIDATE, body, minimum=spec.hashtags_min, maximum=spec.hashtags_max
+        )
+        body = result.text
+        inline = list(result.kept)
+        removed = result.removed
+    else:
+        # Refused or unwired: the counters must then say nothing was enforced rather
+        # than reporting a clean zero that looks like a compliant post.
+        inline = []
+        removed = 0
+
+    tags = list(inline)
+    for tag in _clean_tags(declared):
+        if len(tags) >= spec.hashtags_max:
+            break
+        if tag.lower() not in {existing.lower() for existing in tags}:
+            tags.append(tag)
+
+    return body, tags, removed, max(0, spec.hashtags_min - len(tags))
+
+
+def _clean_tags(declared: Any) -> list[str]:
+    """The model's ``hashtags`` array, de-duplicated and prefixed, order preserved."""
+    if not isinstance(declared, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in declared:
+        text = str(item).strip().lstrip("#").strip()
+        if not text:
+            continue
+        tag = f"#{text}"
+        if tag.lower() in seen:
+            continue
+        seen.add(tag.lower())
+        out.append(tag)
+    return out
 
 
 def _cta_channels(channels: tuple[str, ...]) -> tuple[str, ...]:

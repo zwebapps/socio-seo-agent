@@ -42,6 +42,8 @@ from typing import Any, Final
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
+from backend.app.engines.channel import CHANNEL_SPECS, canonical_channel
+
 __all__ = [
     "AiBlocks",
     "Draft",
@@ -131,12 +133,34 @@ class SocialPost(_Wire):
     """One channel's copy.
 
     ``characters`` is computed here rather than in the client so the count on the screen
-    is the count the server measured. See the module docstring for why no limit ships.
+    is the count the server measured.
+
+    The limits DO ship now, and the module docstring records why that changed: there is
+    one channel spec table (``engines/channel/specs.py``) that the runtime renders to and
+    the eval grades against, so publishing the numbers is no longer minting a third copy
+    that can contradict either.
+
+    ``hashtags_removed`` is the uncomfortable field and the one most worth keeping. It is
+    evidence about the MODEL: a screen that shows three tidy hashtags without saying five
+    were cut out in code is reporting the renderer's competence as the model's.
     """
 
     channel: str
     body: str
     characters: int
+    hashtags: tuple[str, ...] = ()
+    #: How many hashtags code had to remove, and how many are still missing. Both zero
+    #: on a post the model got right, which is the point of showing them.
+    hashtags_removed: int = 0
+    hashtags_shortfall: int = 0
+    #: The channel's editorial target and its platform ceiling. ``None`` for a channel
+    #: the spec table does not cover -- rendering "0 / 0" there would be a false limit.
+    character_target: int | None = None
+    character_limit: int | None = None
+    hashtag_limit: int | None = None
+    #: Over the editorial target but inside the platform limit: publishable, and longer
+    #: than it should be. A different fact from "too long", and reported as one.
+    over_target: bool = False
 
 
 class AiBlocks(_Wire):
@@ -295,12 +319,41 @@ def _social(checkpoint: Mapping[str, Any]) -> tuple[SocialPost, ...]:
     if not isinstance(raw, Mapping):
         return ()
     posts: list[SocialPost] = []
-    for channel, body in raw.items():
+    for channel, value in raw.items():
+        # Two shapes, and both are real rows in the database. REPACK used to store the
+        # bare body string; it now stores a mapping so the hashtags it asked the model
+        # for survive to this screen. Nothing migrates a JSONB display field, so an
+        # older run must keep rendering -- as a post with no hashtag information, which
+        # is true of it.
+        if isinstance(value, Mapping):
+            body: Any = value.get("body")
+            tags = _strings(value.get("hashtags"))
+            removed = _int(value.get("hashtags_removed"))
+            shortfall = _int(value.get("hashtags_shortfall"))
+            over = bool(value.get("over_target", False))
+        else:
+            body, tags, removed, shortfall, over = value, (), 0, 0, False
+
         name = _text(channel).strip()
         text = _text(body).strip()
         if not name or not text:
             continue
-        posts.append(SocialPost(channel=name, body=text, characters=len(text)))
+
+        spec = CHANNEL_SPECS.get(canonical_channel(name))
+        posts.append(
+            SocialPost(
+                channel=name,
+                body=text,
+                characters=len(text),
+                hashtags=tags,
+                hashtags_removed=removed,
+                hashtags_shortfall=shortfall,
+                character_target=spec.max_chars if spec else None,
+                character_limit=spec.hard_max_chars if spec else None,
+                hashtag_limit=spec.hashtags_max if spec else None,
+                over_target=over,
+            )
+        )
     return tuple(posts)
 
 

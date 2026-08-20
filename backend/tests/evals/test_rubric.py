@@ -25,9 +25,9 @@ from __future__ import annotations
 
 import pytest
 
+from backend.app.engines.channel import has_spec, spec_for
 from evals.dataset import CASES, VERTICALS, EvalCase
 from evals.rubric import (
-    CHANNEL_LIMITS,
     Rendering,
     aggregate,
     extract_hashtags,
@@ -177,7 +177,7 @@ def test_over_the_hard_limit_is_fatal() -> None:
 
 
 def test_over_the_soft_limit_is_penalised_but_publishable() -> None:
-    limits = CHANNEL_LIMITS["linkedin"]
+    limits = spec_for("linkedin")
     text = "a " * ((limits.max_chars // 2) + 200)
     result = score_format(Rendering(text=text), "linkedin")
 
@@ -443,7 +443,7 @@ def test_every_case_ships_facts_for_the_rag_arm() -> None:
 
 def test_every_case_uses_a_channel_the_rubric_knows() -> None:
     for case in CASES:
-        assert case.channel in CHANNEL_LIMITS, case.case_id
+        assert has_spec(case.channel), case.case_id
 
 
 def test_the_reference_answer_is_actually_correct_by_our_own_rubric() -> None:

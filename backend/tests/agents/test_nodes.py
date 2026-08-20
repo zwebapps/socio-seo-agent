@@ -388,7 +388,99 @@ async def test_repack_truncates_an_over_length_post_rather_than_shipping_it() ->
         )
     )
 
-    assert len(updates["renderings"]["linkedin"]) <= 3000
+    # The BODY, not the rendering dict. `len()` of the dict is 5 whatever the post
+    # says, so asserting on it would be a test that could never fail.
+    assert len(updates["renderings"]["linkedin"]["body"]) <= 3000
+
+
+async def test_repack_keeps_the_hashtags_it_asked_the_model_for() -> None:
+    """`REPACK_TOOL` accepts `posts[].hashtags` and the node used to store only the
+    body, so they never reached the checkpoint and the social tab could not show
+    them. Declared tags survive, in the model's order, prefixed."""
+    router = StubRouter(
+        {
+            TaskClass.REPACK: {
+                "posts": [
+                    {
+                        "channel": "linkedin",
+                        "body": "Kurz erklärt, was ein Notar beurkundet.",
+                        "hashtags": ["Notar", "#Koblenz"],
+                    }
+                ]
+            }
+        }
+    )
+    updates = await build_nodes(_deps(router))["REPACK"](
+        _state(
+            draft={"html": "<h1>x</h1>", "title": "t"},
+            outline={"target_keyword": "k", "headings": []},
+        )
+    )
+
+    assert updates["renderings"]["linkedin"]["hashtags"] == ["#Notar", "#Koblenz"]
+
+
+async def test_repack_enforces_the_hashtag_cap_in_code_and_says_how_many_it_cut() -> None:
+    """The `channel` engine measured a model producing 21 hashtags against a prompt
+    whose last line said "Keine Hashtags". LinkedIn's cap is 3, so an eight-tag post
+    is brought inside it -- and `hashtags_removed` reports that it had to be, because
+    a clean post shown without that number credits the model for the renderer's work.
+    """
+    body = "Was ein Notar beurkundet. " + " ".join(f"#tag{n}" for n in range(8))
+    router = StubRouter({TaskClass.REPACK: {"posts": [{"channel": "linkedin", "body": body}]}})
+    updates = await build_nodes(_deps(router))["REPACK"](
+        _state(
+            draft={"html": "<h1>x</h1>", "title": "t"},
+            outline={"target_keyword": "k", "headings": []},
+        )
+    )
+
+    rendering = updates["renderings"]["linkedin"]
+    assert len(rendering["hashtags"]) == 3
+    assert rendering["hashtags_removed"] == 5
+    assert rendering["body"].count("#") == 3, "the cut tags must be gone from the body too"
+
+
+async def test_repack_reports_a_hashtag_shortfall_and_never_invents_one() -> None:
+    """Instagram wants at least three. Given one, the node says two are missing and
+    leaves the copy alone: fabricating a tag here would be a node writing marketing."""
+    router = StubRouter(
+        {
+            TaskClass.REPACK: {
+                "posts": [{"channel": "instagram", "body": "Sanfte Behandlung. #Praxis"}]
+            }
+        }
+    )
+    updates = await build_nodes(_deps(router))["REPACK"](
+        _state(
+            draft={"html": "<h1>x</h1>", "title": "t"},
+            outline={"target_keyword": "k", "headings": []},
+        )
+    )
+
+    rendering = updates["renderings"]["instagram"]
+    assert rendering["hashtags"] == ["#Praxis"]
+    assert rendering["hashtags_shortfall"] == 2
+    assert rendering["hashtags_removed"] == 0
+
+
+async def test_repack_reports_being_over_the_editorial_target_without_truncating_to_it() -> None:
+    """1,900 characters publishes fine on LinkedIn and is longer than it should be.
+    The platform limit is 3,000, so the post is NOT cut -- being over the target is a
+    fact about the copy, and truncating to it would be enforcement by preference."""
+    router = StubRouter(
+        {TaskClass.REPACK: {"posts": [{"channel": "linkedin", "body": "w" * 1900}]}}
+    )
+    updates = await build_nodes(_deps(router))["REPACK"](
+        _state(
+            draft={"html": "<h1>x</h1>", "title": "t"},
+            outline={"target_keyword": "k", "headings": []},
+        )
+    )
+
+    rendering = updates["renderings"]["linkedin"]
+    assert rendering["over_target"] is True
+    assert len(rendering["body"]) == 1900
 
 
 # --------------------------------------------------------------------------- #

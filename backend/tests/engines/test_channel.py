@@ -6,8 +6,8 @@ import re
 
 import pytest
 
-from backend.app.engines.channel import enforce_hashtags
-from evals.rubric import CHANNEL_LIMITS, Rendering, extract_hashtags, score_format
+from backend.app.engines.channel import enforce_hashtags, spec_for
+from evals.rubric import Rendering, extract_hashtags, score_format
 
 
 def test_a_channel_that_permits_no_hashtags_gets_none() -> None:
@@ -106,7 +106,7 @@ def test_enforcement_clears_the_hashtag_violations_the_live_eval_found(channel: 
     the 2026-08-19 live run, every failure a hashtag cap. Scoring the enforced text
     with the real rubric is the only assertion that proves the two agree.
     """
-    limits = CHANNEL_LIMITS[channel]
+    limits = spec_for(channel)
     tags = " ".join(f"#tag{index}" for index in range(9))
 
     # The body has to sit strictly inside this channel's own length window, or the

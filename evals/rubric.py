@@ -41,6 +41,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
+from backend.app.engines.channel import ChannelSpec, spec_for
 from backend.app.engines.seo import SeoScoreRequest, score_page
 
 # --------------------------------------------------------------------------- #
@@ -101,81 +102,22 @@ class RubricSummary:
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True, slots=True)
-class ChannelLimits:
-    """What one channel will accept.
-
-    Mirrors the ``ChannelSpec`` sketch in `docs/CHANNELS.md` §4, reduced to the
-    fields a deterministic length/hashtag/link check needs.
-
-    ``max_chars`` is the editorial target; ``hard_max_chars`` is the platform's own
-    reject threshold. Two numbers, not one, because "longer than we would like" and
-    "the API will refuse this" deserve different consequences.
-    """
-
-    max_chars: int
-    hard_max_chars: int
-    hashtags_min: int
-    hashtags_max: int
-    #: False where a URL in the body is not clickable (Instagram, TikTok). A link
-    #: there is not untidy, it is a dead CTA and lost attribution.
-    link_in_body: bool
-    min_chars: int = 0
-
-
-#: **Starting values, to be verified against provider documentation** -- exactly
-#: as `docs/CHANNELS.md` §4 instructs ("treat any number here as a default to
-#: check, never as truth").
+#: The channel spec table, which lives in the PRODUCT and not here.
 #:
-#: These live in code *only because the `channel_specs` config table does not
-#: exist yet* (it lands with the renderers in Phase 6). When it does, this table
-#: must be deleted and the rubric must read from it: two copies of a platform
-#: limit is how the eval starts disagreeing with the product it is grading.
-CHANNEL_LIMITS: Final[Mapping[str, ChannelLimits]] = {
-    # Long-form article. The minimum is the real gate here: a 300-word "article"
-    # cannot cover a commercial-intent query, whatever it scores on-page.
-    "blog_article": ChannelLimits(
-        max_chars=40_000,
-        hard_max_chars=200_000,
-        hashtags_min=0,
-        hashtags_max=0,
-        link_in_body=True,
-        min_chars=2_500,
-    ),
-    # 1,300-1,700 chars, 3 hashtags max (docs/CHANNELS.md section 6).
-    "linkedin": ChannelLimits(
-        max_chars=1_700,
-        hard_max_chars=3_000,
-        hashtags_min=0,
-        hashtags_max=3,
-        link_in_body=True,
-    ),
-    # ~2,200 char ceiling, 3-5 hashtags, and never a caption URL.
-    "instagram_caption": ChannelLimits(
-        max_chars=2_200,
-        hard_max_chars=2_200,
-        hashtags_min=3,
-        hashtags_max=5,
-        link_in_body=False,
-    ),
-    # Short post (~80-150 words); the link preview does the work.
-    "facebook_post": ChannelLimits(
-        max_chars=1_000,
-        hard_max_chars=63_206,
-        hashtags_min=0,
-        hashtags_max=3,
-        link_in_body=True,
-    ),
-    # Email body. Subject and preheader are separate deliverables (Phase 8).
-    "email": ChannelLimits(
-        max_chars=2_500,
-        hard_max_chars=100_000,
-        hashtags_min=0,
-        hashtags_max=0,
-        link_in_body=True,
-        min_chars=300,
-    ),
-}
+#: This used to be a second table, and the comment on it predicted exactly what
+#: happened: "two copies of a platform limit is how the eval starts disagreeing with
+#: the product it is grading." It did. LinkedIn's 3,000 was this table's *hard* max
+#: and the runtime's plain ceiling; ``facebook_post`` here was ``facebook`` there.
+#:
+#: So the numbers now come from ``backend.app.engines.channel.specs``, which the
+#: runtime reads too, and the names this harness uses are aliases in that module --
+#: which is why the twenty cases in ``dataset.py`` name their channel exactly as they
+#: always did. The eval grades the deliverable the product was actually held to.
+#: The name is kept because it reads correctly at the call sites in this module; it
+#: is the product's type, not a parallel one. Ask :func:`spec_for` for a spec --
+#: there is deliberately no re-exported table here to index, because indexing is how
+#: the second copy got written in the first place.
+ChannelLimits = ChannelSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +314,7 @@ def score_format(rendering: Rendering, channel: str) -> RubricResult:
     engine grades severity: "a bit long" and "the API will refuse this" carry the
     same information only if you never intend to act on the number.
     """
-    limits = CHANNEL_LIMITS[channel]
+    limits = spec_for(channel)
     text = rendering.text
     hashtags = rendering.hashtags if rendering.hashtags is not None else extract_hashtags(text)
 
