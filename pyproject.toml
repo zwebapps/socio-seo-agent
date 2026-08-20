@@ -42,6 +42,7 @@ dependencies = [
     # vector store and an agentic retrieval loop, and no way for a customer to put a
     # document into any of it.
     "python-multipart>=0.0.32",
+    "cryptography>=50.0.0",
 ]
 
 # Still phase-gated, added when the phase that needs them lands:

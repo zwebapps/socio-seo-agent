@@ -37,16 +37,19 @@ So :func:`select_token_cipher` returns :class:`NotConfiguredCipher` on any machi
 has a key but no AEAD backend, and a :class:`NotConfiguredCipher` REFUSES to encrypt.
 Refusing is the point — the connect flow then cannot store a credential at all, which is
 the safe direction. The envelope format, the key parsing (:func:`decode_key`) and the
-associated-data binding are all specified and tested here, so landing the real cipher is
-a small, reviewable diff against a fixed format rather than a new design:
+associated-data binding are specified here, and :class:`AesGcmCipher` now implements
+them — `cryptography` is a dependency. A key that is set and valid gets the real cipher;
+:class:`NotConfiguredCipher` remains for a key that is missing or malformed, and for an
+environment where `cryptography` is somehow not importable, because refusing to store a
+credential is always better than storing it in plaintext.
 
     ``v1.aesgcm:<base64(12-byte nonce)>:<base64(ciphertext||tag)>``
 
 ``aad`` is not decoration. AES-GCM authenticates it, so binding the envelope to
 ``business:{id}|platform:{name}`` means a ciphertext lifted out of one row and pasted
 into another fails to open rather than silently authorising a post to somebody else's
-account. :class:`EphemeralVaultCipher` enforces the same binding, so the property is
-covered by tests today even though the AEAD is not implemented.
+account. :class:`EphemeralVaultCipher` enforces the same binding, so the property holds under
+both ciphers.
 
 :class:`EphemeralVaultCipher` is what makes the connect/expire/refresh lifecycle
 testable and locally usable without either of the rejected options: the secret stays in
@@ -71,6 +74,7 @@ __all__ = [
     "CREDENTIAL_KEY_ENV",
     "EPHEMERAL_KEY_VALUE",
     "EPHEMERAL_SCHEME",
+    "AesGcmCipher",
     "CipherNotConfiguredError",
     "CipherStatus",
     "CredentialUnreadableError",
@@ -100,6 +104,11 @@ EPHEMERAL_KEY_VALUE: Final = "ephemeral"
 #: algorithm is replaced, the reader has to be able to tell which rows are which
 #: without guessing from the length of a base64 blob.
 AES_GCM_SCHEME: Final = "v1.aesgcm"
+
+#: 12 bytes, which is GCM's standard nonce length and the one its own security proof is
+#: stated for. A longer nonce is hashed down internally and buys nothing; a shorter one
+#: is a smaller space to collide in.
+NONCE_BYTES: Final = 12
 EPHEMERAL_SCHEME: Final = "v1.ephemeral"
 
 #: AES-256 needs 32 bytes. Enforced when the key is parsed rather than when it is first
@@ -254,6 +263,74 @@ class NotConfiguredCipher:
 
     def decrypt(self, envelope: str, *, aad: str) -> Secret:
         raise CipherNotConfiguredError(self._reason)
+
+
+@final
+class AesGcmCipher:
+    """AES-256-GCM over the envelope format the module docstring specifies.
+
+    The one thing worth reading closely here is the NONCE. It is 12 random bytes per
+    encryption, from `secrets`, and it is never derived from anything: GCM's security
+    collapses if a nonce is reused under the same key -- not "degrades", collapses, in a
+    way that leaks the plaintext of both messages. A counter would be the standard
+    alternative and it is wrong for this shape, because the rows are written by several
+    processes with no shared state to count in. 96 random bits per credential, with a
+    handful of credentials per business, is nowhere near the birthday bound.
+
+    `aad` is authenticated but not encrypted, which is exactly the property wanted: the
+    binding to `business:{id}|platform:{name}` travels with the ciphertext, so a
+    ciphertext lifted out of one row and pasted into another fails to open rather than
+    silently authorising a post to somebody else's account.
+
+    Any failure to open is one error, deliberately: a wrong key, a tampered ciphertext, a
+    mismatched aad and a truncated blob all raise `CredentialUnreadableError` with the
+    same message. Distinguishing them for the caller would distinguish them for an
+    attacker too, and none of the four has a different fix.
+    """
+
+    def __init__(self, key: bytes) -> None:
+        # Constructed here rather than per call: `AESGCM` does key setup once, and this
+        # sits behind a publish path that may loop over channels.
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        self._aead = AESGCM(key)
+
+    @property
+    def scheme(self) -> str:
+        return AES_GCM_SCHEME
+
+    @property
+    def protects_at_rest(self) -> bool:
+        return True
+
+    def encrypt(self, plaintext: Secret, *, aad: str) -> str:
+        nonce = secrets.token_bytes(NONCE_BYTES)
+        sealed = self._aead.encrypt(nonce, plaintext.reveal().encode(), aad.encode())
+        return (
+            f"{AES_GCM_SCHEME}:"
+            f"{base64.b64encode(nonce).decode()}:"
+            f"{base64.b64encode(sealed).decode()}"
+        )
+
+    def decrypt(self, envelope: str, *, aad: str) -> Secret:
+        scheme, _, rest = envelope.partition(":")
+        if scheme != AES_GCM_SCHEME:
+            raise CredentialUnreadableError(
+                f"not an {AES_GCM_SCHEME} envelope: {envelope[:16]!r}..."
+            )
+        nonce_b64, _, sealed_b64 = rest.partition(":")
+        try:
+            nonce = base64.b64decode(nonce_b64, validate=True)
+            sealed = base64.b64decode(sealed_b64, validate=True)
+            opened = self._aead.decrypt(nonce, sealed, aad.encode())
+        except Exception as exc:
+            # ONE message for every cause. See the class docstring.
+            raise CredentialUnreadableError(
+                "this credential could not be decrypted. The key may have been rotated "
+                "or replaced, or the stored envelope may not belong to this business "
+                "and platform. Re-connect the account to store a fresh credential."
+            ) from exc
+        return Secret(opened.decode())
 
 
 @final
@@ -414,12 +491,18 @@ def select_token_cipher(env: Mapping[str, str] | None = None) -> TokenCipher:
             "`openssl rand -base64 32`."
         )
 
-    return NotConfiguredCipher(
-        f"{CREDENTIAL_KEY_ENV} is a valid key, but this build has no AES-256-GCM "
-        "backend: `cryptography` is not a dependency of this project. Until it is "
-        "added and AesGcmCipher lands, a platform credential cannot be protected at "
-        "rest and will not be stored."
-    )
+    try:
+        return AesGcmCipher(decode_key(raw))
+    except ImportError:
+        # `cryptography` was a dependency when this branch was written; if an
+        # environment somehow lacks it, refusing is still better than storing a token
+        # in plaintext. Named so the fix is obvious.
+        return NotConfiguredCipher(
+            f"{CREDENTIAL_KEY_ENV} is a valid key, but the `cryptography` package is "
+            "not importable in this environment, so there is no AES-256-GCM backend to "
+            "hand it to. A platform credential cannot be protected at rest and will "
+            "not be stored. Reinstall dependencies (`make install`)."
+        )
 
 
 def cipher_status(cipher: TokenCipher) -> CipherStatus:

@@ -13,12 +13,15 @@ rather than storing anything in the clear.
 
 import base64
 import logging
-from uuid import uuid4
+import secrets
+from uuid import UUID, uuid4
 
 import pytest
 
 from backend.app.core.token_cipher import (
+    AES_GCM_SCHEME,
     CREDENTIAL_KEY_ENV,
+    AesGcmCipher,
     CipherNotConfiguredError,
     CredentialUnreadableError,
     EphemeralVaultCipher,
@@ -176,22 +179,160 @@ def test_the_ephemeral_vault_is_explicit_opt_in_only() -> None:
     assert isinstance(select_token_cipher({CREDENTIAL_KEY_ENV: "ephemeral"}), EphemeralVaultCipher)
 
 
-def test_a_real_key_is_reported_as_having_no_backend_rather_than_as_missing() -> None:
-    """The operator has to be able to tell "you forgot the key" from "this build cannot use it".
+def test_a_real_key_produces_a_real_cipher_and_never_echoes_the_key() -> None:
+    """Rewritten, not deleted: this used to assert that a valid key produced a REFUSING
+    cipher, because `cryptography` was not a dependency and there was no AEAD to hand it
+    to. That refusal was correct and it was not a feature — it meant no platform
+    credential could be stored at all.
 
-    Both currently produce a refusing cipher, and the fix for each is different: one is a
-    deployment variable, the other is adding `cryptography` and the AES implementation.
-    A single opaque message would send someone to check the wrong thing.
+    What survives from the old test is the half that is still a rule: a key must never
+    appear in a message, whatever the outcome. `NotConfiguredCipher` remains reachable
+    for a missing or malformed key (the two tests below) and for an environment where
+    `cryptography` is somehow not importable.
     """
     key = base64.b64encode(bytes(range(32))).decode()
     cipher = select_token_cipher({CREDENTIAL_KEY_ENV: key})
 
-    assert isinstance(cipher, NotConfiguredCipher)
-    assert "cryptography" in cipher.reason
-    assert key not in cipher.reason, "the key itself must never appear in a message"
+    assert isinstance(cipher, AesGcmCipher)
+    assert cipher.protects_at_rest is True
+    assert key not in repr(cipher), "the key itself must never appear in a message"
+    assert key not in cipher_status(cipher).message
 
 
 def test_a_malformed_key_says_so_rather_than_reporting_nothing_configured() -> None:
     cipher = select_token_cipher({CREDENTIAL_KEY_ENV: "obviously-not-a-key"})
     assert isinstance(cipher, NotConfiguredCipher)
     assert "unusable" in cipher.reason
+
+
+# --------------------------------------------------------------------------- #
+# AES-256-GCM: the real cipher, now that `cryptography` is a dependency
+# --------------------------------------------------------------------------- #
+
+
+class TestAesGcmCipher:
+    """The cipher that actually protects a credential at rest.
+
+    Until `cryptography` was added, `select_token_cipher` returned
+    `NotConfiguredCipher` for a valid key and refused to store anything — which was the
+    right refusal and not a feature. These tests are what make the replacement
+    trustworthy rather than merely present.
+    """
+
+    @staticmethod
+    def _cipher() -> AesGcmCipher:
+        return AesGcmCipher(secrets.token_bytes(32))
+
+    def test_a_real_key_now_selects_the_real_cipher(self) -> None:
+        """The whole point of the change: a configured key no longer refuses."""
+        cipher = select_token_cipher({CREDENTIAL_KEY_ENV: base64.b64encode(b"k" * 32).decode()})
+
+        assert isinstance(cipher, AesGcmCipher)
+        assert cipher.protects_at_rest is True
+        assert cipher.scheme == AES_GCM_SCHEME
+
+    def test_the_column_never_holds_the_credential(self) -> None:
+        """The property every other guarantee here rests on. A dump of the table has to
+        be useless to whoever reads it."""
+        cipher = self._cipher()
+        token = "ya29.a-very-distinctive-access-token"
+
+        envelope = cipher.encrypt(Secret(token), aad="business:x|platform:linkedin")
+
+        assert token not in envelope
+        assert envelope.startswith(f"{AES_GCM_SCHEME}:")
+
+    def test_it_round_trips(self) -> None:
+        cipher = self._cipher()
+        aad = "business:x|platform:linkedin"
+
+        envelope = cipher.encrypt(Secret("token-value"), aad=aad)
+
+        assert cipher.decrypt(envelope, aad=aad).reveal() == "token-value"
+
+    def test_every_encryption_uses_a_fresh_nonce(self) -> None:
+        """Not a nice-to-have. GCM does not degrade on nonce reuse under one key, it
+        COLLAPSES — reusing one leaks the plaintext of both messages. A counter would be
+        the standard alternative and is wrong for this shape: these rows are written by
+        several processes with no shared state to count in."""
+        cipher = self._cipher()
+        aad = "business:x|platform:linkedin"
+
+        envelopes = {cipher.encrypt(Secret("same-token"), aad=aad) for _ in range(25)}
+
+        assert len(envelopes) == 25, "a repeated nonce would show up as a repeated envelope"
+
+    def test_an_envelope_moved_to_another_business_will_not_open(self) -> None:
+        """The reason the aad binding exists. Without it, a ciphertext lifted out of one
+        row and pasted into another would silently authorise a post to somebody else's
+        account."""
+        cipher = self._cipher()
+        envelope = cipher.encrypt(
+            Secret("token"), aad=credential_aad(business_id=UUID(int=1), platform="linkedin")
+        )
+
+        with pytest.raises(CredentialUnreadableError):
+            cipher.decrypt(
+                envelope, aad=credential_aad(business_id=UUID(int=2), platform="linkedin")
+            )
+
+    def test_an_envelope_moved_to_another_platform_will_not_open(self) -> None:
+        """Same binding, the other half: a LinkedIn token must not be usable as the
+        Facebook one for the same business."""
+        cipher = self._cipher()
+        business = UUID(int=1)
+        envelope = cipher.encrypt(
+            Secret("token"), aad=credential_aad(business_id=business, platform="linkedin")
+        )
+
+        with pytest.raises(CredentialUnreadableError):
+            cipher.decrypt(envelope, aad=credential_aad(business_id=business, platform="facebook"))
+
+    def test_a_tampered_ciphertext_is_refused_rather_than_returning_rubbish(self) -> None:
+        """This is what the authenticated part of AEAD buys: a modified ciphertext fails
+        to open instead of decrypting to something an attacker chose."""
+        cipher = self._cipher()
+        aad = "business:x|platform:linkedin"
+        envelope = cipher.encrypt(Secret("token"), aad=aad)
+
+        with pytest.raises(CredentialUnreadableError):
+            cipher.decrypt(envelope[:-6] + "AAAAAA", aad=aad)
+
+    def test_a_rotated_key_cannot_read_the_old_rows(self) -> None:
+        """Stated as a test because it is an operational fact somebody will meet: rotating
+        the key invalidates every stored credential, and the answer is to re-connect the
+        accounts. The error says exactly that."""
+        aad = "business:x|platform:linkedin"
+        envelope = self._cipher().encrypt(Secret("token"), aad=aad)
+
+        with pytest.raises(CredentialUnreadableError, match="Re-connect"):
+            self._cipher().decrypt(envelope, aad=aad)
+
+    def test_every_failure_gives_the_same_message(self) -> None:
+        """Deliberate. A wrong key, a tampered blob and a mismatched aad have the same
+        fix — re-connect — and distinguishing them for the caller would distinguish them
+        for an attacker too."""
+        cipher = self._cipher()
+        aad = "business:x|platform:linkedin"
+        envelope = cipher.encrypt(Secret("token"), aad=aad)
+
+        messages = set()
+        for broken_aad, broken_envelope in (
+            ("business:other|platform:linkedin", envelope),
+            (aad, envelope[:-6] + "AAAAAA"),
+            (aad, f"{AES_GCM_SCHEME}:AAAA:AAAA"),
+        ):
+            with pytest.raises(CredentialUnreadableError) as caught:
+                cipher.decrypt(broken_envelope, aad=broken_aad)
+            messages.add(str(caught.value))
+
+        assert len(messages) == 1, f"failures must be indistinguishable, got {messages}"
+
+    def test_a_non_aesgcm_envelope_is_named_rather_than_mis_decoded(self) -> None:
+        """An ephemeral-scheme row read by the real cipher after a config change. Saying
+        which scheme it is beats a generic decrypt failure, because the fix is different:
+        that credential was never durable."""
+        cipher = self._cipher()
+
+        with pytest.raises(CredentialUnreadableError, match=AES_GCM_SCHEME):
+            cipher.decrypt("v1.ephemeral:some-handle", aad="business:x|platform:linkedin")
