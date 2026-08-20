@@ -90,6 +90,11 @@ export default function Home() {
                 blurb="Who got in touch, and which piece of content earned them."
               />
               <NavRow
+                href="/documents"
+                title="Your documents"
+                blurb="Upload a price list or service sheet — the agent quotes your own material instead of guessing."
+              />
+              <NavRow
                 href="/memory"
                 title="What I remember"
                 blurb="The preferences carried into every run — and the exact lines the next one receives."

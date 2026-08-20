@@ -27,11 +27,13 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
-import { Pill, SoftWell } from "@/app/components/soft";
+import { Pill, SoftButton, SoftWell } from "@/app/components/soft";
 import { ApiError } from "@/app/lib/api";
 import {
+  canResume,
   fetchRuns,
   isLive,
+  resumeRun,
   runStateLabel,
   runStateTone,
   type RunSummary,
@@ -64,15 +66,36 @@ export function useRuns(limit: number): {
   state: State;
   live: boolean;
   reload: () => Promise<void>;
+  loadMore: () => Promise<void>;
+  /** Whether the API says there is another page. */
+  canLoadMore: boolean;
+  loadingMore: boolean;
 } {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [live, setLive] = useState(false);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Pages the reader asked for beyond the first. Held separately so a poll can refresh
+  // the first page without throwing away the history somebody has scrolled into.
+  const [older, setOlder] = useState<RunSummary[]>([]);
 
   const reload = useCallback(async () => {
     try {
       const body = await fetchRuns(limit);
       setLive(body.runs.some(isLive));
-      setState({ kind: "ready", runs: body.runs });
+      setCursor(body.nextCursor);
+      // First page first, then whatever was loaded below it, de-duplicated by id. A run
+      // can legitimately appear in both: it was on page two when it was fetched, and a
+      // newer run pushed it down, or an older one finished and moved. Rendering it twice
+      // would look like the list inventing runs.
+      setState((current) => {
+        const kept = current.kind === "ready" ? older : [];
+        const seen = new Set(body.runs.map((run) => run.runId));
+        return {
+          kind: "ready",
+          runs: [...body.runs, ...kept.filter((run) => !seen.has(run.runId))],
+        };
+      });
     } catch (exc) {
       // A 409 `no_business` is not a broken screen: it is an account that has not finished
       // onboarding, and the message the API sends says exactly that. Passed through rather
@@ -82,12 +105,44 @@ export function useRuns(limit: number): {
         message: exc instanceof ApiError ? exc.message : "Could not load your runs.",
       });
     }
-  }, [limit]);
+  }, [limit, older]);
+
+  /**
+   * Fetch the next page and append it.
+   *
+   * Keyset, so this cannot skip or repeat a run while new ones are being started —
+   * which an offset would, by shifting one row every time a run appears above it.
+   */
+  const loadMore = useCallback(async () => {
+    if (!cursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const body = await fetchRuns(limit, cursor);
+      setCursor(body.nextCursor);
+      setOlder((current) => [...current, ...body.runs]);
+      setState((current) =>
+        current.kind === "ready"
+          ? { kind: "ready", runs: [...current.runs, ...body.runs] }
+          : current,
+      );
+    } catch (exc) {
+      setState({
+        kind: "error",
+        message: exc instanceof ApiError ? exc.message : "Could not load older runs.",
+      });
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [cursor, limit, loadingMore]);
 
   // The first read, and a fresh one if the caller changes how many it wants.
   useEffect(() => {
     void reload();
-  }, [reload]);
+    // `reload` closes over `older`, which it also updates -- depending on it here would
+    // re-fetch the first page every time a page is appended. The limit is what a caller
+    // can actually change, so that is what this watches.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [limit]);
 
   // Polling is keyed on `live`, which is what makes it start as well as stop: a manual
   // refresh, or a run started from the dashboard, flips `live` true and arms this; the poll
@@ -95,6 +150,10 @@ export function useRuns(limit: number): {
   // it. Keying it on the data rather than mounting a permanent timer is the difference
   // between a dashboard that costs nothing when idle and one that polls a finished account
   // forever.
+  //
+  // It re-reads the FIRST page only. Re-fetching every loaded page on every tick would
+  // multiply the request volume by however far somebody has scrolled, for information
+  // that does not change: an older run is, by definition, already finished.
   useEffect(() => {
     if (!live) return;
     let cancelled = false;
@@ -115,16 +174,26 @@ export function useRuns(limit: number): {
     };
   }, [live, reload]);
 
-  return { state, live, reload };
+  return { state, live, reload, loadMore, canLoadMore: cursor !== null, loadingMore };
 }
 
 export function RunRows({
   state,
   emptyNote,
+  onLoadMore,
+  canLoadMore = false,
+  loadingMore = false,
+  onResumed,
 }: {
   state: State;
   /** What to say when there are no runs. Differs by screen, so the caller owns it. */
   emptyNote: string;
+  /** Omitted on the dashboard panel: five recent runs is not a place to paginate. */
+  onLoadMore?: () => void;
+  canLoadMore?: boolean;
+  loadingMore?: boolean;
+  /** Called after a successful resume, so the caller can refresh. */
+  onResumed?: () => void;
 }) {
   if (state.kind === "loading") {
     return (
@@ -155,11 +224,28 @@ export function RunRows({
   }
 
   return (
-    <ul className="space-y-2.5">
-      {state.runs.map((run) => (
-        <RunRow key={run.runId} run={run} />
-      ))}
-    </ul>
+    <>
+      <ul className="space-y-2.5">
+        {state.runs.map((run) => (
+          <RunRow key={run.runId} run={run} onResumed={onResumed} />
+        ))}
+      </ul>
+
+      {/* Only when the API says there is another page. A control that fetches nothing
+          is worse than no control: it reads as the list being broken. */}
+      {onLoadMore && canLoadMore && (
+        <div className="mt-4">
+          <SoftButton
+            variant="quiet"
+            onClick={onLoadMore}
+            disabled={loadingMore}
+            ariaLabel="Load older runs"
+          >
+            {loadingMore ? "Loading…" : "Show older runs"}
+          </SoftButton>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -189,7 +275,7 @@ function nodeCaption(state: string, node: string): string {
 /** `awaiting_approval` is deliberately absent — see `nodeCaption`. */
 const TERMINAL_FOR_CAPTION = new Set(["done", "failed", "partial"]);
 
-function RunRow({ run }: { run: RunSummary }) {
+function RunRow({ run, onResumed }: { run: RunSummary; onResumed?: () => void }) {
   return (
     <li>
       {/*
@@ -236,7 +322,63 @@ function RunRow({ run }: { run: RunSummary }) {
           Started <RunTime iso={run.createdAt} />
         </span>
       </Link>
+
+      {/* OUTSIDE the `Link`, because a button inside an anchor is invalid markup and
+          behaves unpredictably under a keyboard. */}
+      {canResume(run) && <ResumeControl run={run} onResumed={onResumed} />}
     </li>
+  );
+}
+
+/**
+ * Pick a stalled run back up.
+ *
+ * The endpoint has existed since runs were made resumable and had NO caller, so a run
+ * left `running` by a process that died was recoverable only by curl. The executor lives
+ * in the API process, so a restart mid-run is exactly the case this is for.
+ *
+ * **The copy says "if stalled", and the refusal is shown verbatim.** A run that is
+ * genuinely executing right now looks identical from here — both say `running` — and only
+ * the executor can tell "a task is driving this" from "a process died and left it there".
+ * So the honest design is to offer the button, let the API refuse, and print what it said:
+ * "This run is already executing" is a useful answer, and hiding it behind a generic error
+ * would turn a working safeguard into a mystery.
+ */
+function ResumeControl({ run, onResumed }: { run: RunSummary; onResumed?: () => void }) {
+  const [state, setState] = useState<
+    { kind: "idle" } | { kind: "sending" } | { kind: "said"; message: string }
+  >({ kind: "idle" });
+
+  async function resume() {
+    setState({ kind: "sending" });
+    try {
+      await resumeRun(run.runId);
+      setState({ kind: "said", message: "Picked back up from its checkpoint." });
+      onResumed?.();
+    } catch (exc) {
+      setState({
+        kind: "said",
+        message: exc instanceof ApiError ? exc.message : "Could not resume this run.",
+      });
+    }
+  }
+
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-3 px-4">
+      <SoftButton
+        variant="quiet"
+        disabled={state.kind === "sending"}
+        onClick={() => void resume()}
+        ariaLabel={`Resume the run for "${run.goal}" from its checkpoint`}
+      >
+        {state.kind === "sending" ? "Resuming…" : "Resume if stalled"}
+      </SoftButton>
+      {state.kind === "said" && (
+        <span className="text-xs" style={{ color: "var(--text-muted)" }} role="status">
+          {state.message}
+        </span>
+      )}
+    </div>
   );
 }
 

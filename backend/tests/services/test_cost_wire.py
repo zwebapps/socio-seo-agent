@@ -15,11 +15,20 @@ They are deliberately NOT database tests, so they run on a machine with no Postg
 serialisation shape is not a database concern and should not be gated behind one.
 """
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any, cast
 from uuid import uuid4
 
+import pytest
+
+from backend.app.llm import Completion, Usage
 from backend.app.services.cost_service import CostReport, DailySpend, RunSpend, SpendRow
+from backend.app.services.kb_service import RETRIEVAL_PROMPT_VERSION, retrieve
+from backend.app.services.run_executor import KB_NODE
+
+pytestmark = pytest.mark.anyio
 
 
 def _report() -> CostReport:
@@ -125,3 +134,64 @@ def test_money_formatting_is_consistent_across_an_empty_and_a_populated_figure()
     # A run cap is stored at a different scale (Numeric(10, 6)) and must still render the
     # same way, or the dashboard mixes formats within one row.
     assert _usd(Decimal("0.500000")) == "0.50000000"
+
+
+async def test_a_retrieval_call_is_attributed_to_a_step_and_not_to_nothing() -> None:
+    """Found by driving a real run the first time retrieval was wired into the graph.
+
+    The agentic loop makes three cheap calls per attempt — decide, rewrite, grade — and
+    every one of them wrote a `model_usage` row with an EMPTY `node`, so eighteen of the
+    twenty-six rows in the ledger belonged to no step. This repo has already fixed
+    exactly this once, for llm spans; an unattributed cost row is a number nobody can
+    act on, which is the whole reason the ledger exists.
+
+    `KB` rather than a graph node name, because the calls belong to the retrieval loop
+    and borrowing HARVEST's name would put another node's spend in its column.
+    """
+    seen: list[dict[str, str] | None] = []
+
+    class _Router:
+        async def complete(self, task: object, messages: object, **kw: object) -> Completion:
+            trace = kw.get("trace")
+            seen.append(trace if trace is None or isinstance(trace, dict) else None)
+            return Completion(
+                text="prose, so the loop stops asking",
+                tool_calls=[],
+                usage=Usage(
+                    provider="stub",
+                    model="stub/m",
+                    tokens_in=10,
+                    tokens_out=5,
+                    usd=Decimal("0.00001"),
+                    latency_ms=3,
+                ),
+                is_final=True,
+            )
+
+    class _Embedder:
+        async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+            return [[0.0] * 8 for _ in texts]
+
+    class _Store:
+        async def upsert(self, *args: object, **kwargs: object) -> int:
+            return 0
+
+        async def search(self, *args: object, **kwargs: object) -> list[object]:
+            return []
+
+        async def existing_hashes(self, *args: object, **kwargs: object) -> set[str]:
+            return set()
+
+    await retrieve(
+        "was kostet eine rohrreinigung",
+        business_id=uuid4(),
+        router=cast("Any", _Router()),
+        embedder=cast("Any", _Embedder()),
+        store=cast("Any", _Store()),
+        trace={"node": KB_NODE, "prompt_version": RETRIEVAL_PROMPT_VERSION},
+    )
+
+    assert seen, "the loop must have made at least one call"
+    assert all(entry is not None and entry.get("node") == KB_NODE for entry in seen), (
+        "every retrieval call must name the step it belongs to"
+    )

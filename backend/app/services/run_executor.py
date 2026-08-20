@@ -79,6 +79,14 @@ PAGE_EXCERPT_CHARS: Final = 800
 #: Headings kept per page. The shape of a page is in its first few headings.
 MAX_HEADINGS_PER_PAGE: Final = 8
 
+#: The ledger label for the retrieval loop's own model calls.
+#:
+#: Not a graph node, and deliberately not borrowing one: the calls belong to the
+#: agentic retrieval loop, which runs inside whichever node asked for grounding, and
+#: attributing them to HARVEST would put another node's spend in its column. Same
+#: reasoning as `EXECUTOR_NODE` below.
+KB_NODE: Final = "KB"
+
 #: The timeline label for the executor's own bookkeeping lines.
 #:
 #: Not a graph node, and deliberately not borrowing one: `event.node` is a free
@@ -359,6 +367,7 @@ async def _build_retrieve(
     from backend.app.db.adapters.chunk_store import PgVectorChunkStore
     from backend.app.db.adapters.document_store import PostgresDocumentStore
     from backend.app.llm.embedder import RouterEmbedder
+    from backend.app.services.kb_service import RETRIEVAL_PROMPT_VERSION
     from backend.app.services.kb_service import retrieve as retrieve_chunks
 
     try:
@@ -380,6 +389,14 @@ async def _build_retrieve(
             router=router,
             embedder=embedder,
             store=store,
+            # So the loop's cheap calls are ATTRIBUTABLE. Found by driving a real run
+            # the first time retrieval was wired in: the loop makes three calls per
+            # attempt and every one wrote a `model_usage` row with an empty `node`, so
+            # eighteen of twenty-six ledger rows belonged to no step. `KB` rather than a
+            # graph node name, because the calls belong to the retrieval loop and
+            # borrowing HARVEST's name would put another node's spend in its column --
+            # the same reason `EXECUTOR` is not a node.
+            trace={"node": KB_NODE, "prompt_version": RETRIEVAL_PROMPT_VERSION},
             **kwargs,
         )
 

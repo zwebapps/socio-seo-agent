@@ -24,7 +24,7 @@ import { Pill, SoftButton } from "@/app/components/soft";
 import { ALL_RUNS } from "@/app/lib/runs-api";
 
 export default function RunsPage() {
-  const { state, live, reload } = useRuns(ALL_RUNS);
+  const { state, live, reload, loadMore, canLoadMore, loadingMore } = useRuns(ALL_RUNS);
 
   return (
     <main className="mx-auto max-w-3xl px-6 py-12">
@@ -37,7 +37,8 @@ export default function RunsPage() {
       <h1 className="mt-2 text-[26px] font-semibold tracking-tight">Everything you have asked for</h1>
       <p className="mt-3 text-sm" style={{ color: "var(--text-muted)" }}>
         Newest first. Open one to see which step it reached, what each step cost, and the
-        draft, SEO findings, social posts and AI answer blocks it produced.
+        draft, SEO findings, social posts and AI answer blocks it produced. A run left
+        mid-flight by a restart can be picked back up from its checkpoint.
       </p>
 
       <div className="mt-8 flex flex-wrap items-center justify-between gap-3">
@@ -45,10 +46,12 @@ export default function RunsPage() {
           {live && <Pill tone="accent">live</Pill>}
           {state.kind === "ready" && (
             <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-              {/* The number shown, not a claim about the total: the list is capped, and
-                  saying "12 runs" when the cap is 50 and there are 300 would be wrong. */}
+              {/* The number shown, and whether there is more — never a claim about the
+                  total. The list used to be CAPPED here, so older runs were unreachable
+                  and the honest wording was "the most recent 50"; it is paginated now, so
+                  the wording follows the mechanism rather than the other way round. */}
               showing {state.runs.length}
-              {state.runs.length === ALL_RUNS ? ` (the most recent ${ALL_RUNS})` : ""}
+              {canLoadMore ? " — more below" : ""}
             </span>
           )}
         </div>
@@ -65,6 +68,10 @@ export default function RunsPage() {
         <RunRows
           state={state}
           emptyNote="No runs yet. Start one from the dashboard and it will appear here."
+          onLoadMore={() => void loadMore()}
+          canLoadMore={canLoadMore}
+          loadingMore={loadingMore}
+          onResumed={() => void reload()}
         />
       </div>
 

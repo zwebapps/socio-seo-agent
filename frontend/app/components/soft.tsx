@@ -255,18 +255,33 @@ export function Pill({
   tone?: "ok" | "warn" | "err" | "muted" | "accent";
   children: ReactNode;
 }) {
+  // `accent` is FILLED and the others are not, and that is a contrast fix rather than a
+  // style choice. Measured against `--bg`: `--accent` (#ef7215) as text is 2.54:1, which
+  // fails 1.4.3 AA for an 11px label — and this pill is used for a run's
+  // `awaiting_approval` state and for the target keyword, both of which are information.
+  // `--accent-ink` on `--accent` measures 6.09:1 light and 7.14:1 dark, and it is the
+  // token that exists for exactly this: it keeps the brand orange instead of darkening it.
+  //
+  // The other four tones stay text-on-surface because they pass there (`--ok` 5.28:1,
+  // `--warn` 4.71:1, `--err` 5.05:1, `--text-muted` 4.6:1 against `--bg`). Filling all
+  // five would repaint every screen to fix one.
+  const filled = tone === "accent";
   const colour = {
     ok: "var(--ok)",
     warn: "var(--warn)",
     err: "var(--err)",
-    accent: "var(--accent)",
+    accent: "var(--accent-ink)",
     muted: "var(--text-muted)",
   }[tone];
 
   return (
     <span
-      className="soft-flat inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider"
-      style={{ borderRadius: "var(--r-pill)", color: colour }}
+      className={`${filled ? "" : "soft-flat"} inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider`}
+      style={{
+        borderRadius: "var(--r-pill)",
+        color: colour,
+        ...(filled ? { background: "var(--accent)" } : {}),
+      }}
     >
       <span
         aria-hidden

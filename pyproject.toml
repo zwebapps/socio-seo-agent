@@ -60,6 +60,7 @@ dev = [
     # network. Hermetic tests for that surface need httpx2.MockTransport, so the
     # transitive dependency is declared explicitly rather than relied upon.
     "httpx2>=0.28.0",
+    "deepeval>=4.1.8",
 ]
 
 [tool.uv]

@@ -665,6 +665,7 @@ async def retrieve(
     min_relevant: int = DEFAULT_MIN_RELEVANT,
     max_attempts: int = MAX_RETRIEVAL_ATTEMPTS,
     budget: BudgetState | None = None,
+    trace: Mapping[str, str] | None = None,
 ) -> RetrievalTrace:
     """Retrieve grounding facts for ``question``, and record how.
 
@@ -715,6 +716,7 @@ async def retrieve(
         router=router,
         budget=budget,
         meter=meter,
+        trace=trace,
     )
     trace_notes.extend(decision.notes)
 
@@ -760,6 +762,7 @@ async def retrieve(
                 router=router,
                 budget=budget,
                 meter=meter,
+                trace=trace,
             )
             graded = grading.grades
             keep = grading.retained
@@ -823,6 +826,7 @@ async def retrieve(
             router=router,
             budget=budget,
             meter=meter,
+            trace=trace,
         )
         trace_notes.extend(rewritten.notes)
         query = rewritten.query or question
@@ -949,6 +953,7 @@ async def _call(
     tool: ToolSpec,
     budget: BudgetState | None,
     meter: _CostMeter,
+    trace: Mapping[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """One cheap-tier call that must answer by calling ``tool``.
 
@@ -956,6 +961,14 @@ async def _call(
     instead. ``None`` is a real outcome with a real handling policy at each call
     site -- not something to retry blindly, which would double the cost of the
     exact failure that is least likely to fix itself.
+
+    ``trace`` is forwarded so the retrieval loop's calls are ATTRIBUTABLE. Found by
+    driving a real run once retrieval was wired into the graph: the loop makes three
+    cheap calls per attempt (decide, rewrite, grade) and every one of them wrote a
+    `model_usage` row with an empty `node`, so eighteen of the twenty-six rows in the
+    ledger belonged to no step. This repo has already fixed exactly this once, for llm
+    spans -- an unattributed cost row is a number nobody can act on, which is the whole
+    reason the ledger exists.
     """
     completion = await router.complete(
         TaskClass.CLASSIFY,
@@ -965,6 +978,7 @@ async def _call(
         ],
         tools=[tool],
         budget=budget,
+        trace=dict(trace) if trace else None,
     )
     meter.record(completion)
 
@@ -981,6 +995,7 @@ async def _decide(
     router: ModelRouter,
     budget: BudgetState | None,
     meter: _CostMeter,
+    trace: Mapping[str, str] | None = None,
 ) -> _Decision:
     """Decide whether to retrieve, and what to search for."""
     parts = [f"Task or question:\n{question}"]
@@ -993,6 +1008,7 @@ async def _decide(
         tool=DECISION_TOOL,
         budget=budget,
         meter=meter,
+        trace=trace,
     )
 
     if arguments is None:
@@ -1034,6 +1050,7 @@ async def _rewrite(
     router: ModelRouter,
     budget: BudgetState | None,
     meter: _CostMeter,
+    trace: Mapping[str, str] | None = None,
 ) -> _Rewritten:
     """Ask for a materially different query after a failed attempt."""
     if graded:
@@ -1055,6 +1072,7 @@ async def _rewrite(
         tool=REWRITE_TOOL,
         budget=budget,
         meter=meter,
+        trace=trace,
     )
 
     if arguments is None:
@@ -1089,6 +1107,7 @@ async def _grade(
     router: ModelRouter,
     budget: BudgetState | None,
     meter: _CostMeter,
+    trace: Mapping[str, str] | None = None,
 ) -> _Grading:
     """Grade every retrieved chunk, structurally.
 
@@ -1111,6 +1130,7 @@ async def _grade(
         tool=GRADE_TOOL,
         budget=budget,
         meter=meter,
+        trace=trace,
     )
 
     notes: list[str] = []
