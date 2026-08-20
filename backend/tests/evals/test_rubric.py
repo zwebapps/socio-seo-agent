@@ -491,11 +491,22 @@ def test_report_names_the_fake_provider_when_run_unconfigured() -> None:
     assert "harness" in report.lower()
 
 
-def test_report_marks_ragas_as_absent_rather_than_inventing_numbers() -> None:
+def test_report_marks_the_llm_judged_metrics_as_absent_rather_than_inventing_numbers() -> None:
+    """Faithfulness and answer relevancy are absent by default, never zero.
+
+    This test used to assert `ragas not installed`, which was true until the LLM-judged
+    arm landed. The claim it was really protecting is unchanged and is what is asserted
+    now: with the arm off, the report says the metrics were **not measured** and puts no
+    number in their place. The arm's own behaviour is covered by
+    `test_deepeval_arm.py`; this stays here because it is a property of the *report*.
+    """
     report = render_report(config=RunConfig(live=False), rows=[], notes=[])
 
+    assert "not measured" in report.lower()
+    assert "faithfulness" in report.lower()
+    # And it still explains the choice of judging library, because a reader who knows
+    # the requirement said "Ragas or DeepEval" will want to know why not Ragas.
     assert "ragas" in report.lower()
-    assert "not installed" in report.lower()
 
 
 def test_report_states_the_tracing_backend() -> None:

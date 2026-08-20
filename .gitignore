@@ -25,6 +25,12 @@ frontend/tsconfig.tsbuildinfo
 data/
 *.log
 
+# DeepEval's local state directory. Created on import by the LLM-judged eval arm
+# (evals/deepeval_arm.py); holds a machine-local anonymous id and cached settings,
+# which is per-developer scratch rather than part of the deliverable.
+.deepeval/
+.deepeval-cache/
+
 # Local AI-agent tooling. Kept on disk so /next and the architect work in this
 # project without borrowing another project's config, but deliberately untracked:
 # it is personal build machinery, not part of the deliverable.

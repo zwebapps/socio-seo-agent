@@ -37,10 +37,14 @@ correctly refuses to ground anything and ``rag_on`` collapses onto ``rag_off`` -
 the oracle column is what makes that visible as a retrieval result rather than a
 missing feature.
 
-**Ragas is not installed** (it is phase-gated in ``pyproject.toml``). The
-faithfulness and answer-relevancy columns are therefore rendered as ``n/a
-(ragas not installed)``. They are not estimated, approximated, or filled in from
-the deterministic scores.
+**Faithfulness and answer relevancy are LLM-judged, opt-in, and off by default.**
+``--deepeval`` adds a second arm built on DeepEval's own metric classes (see
+``evals/deepeval_arm.py``, which also records why DeepEval rather than Ragas). It
+follows ``--live``'s posture exactly: off unless asked for, so CI stays hermetic,
+and the report states which state produced its numbers. The five deterministic
+scorers run and are reported either way -- the judged arm is an addition, never a
+replacement. A metric that was not measured renders as ``n/m``, never as ``0.00``:
+the same rule this project applies to ``no_answer`` in share-of-voice.
 """
 
 from __future__ import annotations
@@ -81,6 +85,15 @@ from backend.app.services.kb_service import (
     retrieve,
 )
 from evals.dataset import CASES, EvalCase
+from evals.deepeval_arm import (
+    ANSWER_RELEVANCY,
+    FAITHFULNESS,
+    NOT_MEASURED_CELL,
+    DeepEvalArm,
+    DeepEvalRunStatus,
+    JudgedArm,
+    arm_off_status,
+)
 from evals.rubric import (
     ChannelLimits,
     Rendering,
@@ -128,8 +141,6 @@ CITATION_RE: Final = re.compile(r"\[chunk:([^\]\s]+)\]")
 #: using 1536 dimensions would be theatre.
 EMBED_DIMS: Final = 64
 
-RAGAS_NOTE: Final = "n/a (ragas not installed)"
-
 type Arm = Literal["rag_off", "rag_on"]
 
 
@@ -164,6 +175,17 @@ class RunConfig:
     #: executable so the improvement over it can be re-measured on demand rather
     #: than taken on trust.
     prompt_version: str = DEFAULT_PROMPT_VERSION
+    #: Run the LLM-judged DeepEval arm (`evals/deepeval_arm.py`) as well as the five
+    #: deterministic scorers.
+    #:
+    #: Off by default, for the same reason `live` is: it costs model calls -- about
+    #: seven judge calls per case-arm on top of generation -- and a report that
+    #: quietly billed a key sitting in `.env` would walk straight through the money
+    #: guardrail in `CLAUDE.md`. Independent of `live` on purpose: `--deepeval`
+    #: without `--live` exercises the whole judged path against `FakeProvider`, which
+    #: is what proves the plumbing is hermetic and that an unjudgeable output is
+    #: reported as `n/m` rather than as 0.00.
+    deepeval: bool = False
 
     @property
     def env(self) -> Mapping[str, str] | None:
@@ -370,6 +392,10 @@ class ArmResult:
     #: crediting the wrong component.
     hashtags_removed: int = 0
     hashtag_shortfall: int = 0
+    #: The LLM-judged metrics for this arm, or `None` when `--deepeval` was not
+    #: passed. `None` and "judged, but the judge failed" are different facts and are
+    #: rendered differently -- see `_judged_cell`.
+    judged: JudgedArm | None = None
 
     @property
     def mean_score(self) -> float:
@@ -742,11 +768,24 @@ def _score_arm(
 
 
 async def run_case(
-    case: EvalCase, *, router: ModelRouter, tracer: Tracer, config: RunConfig
+    case: EvalCase,
+    *,
+    router: ModelRouter,
+    tracer: Tracer,
+    config: RunConfig,
+    judged_arm: DeepEvalArm | None = None,
 ) -> CaseRow:
-    """Run both arms of one case and score them."""
+    """Run both arms of one case and score them.
+
+    `judged_arm` is the opt-in LLM judge. `None` -- the default -- means the
+    deterministic rubric alone, which is what CI runs.
+    """
     corpus = await build_corpus(case)
     oracle = dict(corpus.chunks)
+    # The retrieval query, reused verbatim as the judge's `input`: it is literally
+    # what was asked for, so answer relevancy is measured against the real request
+    # rather than against a paraphrase invented for the judge.
+    request = f"{case.brief} Keyword: {case.target_keyword}."
 
     # ---- arm 1: RAG off. No documents offered at all. ---- #
     off_budget = BudgetState(limit_usd=config.budget_usd)
@@ -764,6 +803,20 @@ async def run_case(
     off_grounding = _grounding_triple(
         off_text, cited=_cited_ids(off_text), retrieved={}, oracle=oracle
     )
+    # No retrieval context by definition, so faithfulness has nothing to check
+    # against and comes back `not measured`. That is the honest reading: an
+    # ungrounded arm is unverifiable, not unfaithful.
+    off_judged = (
+        await judged_arm.judge(
+            case_id=case.case_id,
+            arm="rag_off",
+            request=request,
+            output=off_text,
+            retrieval_context=(),
+        )
+        if judged_arm is not None
+        else None
+    )
     rag_off = ArmResult(
         arm="rag_off",
         text=off_text,
@@ -779,6 +832,7 @@ async def run_case(
         cost_usd=off_usd,
         hashtags_removed=off_enforced.removed,
         hashtag_shortfall=off_enforced.shortfall,
+        judged=off_judged,
     )
 
     # ---- arm 2: RAG on. The real agentic retrieval loop. ---- #
@@ -831,6 +885,20 @@ async def run_case(
     on_text = on_enforced.text
     on_cited = _cited_ids(on_text)
     on_grounding = _grounding_triple(on_text, cited=on_cited, retrieved=retrieved, oracle=oracle)
+    # The judge sees exactly the passages the shipped retrieval loop KEPT -- not the
+    # oracle, and not the ones the model claimed to cite. Anything wider would let
+    # faithfulness pass on evidence the pipeline never actually had.
+    on_judged = (
+        await judged_arm.judge(
+            case_id=case.case_id,
+            arm="rag_on",
+            request=request,
+            output=on_text,
+            retrieval_context=tuple(retrieved.values()),
+        )
+        if judged_arm is not None
+        else None
+    )
     rag_on = ArmResult(
         arm="rag_on",
         text=on_text,
@@ -847,6 +915,7 @@ async def run_case(
         error=error,
         hashtags_removed=on_enforced.removed,
         hashtag_shortfall=on_enforced.shortfall,
+        judged=on_judged,
     )
 
     # ---- the control: the human reference answer, same three conditions ---- #
@@ -902,11 +971,28 @@ def _dimension_score(results: Sequence[RubricResult], dimension: str) -> str:
     return "—"
 
 
+def _judged_cell(arm: ArmResult, metric: str) -> str:
+    """One LLM-judged table cell.
+
+    Three distinguishable states, and keeping them distinguishable is the whole
+    point: ``—`` the arm never ran, ``n/m`` it ran and the judge produced no usable
+    answer, and a number. A metric that was never measured must never render as
+    ``0.00`` -- the same rule this project applies to ``no_answer`` in share of
+    voice, and for the same reason.
+    """
+    judged = arm.judged
+    if judged is None:
+        return "—"
+    outcome = judged.faithfulness if metric == FAITHFULNESS else judged.answer_relevancy
+    return outcome.cell()
+
+
 def render_report(
     *,
     config: RunConfig,
     rows: Sequence[CaseRow],
     notes: Sequence[str],
+    deepeval: DeepEvalRunStatus | None = None,
 ) -> str:
     """Render the markdown report. Pure: no I/O, so it is testable.
 
@@ -916,13 +1002,15 @@ def render_report(
     """
     providers = config_status(env=config.env)
     tracing = tracing_status(env=config.env)
+    judged = deepeval if deepeval is not None else arm_off_status()
     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     lines: list[str] = [
         "# Evaluation report",
         "",
         f"Generated {generated_at} · `uv run python evals/run.py"
-        f"{' --live' if config.live else ''}`",
+        f"{' --live' if config.live else ''}"
+        f"{' --deepeval' if config.deepeval else ''}`",
         "",
         "## What produced these numbers",
         "",
@@ -959,22 +1047,24 @@ def render_report(
         "skipped, and a 403/404 on one model falls through to the next, so the model that "
         "served is not always the first listed — the per-case rows carry the actual model.",
         f"- **Tracing:** {tracing.message}",
-        f"- **Ragas faithfulness / answer relevancy:** {RAGAS_NOTE}. The columns are "
-        "reserved and rendered empty; no value is estimated from the deterministic "
-        "scores, because a faithfulness number that is really a rubric average would "
-        "be a fabrication.",
+        f"- **LLM-judged metrics (DeepEval — faithfulness, answer relevancy):** {judged.note}",
         f"- **Generation prompt:** `{config.prompt_version}` "
         f"({', '.join(f'`{label}`' for label in _PROMPT_LABELS[config.prompt_version])}). "
         "Rerun with `--prompt-version v1` to reproduce the original numbers; v1 is kept "
         "executable so a prompt improvement stays a measurement rather than a claim.",
         f"- **Cases:** {len(rows)} of {len(CASES)} in the eval set.",
-        "- **Scoring:** deterministic (`evals/rubric.py`). No model is used as a judge.",
+        "- **Scoring:** five deterministic scorers (`evals/rubric.py`) — no model is "
+        "used as a judge for any of them, and they are the numbers the `mean` column "
+        "and every aggregate below are built from. The two LLM-judged columns are "
+        "reported separately and are deliberately **excluded** from the mean, so a "
+        "judge's opinion cannot move a deterministic average.",
         "",
     ]
 
     lines += _render_per_case(rows)
     lines += _render_aggregate(rows)
     lines += _render_rag_comparison(rows)
+    lines += _render_judged(rows, judged)
     lines += _render_self_check(rows)
     lines += _render_fatal(rows)
 
@@ -995,10 +1085,13 @@ def _render_per_case(rows: Sequence[CaseRow]) -> list[str]:
         "channel: a social post has no title tag, so scoring one would produce a number "
         "about nothing. **`n/e`** means *not exercised* — the cell scored 1.00 only "
         "because there was nothing to check (no figures to trace, no banned claim "
-        "configured), which is an absence of risk rather than a pass.",
+        "configured), which is an absence of risk rather than a pass. The two "
+        "rightmost columns are LLM-judged and are **not** in the `mean`: **`—`** means "
+        "the `--deepeval` arm did not run, and **`n/m`** means it ran but the judge "
+        "returned nothing usable. Neither is ever rendered as `0.00`.",
         "",
         "| case | channel | arm | seo | brand | format | grounding | coverage | mean | "
-        "ragas faithfulness | ragas relevancy |",
+        "faithfulness | answer relevancy |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in rows:
@@ -1010,7 +1103,9 @@ def _render_per_case(rows: Sequence[CaseRow]) -> list[str]:
                 f"{_dimension_score(arm.results, 'format')} | "
                 f"{_dimension_score(arm.results, 'grounding')} | "
                 f"{_dimension_score(arm.results, 'coverage')} | "
-                f"**{_fmt(arm.mean_score)}** | — | — |"
+                f"**{_fmt(arm.mean_score)}** | "
+                f"{_judged_cell(arm, FAITHFULNESS)} | "
+                f"{_judged_cell(arm, ANSWER_RELEVANCY)} |"
             )
     lines.append("")
     return lines
@@ -1146,6 +1241,94 @@ def _render_rag_comparison(rows: Sequence[CaseRow]) -> list[str]:
     return lines
 
 
+def _render_judged(rows: Sequence[CaseRow], judged: DeepEvalRunStatus) -> list[str]:
+    """The LLM-judged arm: what it measured, what it cost, and what it could not do.
+
+    Rendered whether or not the arm ran, because "these two metrics were not measured"
+    is a fact a reader needs and an omitted section does not state it. The deterministic
+    rubric above is untouched by anything here.
+    """
+    lines = [
+        "## LLM-judged metrics (DeepEval)",
+        "",
+        "The five scorers above are arithmetic, and that leaves one hole they have "
+        "always named: a sentence can cite a real chunk and then misdescribe it in "
+        "words. Closing it needs a reader, so this arm adds one — `FaithfulnessMetric` "
+        "and `AnswerRelevancyMetric` from DeepEval, with the judge routed through our "
+        "own `ModelRouter` (`TaskClass.REVIEW`) rather than DeepEval's default OpenAI "
+        "client, so it obeys the routing table, the pre-call budget guard and the cost "
+        "ledger like every other model call in this codebase. It is a **second arm, "
+        "never a replacement**: the deterministic scores are unchanged by it and remain "
+        "what the aggregate is built from.",
+        "",
+        f"- **State:** {judged.note}",
+        "",
+    ]
+
+    if not judged.requested:
+        lines += [
+            "Faithfulness is the semantic half of `grounding`; answer relevancy has no "
+            "deterministic counterpart here at all (`coverage` checks that required "
+            "strings appear, not that the copy answers the brief). Both are absent from "
+            "this report rather than approximated.",
+            "",
+            "`evals/deepeval_arm.py` also records why DeepEval and not Ragas: "
+            "`ragas>=0.4.3` pulls `instructor`, which caps `openai<3.0.0`, and this "
+            "project pins `openai>=3.2.0` because the shipped adapter is built on it; "
+            "`ragas==0.3.1` avoids that pin but imports a langchain-community module "
+            "that no longer exists. That is a version wall, not a preference.",
+            "",
+        ]
+        return lines
+
+    lines += [
+        # Six decimal places, not `str(Decimal)`: an exact zero renders as `0E-8`,
+        # which reads like a bug rather than like "nothing was spent".
+        f"- **Judge calls:** {judged.calls} · **judge cost:** "
+        f"${judged.cost_usd:.6f} (from the router's own usage figures, not an estimate)",
+        f"- **Measurements returned a score:** {judged.measured} of {judged.attempted}",
+        "",
+        "`rag_off` has no retrieval context by construction, so **faithfulness is "
+        "reported as `n/m` for that arm rather than 0.00** — an ungrounded output is "
+        "unverifiable, not unfaithful, and scoring it zero would blame the model for "
+        "the absence of evidence. `rag_on` is judged against exactly the passages the "
+        "shipped retrieval loop kept: not the oracle, and not the ids the model claimed "
+        "to cite.",
+        "",
+        "| arm | faithfulness (measured cases) | answer relevancy (measured cases) |",
+        "|---|---|---|",
+    ]
+    for arm_name in ("rag_off", "rag_on"):
+        arms = [getattr(row, arm_name) for row in rows]
+        lines.append(
+            f"| {arm_name} | {_judged_mean(arms, FAITHFULNESS)} | "
+            f"{_judged_mean(arms, ANSWER_RELEVANCY)} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _judged_mean(arms: Sequence[ArmResult], metric: str) -> str:
+    """Mean of one judged metric over the cases where it was actually measured.
+
+    The denominator is the measured cases, and the cell says so. Averaging an
+    unmeasured case in as 0.0 would let a judge outage read as a quality collapse;
+    silently averaging over fewer cases without saying so would be worse.
+    """
+    scores = [
+        outcome.score
+        for arm in arms
+        if arm.judged is not None
+        for outcome in (
+            arm.judged.faithfulness if metric == FAITHFULNESS else arm.judged.answer_relevancy,
+        )
+        if outcome.score is not None
+    ]
+    if not scores:
+        return f"{NOT_MEASURED_CELL} (0 of {len(arms)})"
+    return f"{sum(scores) / len(scores):.2f} ({len(scores)} of {len(arms)})"
+
+
 def _render_self_check(rows: Sequence[CaseRow]) -> list[str]:
     references_ok = sum(1 for row in rows if row.reference_brand_passed)
     mutations_caught = sum(1 for row in rows if not row.violating_brand_passed)
@@ -1200,10 +1383,14 @@ def _render_limitations() -> list[str]:
         "1. **Whether the copy is any good.** Nothing here judges persuasion, tone, "
         "register or German grammar. A fluent, on-brand, useless paragraph scores the "
         "same as a good one.",
-        "2. **Semantic faithfulness.** `score_grounding` checks that the *figures* in a "
-        "claim appear in a cited chunk. A sentence that cites a real chunk and then "
-        "misdescribes it in words passes. That is the gap Ragas would close, and Ragas "
-        "is not installed.",
+        "2. **Semantic faithfulness — deterministically.** `score_grounding` checks "
+        "that the *figures* in a claim appear in a cited chunk. A sentence that cites a "
+        "real chunk and then misdescribes it in words passes. That is the gap the "
+        "opt-in `--deepeval` arm exists to close, and it closes it with a **model's "
+        "opinion**, not a proof: an LLM judge is itself non-deterministic, is not "
+        "reproducible run to run, and its own error rate is unmeasured here. Read a "
+        "faithfulness number as a second reader, never as a verdict — which is also "
+        "why it is kept out of the deterministic mean.",
         "3. **Rankings.** The SEO column is a deterministic on-page audit. It does not "
         "predict Google positions, and a 1.00 is not a promise of traffic.",
         "4. **The article renderer.** It does not exist yet (Phase 6). For article cases "
@@ -1250,6 +1437,19 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         ),
     )
     parser.add_argument(
+        "--deepeval",
+        action="store_true",
+        help=(
+            "also run the LLM-judged arm (DeepEval faithfulness + answer relevancy), "
+            "with the judge routed through our own ModelRouter. Off by default, like "
+            "--live. Combined with --live it SPENDS MORE MONEY: roughly seven "
+            "mid-tier judge calls per case-arm on top of generation. Without --live "
+            "the judge is FakeProvider, so every metric is reported as `n/m` (not "
+            "measured) — useful for exercising the path hermetically, useless as a "
+            "measurement, and the report says so."
+        ),
+    )
+    parser.add_argument(
         "--tier",
         choices=[tier.value for tier in ModelTier if tier is not ModelTier.EMBED],
         default=None,
@@ -1284,6 +1484,7 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         only=tuple(parsed.case),
         tier=None if parsed.tier is None else ModelTier(parsed.tier),
         prompt_version=str(parsed.prompt_version),
+        deepeval=bool(parsed.deepeval),
     )
 
 
@@ -1294,6 +1495,10 @@ async def run(config: RunConfig) -> tuple[str, list[CaseRow]]:
     task_tiers = None if config.tier is None else {**TASK_TIERS, TaskClass.GENERATE: config.tier}
     router = ModelRouter(env=config.env, task_tiers=task_tiers)
     tracer = get_tracer(env=config.env)
+    # Built unconditionally, but inert unless `--deepeval` was passed: with
+    # `requested=False` it never imports DeepEval and `judge()` returns None, so the
+    # default path is exactly what it was before this arm existed.
+    judged_arm = DeepEvalArm(router, requested=config.deepeval, env=config.env)
 
     cases = [case for case in CASES if not config.only or case.case_id in config.only]
     notes: list[str] = []
@@ -1302,12 +1507,29 @@ async def run(config: RunConfig) -> tuple[str, list[CaseRow]]:
 
     rows: list[CaseRow] = []
     for case in cases:
-        row = await run_case(case, router=router, tracer=tracer, config=config)
+        row = await run_case(
+            case, router=router, tracer=tracer, config=config, judged_arm=judged_arm
+        )
         if row.rag_on.error:
             notes.append(f"`{case.case_id}`: retrieval failed — {row.rag_on.error}")
         rows.append(row)
 
-    return render_report(config=config, rows=rows, notes=notes), rows
+    status = judged_arm.status()
+    # Judge failures are RUN NOTES, not silent degradation. The cells already read
+    # `n/m`; without the reason a reader cannot tell an unparseable reply from an
+    # exhausted budget, and both are things a maintainer needs to see.
+    #
+    # Capped, because under FakeProvider every single measurement fails with the same
+    # message and 80 identical lines would bury the notes that matter.
+    if status.requested and judged_arm.errors:
+        failures = judged_arm.errors
+        notes += [f"LLM judge failed — {failure}" for failure in failures[:5]]
+        if len(failures) > 5:
+            notes.append(
+                f"LLM judge failed {len(failures)} times in total; the first 5 are listed."
+            )
+
+    return render_report(config=config, rows=rows, notes=notes, deepeval=status), rows
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1351,7 +1573,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "--live: calling real providers. THIS SPENDS MONEY. "
             f"Available: {', '.join(status.available_providers)}. "
-            f"GENERATE tier: {tier.value}.",
+            f"GENERATE tier: {tier.value}."
+            + (
+                " --deepeval is also on, so an LLM judge runs on the "
+                f"{TASK_TIERS[TaskClass.REVIEW].value} tier: roughly seven more calls "
+                "per case-arm."
+                if config.deepeval
+                else ""
+            ),
+            file=sys.stderr,
+        )
+    elif config.deepeval:
+        # Not an error, unlike --live without a credential: the hermetic judged path is
+        # worth running (it proves the plumbing and the `n/m` degradation). But it
+        # measures nothing, so it must not be mistaken for a judged run.
+        print(
+            "--deepeval without --live: the judge will be FakeProvider, so every "
+            "faithfulness and relevancy cell will read `n/m` (not measured). This "
+            "exercises the judged path hermetically; it does not measure anything.",
             file=sys.stderr,
         )
 

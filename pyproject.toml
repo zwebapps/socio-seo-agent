@@ -46,7 +46,10 @@ dependencies = [
 
 # Still phase-gated, added when the phase that needs them lands:
 #   pypdf, python-docx  (the kb engine's pdf/docx extractors raise until then)
-#   Phase 12 langfuse, ragas
+#   Phase 12 langfuse
+# Ragas is NOT on that list any more: it is not installable against these pins, so the
+# LLM-judged eval arm uses DeepEval instead. See docs/ARCHITECTURE.md section 14 and
+# the docstring of evals/deepeval_arm.py for the full reasoning.
 
 [dependency-groups]
 dev = [
@@ -60,6 +63,14 @@ dev = [
     # network. Hermetic tests for that surface need httpx2.MockTransport, so the
     # transitive dependency is declared explicitly rather than relied upon.
     "httpx2>=0.28.0",
+    # The LLM-judged eval arm (evals/deepeval_arm.py): FaithfulnessMetric and
+    # AnswerRelevancyMetric, which close the one hole the deterministic rubric names
+    # -- a claim that cites a real chunk and misdescribes it in words. A DEV
+    # dependency, not a runtime one: nothing the product serves imports it. The judge
+    # itself goes through our own ModelRouter, so no DeepEval-side model credential
+    # exists; its pytest plugin is disabled in `addopts` and its telemetry and dotenv
+    # autoloading are forced off before import, because both would reach outside a
+    # suite that promises never to.
     "deepeval>=4.1.8",
 ]
 
@@ -92,7 +103,14 @@ exclude = ["frontend"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["backend/tests"]
-addopts = "-q --strict-markers"
+# `-p no:deepeval` disables DeepEval's auto-registered pytest plugin. It loads in
+# EVERY session simply because deepeval is installed -- before conftest.py runs, so
+# before the credential strip -- and it opens a telemetry scope at session start and
+# closes it at session finish. Nothing in this suite uses `assert_test`, so the plugin
+# has no job here; leaving it on would mean the whole test run depends on DeepEval's
+# own "skip if empty" logic to stay off the network. The LLM-judged eval arm imports
+# deepeval directly (`evals/deepeval_arm.py`), which is unaffected by this.
+addopts = "-q --strict-markers -p no:deepeval"
 markers = [
     "db: needs a live Postgres; skipped when unreachable, always run in CI",
 ]
