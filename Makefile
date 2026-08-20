@@ -1,5 +1,5 @@
 # Development entry points. Run everything from this directory.
-.PHONY: help install up down logs api web dev test lint format typecheck check images clean
+.PHONY: help install up down logs api web dev test lint format typecheck check images clean ragas-env
 
 help:
 	@echo "make install    install python + node dependencies"
@@ -9,6 +9,7 @@ help:
 	@echo "make web        run Next.js with hot reload on :3100"
 	@echo "make test       pytest"
 	@echo "make check      lint + format check + typecheck + test   (what CI runs)"
+	@echo "make ragas-env  build .venv-ragas, the isolated env the Ragas eval arm runs in"
 	@echo "make images     build both docker images locally"
 
 install:
@@ -55,6 +56,18 @@ check: lint typecheck test
 images:
 	docker build -f backend/Dockerfile -t sma-api:local .
 	docker build -f frontend/Dockerfile -t sma-web:local frontend
+
+# The Ragas eval arm runs OUT-OF-PROCESS, in its own virtualenv, and it has to: `ragas`
+# depends on `instructor`, which caps `openai<3.0.0`, while this project pins
+# `openai>=3.2.0` deliberately (v3 is built on httpx2). See ARCHITECTURE.md section 14.
+#
+# Idempotent: safe to re-run, and re-running is how you pick up a change to
+# evals/ragas-requirements.txt. Gitignored -- a second virtualenv is a build artifact.
+ragas-env:
+	uv venv .venv-ragas --python 3.13
+	VIRTUAL_ENV=.venv-ragas uv pip install -r evals/ragas-requirements.txt
+	@.venv-ragas/bin/python -c "import ragas; print(f'ragas {ragas.__version__} ready in .venv-ragas')"
+	@uv run python -m evals.ragas_arm || true
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache frontend/.next

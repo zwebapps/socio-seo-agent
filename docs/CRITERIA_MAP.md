@@ -29,7 +29,7 @@ a separate file would have been a second copy to let rot:
 | Core functionality | 10-node graph: intake → harvest → opportunity → plan → generate → validate → repack → review → export → measure | `agents/graph.py` | 3–11 |
 | User interactions | onboarding, document upload, opportunity selection, edit, approve/reject, brand voice, tool toggles, model settings | `frontend/app/(app)/` | 2–12 |
 | User-friendly UI for **all** functionality | every backend capability has a screen; user mode vs `/developer` mode | `frontend/` | 2–13 |
-| Appropriate tools/libraries | LangGraph (`StateGraph`, genuinely imported — see the note below), FastAPI, Pydantic, pgvector, Next.js, Langfuse, **DeepEval** (not Ragas — see the note below), Vitest + React Testing Library | `pyproject.toml`, `ARCHITECTURE.md` §5, §14 | — |
+| Appropriate tools/libraries | LangGraph (`StateGraph`, genuinely imported — see the note below), FastAPI, Pydantic, pgvector, Next.js, Langfuse, **DeepEval** and **Ragas** (see the note below), Vitest + React Testing Library | `pyproject.toml`, `ARCHITECTURE.md` §5, §14 | — |
 | Error handling | typed engine errors, bounded retries, provider fallback (403/404 falls through the chain, 401/402 fails fast), partial-failure degradation, caps, and two deliberate **fail-open** decisions with the reasoning recorded — a breach-lookup outage must not stop signups, and a rate-limit backend outage must not lock everyone out | `ARCHITECTURE.md` §7, §14, `ROADMAP.md` §10 | 6, 9 |
 | Real-world usage | resumable runs, idempotent actuators, budgets, rate limits, RLS, audit log | `ARCHITECTURE.md` §3, §6, §7 | 9 |
 | Documentation | 6 documents + in-app help assistant | `docs/`, `README.md` | 13 |
@@ -194,15 +194,33 @@ the timeline and the resume path already read it and two stores for the same fac
 worse than one. Say "compiled as a LangGraph `StateGraph`", not "built on LangGraph's
 persistence".
 
-**Ragas → DeepEval.** The criteria say "Ragas or DeepEval" and this project uses
-**DeepEval**, for a reason rather than a preference: `ragas>=0.4.3` depends on
-`instructor`, which caps `openai<3.0.0`, and this project pins `openai>=3.2.0`
-deliberately (v3 is built on httpx2 — see the dev-dependency comment about respx);
-`ragas==0.3.1` imports `langchain_community.chat_models.vertexai`, which no longer
-exists in langchain-community 1.x. Both are recorded in `BACKLOG.md` as an OPEN item
-rather than quietly substituted. The five deterministic scorers are unchanged and still
-gate drafts — the LLM-judged metrics are added ALONGSIDE them, which is also what makes
-it possible to show where a judge and arithmetic disagree.
+**Ragas AND DeepEval.** The criteria say "Ragas or DeepEval"; both are here, behind
+`--deepeval` and `--ragas`, off by default. They are different mechanisms and the
+difference is the point.
+
+**DeepEval judges in-process**, with the judge routed through our own `ModelRouter` —
+so it inherits the routing table, the budget guard and the cost ledger.
+
+**Ragas cannot run in-process at all**, and that is a version wall rather than a
+preference: `ragas` depends on `instructor`, which caps `openai<3.0.0`, while this
+project pins `openai>=3.2.0` deliberately (v3 is built on httpx2 — see the
+dev-dependency comment about respx). `ragas==0.3.1` escapes the pin and then fails at
+import on `langchain_community.chat_models.vertexai`, removed in langchain-community
+1.x. So it runs in `.venv-ragas` (`make ragas-env`) as a subprocess. What that costs is
+printed in the report: no per-call budget guard, no fallback chain. What it keeps: the
+judge's model id comes from our routing table, and the child reports token usage back so
+the spend is priced with our own table.
+
+**Both arms refuse to score an ungrounded output, and the Ragas one had to be made to.**
+Driven against a stub judge, Ragas returned `faithfulness = 1.00` for a sample whose
+retrieval context was EMPTY — nothing there to contradict, so every claim passes. That
+number would have been the highest in the report and the most meaningless, so it is
+discarded with the reason kept. This is the same rule as `no_answer` being excluded from
+the share-of-voice denominator: a measurement nobody made must not read as a good result.
+
+The five deterministic scorers are unchanged, still gate drafts, and the judged columns
+are excluded from their mean. Running both judges together is the interesting case:
+where they disagree on the same text, that gap measures the JUDGES.
 
 **One demo step below is aspirational and is marked so.** Step 5 ("open the retrieval
 trace") has no UI: `RetrievalTrace` is produced, carries every grade and the fallback

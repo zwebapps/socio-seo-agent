@@ -509,24 +509,41 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   and every test in `tests/agents/test_graph.py` now runs against BOTH, because a fallback that
   is not equivalent is not a fallback. The builtin driver should be deleted if it goes a release
   untouched.
-- [ ] **Ragas is not used, and the reason is now measured rather than inferred.** The module
-  criteria say "Ragas or DeepEval"; this project uses **DeepEval**. Ragas cannot share a venv
-  with this codebase: `ragas>=0.4.3` depends on `instructor`, which caps `openai<3.0.0`, and
-  this project pins `openai>=3.2.0` deliberately (v3 is built on httpx2, which is why `httpx2`
-  is a declared dev dependency and why respx cannot intercept our provider calls).
-  `ragas==0.3.1` escapes that pin but imports `langchain_community.chat_models.vertexai`,
-  which no longer exists in langchain-community 1.x.
+- [x] **Ragas is used, out-of-process** — the criteria name it, so it is there. It cannot
+  share a venv with this codebase: `ragas` depends on `instructor`, which caps
+  `openai<3.0.0`, while this project pins `openai>=3.2.0` deliberately (v3 is built on
+  httpx2, which is why `httpx2` is a declared dev dependency and why respx cannot
+  intercept our provider calls). `ragas==0.3.1` escapes that pin and then fails at import
+  on `langchain_community.chat_models.vertexai`, removed in langchain-community 1.x.
 
-  **Checked, not assumed (2026-08-20):** in an ISOLATED venv, `ragas==0.4.3` +
-  `openai==2.54.0` + `langchain-community<0.4` installs and imports its metrics cleanly. So
-  Ragas is reachable out-of-process — a second venv driven as a subprocess with a JSON
-  handoff — and that is deliberately NOT done, for three reasons worth more than the label:
-  the judge could no longer go through our `ModelRouter`, so it would lose the routing table,
-  the budget guard and the cost ledger and would call a provider directly with its own key;
-  two openai SDK majors would live in one repo; and CI would need a second environment to
-  install and cache. DeepEval gives the same graded credit with the judge inside our own
-  accounting. Left OPEN so a reader grading against the literal word "Ragas" finds this
-  paragraph rather than a silent substitution.
+  So `evals/ragas_arm.py` drives `evals/ragas_runner.py` inside `.venv-ragas`
+  (`make ragas-env`, pinned in `evals/ragas-requirements.txt`) as a subprocess with JSON
+  in and JSON out, behind `--ragas`, off by default. Batched — Ragas evaluates a dataset,
+  so one interpreter start covers every case rather than eighty. What the boundary costs
+  is stated in the report itself: no per-call budget guard and no fallback chain. What it
+  keeps: the judge's model id is resolved from OUR routing table (so a tier change still
+  moves the judge and no model id is written at a call site), and the child reports token
+  usage back so the spend is priced with our own table.
+
+  Verified through the real subprocess against a local stub judge: 4 judge calls, usage
+  tallied, faithfulness scored on the grounded arm. **That run also found a real problem:
+  Ragas returns `faithfulness = 1.00` for a sample whose retrieval context is EMPTY** —
+  there is nothing there to contradict, so every claim passes by default. That would put
+  the report's best number on its least grounded output, so the score is discarded on the
+  way back with the reason kept. `answer_relevancy` needs an embeddings endpoint (Ragas
+  embeds generated questions against the original); without one it reads `n/m` rather
+  than a number derived from nothing.
+
+  Both judged arms now exist and both are opt-in. Running the two together is the
+  interesting case: where they disagree on the same text, the gap is a measurement of the
+  JUDGES, which is why the report renders them side by side instead of picking one.
+- [ ] **A live Ragas measurement has not been obtained**, only a stubbed one. `--ragas
+  --live` needs a real key and spends real money (several judge calls per case-arm), so
+  it is ⛔ under the money guardrail. Everything up to the provider call is proven.
+- [ ] **`answer_relevancy` is unmeasured on both arms until an embeddings endpoint is
+  configured.** Ragas needs one; our `RouterEmbedder` reports `using_fake` because no
+  embeddings provider is set. Set `RAGAS_EMBEDDINGS_MODEL` (and a key that serves
+  embeddings) to fill that column. Reported as `n/m` meanwhile, never as a score.
 - [ ] **`evals/report.md` still names Ragas in its header and its column titles.** The
   checked-in report is a real `--live` run (2026-08-19, `gpt-4.1-mini`, real money), and
   regenerating it hermetically would overwrite measured numbers with FakeProvider

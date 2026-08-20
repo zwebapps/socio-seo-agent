@@ -56,7 +56,7 @@ import math
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -94,6 +94,8 @@ from evals.deepeval_arm import (
     JudgedArm,
     arm_off_status,
 )
+from evals.judged import ARM_OFF_CELL
+from evals.ragas_arm import RagasArm, RagasRunStatus, ragas_arm_off_status
 from evals.rubric import (
     ChannelLimits,
     Rendering,
@@ -186,6 +188,13 @@ class RunConfig:
     #: is what proves the plumbing is hermetic and that an unjudgeable output is
     #: reported as `n/m` rather than as 0.00.
     deepeval: bool = False
+    #: Run the Ragas arm (`evals/ragas_arm.py`) as well. Its own flag rather than a
+    #: mode of `--deepeval`, because the two are different mechanisms with different
+    #: costs: DeepEval judges in-process through our `ModelRouter`, while Ragas runs
+    #: in `.venv-ragas` as a subprocess because it caps `openai<3` and we pin
+    #: `openai>=3.2`. Running both is the interesting case -- two judges reading the
+    #: same text, where disagreement between them is itself a measurement.
+    ragas: bool = False
 
     @property
     def env(self) -> Mapping[str, str] | None:
@@ -396,6 +405,10 @@ class ArmResult:
     #: passed. `None` and "judged, but the judge failed" are different facts and are
     #: rendered differently -- see `_judged_cell`.
     judged: JudgedArm | None = None
+    #: The same two metrics as judged by RAGAS, filled by `--ragas`. A separate field
+    #: from `judged` on purpose: overwriting one arm's numbers with the other's would
+    #: throw away the comparison that running both exists to produce.
+    judged_ragas: JudgedArm | None = None
 
     @property
     def mean_score(self) -> float:
@@ -774,6 +787,7 @@ async def run_case(
     tracer: Tracer,
     config: RunConfig,
     judged_arm: DeepEvalArm | None = None,
+    ragas_arm: RagasArm | None = None,
 ) -> CaseRow:
     """Run both arms of one case and score them.
 
@@ -817,6 +831,17 @@ async def run_case(
         if judged_arm is not None
         else None
     )
+    # Recorded, not judged: the Ragas arm batches and resolves once the whole dataset
+    # exists. The empty context is passed through truthfully rather than padded, so
+    # faithfulness comes back not measured for this arm there too.
+    if ragas_arm is not None:
+        ragas_arm.record(
+            case_id=case.case_id,
+            arm="rag_off",
+            request=request,
+            output=off_text,
+            retrieval_context=(),
+        )
     rag_off = ArmResult(
         arm="rag_off",
         text=off_text,
@@ -899,6 +924,14 @@ async def run_case(
         if judged_arm is not None
         else None
     )
+    if ragas_arm is not None:
+        ragas_arm.record(
+            case_id=case.case_id,
+            arm="rag_on",
+            request=request,
+            output=on_text,
+            retrieval_context=tuple(retrieved.values()),
+        )
     rag_on = ArmResult(
         arm="rag_on",
         text=on_text,
@@ -993,6 +1026,7 @@ def render_report(
     rows: Sequence[CaseRow],
     notes: Sequence[str],
     deepeval: DeepEvalRunStatus | None = None,
+    ragas: RagasRunStatus | None = None,
 ) -> str:
     """Render the markdown report. Pure: no I/O, so it is testable.
 
@@ -1003,6 +1037,7 @@ def render_report(
     providers = config_status(env=config.env)
     tracing = tracing_status(env=config.env)
     judged = deepeval if deepeval is not None else arm_off_status()
+    ragas_status = ragas if ragas is not None else ragas_arm_off_status()
     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     lines: list[str] = [
@@ -1010,7 +1045,8 @@ def render_report(
         "",
         f"Generated {generated_at} · `uv run python evals/run.py"
         f"{' --live' if config.live else ''}"
-        f"{' --deepeval' if config.deepeval else ''}`",
+        f"{' --deepeval' if config.deepeval else ''}"
+        f"{' --ragas' if config.ragas else ''}`",
         "",
         "## What produced these numbers",
         "",
@@ -1065,6 +1101,7 @@ def render_report(
     lines += _render_aggregate(rows)
     lines += _render_rag_comparison(rows)
     lines += _render_judged(rows, judged)
+    lines += _render_ragas(rows, ragas_status, deepeval=judged)
     lines += _render_self_check(rows)
     lines += _render_fatal(rows)
 
@@ -1329,6 +1366,86 @@ def _judged_mean(arms: Sequence[ArmResult], metric: str) -> str:
     return f"{sum(scores) / len(scores):.2f} ({len(scores)} of {len(arms)})"
 
 
+def _render_ragas(
+    rows: Sequence[CaseRow],
+    status: RagasRunStatus,
+    *,
+    deepeval: DeepEvalRunStatus,
+) -> list[str]:
+    """The Ragas arm: the same two metrics, measured by a different judge.
+
+    Its own section rather than two more columns in the per-case table, for a reason
+    that is about reading rather than layout: when both arms run, the interesting
+    number is not either score but the DISTANCE between them. Two judges reading the
+    same text and disagreeing is a fact about the judges, and it belongs somewhere a
+    reader can see both at once.
+
+    Rendered whether or not the arm ran, because "not measured" is a fact an omitted
+    section cannot state.
+    """
+    lines = [
+        "## LLM-judged metrics (Ragas)",
+        "",
+        "The same two metrics as the DeepEval section, measured by Ragas instead. It "
+        "runs **out-of-process**, in `.venv-ragas`, because `ragas` depends on "
+        "`instructor` which caps `openai<3.0.0` while this project pins "
+        "`openai>=3.2.0` — see `ARCHITECTURE.md` §14. What that costs is stated rather "
+        "than hidden: the judge does not go through `ModelRouter`, so it has no "
+        "per-call budget guard and no fallback chain. What it keeps: the judge's model "
+        "id is resolved from our own routing table, and the subprocess reports its "
+        "token usage back so the spend is priced with our own table and appears below.",
+        "",
+    ]
+
+    if not status.requested:
+        lines += [
+            f"**Not run.** `--ragas` was not passed, so both columns would be "
+            f"`{ARM_OFF_CELL}` and are omitted rather than filled with zeroes.",
+            "",
+        ]
+        return lines
+
+    if not status.available:
+        lines += [
+            f"**Could not run:** {status.note}",
+            "",
+            "Every cell below would be a stated absence, so the table is omitted. "
+            "Nothing here is rendered as `0.00`: a judge that never ran has told us "
+            "nothing about the text.",
+            "",
+        ]
+        return lines
+
+    lines += [
+        f"- judge model: `{status.model or 'unknown'}` · {status.calls} call(s) · "
+        # `quantize` because `Decimal(0)` scaled by the pricing table renders as
+        # `0E-8`, and a cost line is read by people.
+        f"{status.tokens_in}+{status.tokens_out} tokens · "
+        f"${status.cost_usd.quantize(Decimal('0.000001'))}",
+        f"- measured {status.measured} of {status.attempted} metric slots · {status.note}",
+        "",
+        "| case | arm | faithfulness | answer relevancy |",
+        "|---|---|---|---|",
+    ]
+    for row in rows:
+        for arm in (row.rag_off, row.rag_on):
+            judged = arm.judged_ragas
+            faithfulness = judged.faithfulness.cell() if judged else ARM_OFF_CELL
+            relevancy = judged.answer_relevancy.cell() if judged else ARM_OFF_CELL
+            lines.append(f"| `{row.case_id}` | {arm.arm} | {faithfulness} | {relevancy} |")
+    lines.append("")
+
+    if deepeval.requested:
+        lines += [
+            "**Both judges ran.** Compare these cells with the DeepEval section above: "
+            "where the two disagree on the same text, that gap is a measurement of the "
+            "JUDGES, and it is the reason for running both rather than picking one and "
+            "reporting its number as the truth.",
+            "",
+        ]
+    return lines
+
+
 def _render_self_check(rows: Sequence[CaseRow]) -> list[str]:
     references_ok = sum(1 for row in rows if row.reference_brand_passed)
     mutations_caught = sum(1 for row in rows if not row.violating_brand_passed)
@@ -1437,6 +1554,15 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         ),
     )
     parser.add_argument(
+        "--ragas",
+        action="store_true",
+        help=(
+            "run the Ragas arm as well. Needs the isolated environment (`make "
+            "ragas-env`) and a real key: Ragas runs out-of-process because it caps "
+            "openai<3, so it has no fake provider to fall back to."
+        ),
+    )
+    parser.add_argument(
         "--deepeval",
         action="store_true",
         help=(
@@ -1485,6 +1611,7 @@ def parse_args(argv: Sequence[str]) -> RunConfig:
         tier=None if parsed.tier is None else ModelTier(parsed.tier),
         prompt_version=str(parsed.prompt_version),
         deepeval=bool(parsed.deepeval),
+        ragas=bool(parsed.ragas),
     )
 
 
@@ -1499,6 +1626,9 @@ async def run(config: RunConfig) -> tuple[str, list[CaseRow]]:
     # `requested=False` it never imports DeepEval and `judge()` returns None, so the
     # default path is exactly what it was before this arm existed.
     judged_arm = DeepEvalArm(router, requested=config.deepeval, env=config.env)
+    # Collects during the run and judges once at the end: Ragas evaluates a DATASET,
+    # so one interpreter start covers every case instead of eighty.
+    ragas_arm = RagasArm(router, requested=config.ragas, env=config.env)
 
     cases = [case for case in CASES if not config.only or case.case_id in config.only]
     notes: list[str] = []
@@ -1508,11 +1638,30 @@ async def run(config: RunConfig) -> tuple[str, list[CaseRow]]:
     rows: list[CaseRow] = []
     for case in cases:
         row = await run_case(
-            case, router=router, tracer=tracer, config=config, judged_arm=judged_arm
+            case,
+            router=router,
+            tracer=tracer,
+            config=config,
+            judged_arm=judged_arm,
+            ragas_arm=ragas_arm,
         )
         if row.rag_on.error:
             notes.append(f"`{case.case_id}`: retrieval failed — {row.rag_on.error}")
         rows.append(row)
+
+    # One subprocess, after every case has been generated and recorded. Attaching the
+    # results afterwards is what lets the arm be batched without the run loop knowing.
+    ragas_judged = await ragas_arm.resolve()
+    if ragas_judged:
+        rows = [_with_ragas(row, ragas_judged) for row in rows]
+    ragas_status = ragas_arm.status()
+    if ragas_status.requested and ragas_arm.errors:
+        failures = ragas_arm.errors
+        notes += [f"Ragas judge failed — {failure}" for failure in failures[:5]]
+        if len(failures) > 5:
+            notes.append(
+                f"Ragas judge failed {len(failures)} times in total; the first 5 are listed."
+            )
 
     status = judged_arm.status()
     # Judge failures are RUN NOTES, not silent degradation. The cells already read
@@ -1529,7 +1678,24 @@ async def run(config: RunConfig) -> tuple[str, list[CaseRow]]:
                 f"LLM judge failed {len(failures)} times in total; the first 5 are listed."
             )
 
-    return render_report(config=config, rows=rows, notes=notes, deepeval=status), rows
+    return (
+        render_report(config=config, rows=rows, notes=notes, deepeval=status, ragas=ragas_status),
+        rows,
+    )
+
+
+def _with_ragas(row: CaseRow, judged: Mapping[str, JudgedArm]) -> CaseRow:
+    """Attach the batched Ragas results to a row that was built before they existed.
+
+    `replace` rather than mutation, because `ArmResult` is frozen and it should stay
+    that way: a scored arm is a record of what happened, and the one thing being added
+    here arrives later by design.
+    """
+    return replace(
+        row,
+        rag_off=replace(row.rag_off, judged_ragas=judged.get(f"{row.case_id}::rag_off")),
+        rag_on=replace(row.rag_on, judged_ragas=judged.get(f"{row.case_id}::rag_on")),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

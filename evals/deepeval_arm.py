@@ -66,6 +66,13 @@ from typing import Any, Final
 
 from backend.app.llm.contract import BudgetState, Message, Role, TaskClass
 from backend.app.llm.router import TASK_TIERS, ModelRouter, config_status
+from evals.judged import (
+    ANSWER_RELEVANCY,
+    FAITHFULNESS,
+    NOT_MEASURED_CELL,
+    JudgedArm,
+    MetricOutcome,
+)
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -87,11 +94,9 @@ DEFAULT_JUDGE_BUDGET_USD: Final = Decimal("0.50")
 #: nothing in this harness gates on an LLM judgement.
 DEFAULT_THRESHOLD: Final = 0.7
 
-FAITHFULNESS: Final = "faithfulness"
-ANSWER_RELEVANCY: Final = "answer_relevancy"
 
 #: What the report prints for a cell that was never measured. Deliberately not `0.00`.
-NOT_MEASURED_CELL: Final = "n/m"
+
 
 #: Environment that must be in place BEFORE `deepeval` is imported.
 #:
@@ -128,48 +133,27 @@ def harden_deepeval_env(env: MutableMapping[str, str] | None = None) -> None:
 
 # --------------------------------------------------------------------------- #
 # Results
+#
+# `MetricOutcome`, `JudgedArm` and the metric/cell constants live in `evals/judged.py`
+# and are re-exported here so existing importers keep working. They moved when a
+# SECOND judged arm appeared (`evals/ragas_arm.py`): a shared shape belongs in a
+# shared place the first time there are two consumers, and the alternative was one
+# arm importing the other's module for a dataclass.
 # --------------------------------------------------------------------------- #
 
-
-@dataclass(frozen=True, slots=True)
-class MetricOutcome:
-    """One LLM-judged metric on one generated output.
-
-    `score is None` means **not measured**, and the reason is in `error`. It is never
-    coerced to 0.0: a judge that failed to answer has told us nothing about the text,
-    whereas 0.0 would say the text is entirely unfaithful.
-    """
-
-    metric: str
-    score: float | None = None
-    reason: str | None = None
-    error: str | None = None
-
-    @property
-    def measured(self) -> bool:
-        """Whether a real judgement was obtained."""
-        return self.score is not None
-
-    def cell(self) -> str:
-        """This metric as one markdown table cell."""
-        return f"{self.score:.2f}" if self.score is not None else NOT_MEASURED_CELL
-
-
-@dataclass(frozen=True, slots=True)
-class JudgedArm:
-    """Both LLM-judged metrics for one arm of one case."""
-
-    faithfulness: MetricOutcome
-    answer_relevancy: MetricOutcome
-
-    @property
-    def any_measured(self) -> bool:
-        """Whether at least one metric produced a number."""
-        return self.faithfulness.measured or self.answer_relevancy.measured
-
-    def outcomes(self) -> tuple[MetricOutcome, ...]:
-        """Both outcomes, in report order."""
-        return (self.faithfulness, self.answer_relevancy)
+__all__ = [
+    "ANSWER_RELEVANCY",
+    "FAITHFULNESS",
+    "NOT_MEASURED_CELL",
+    "DeepEvalArm",
+    "DeepEvalRunStatus",
+    "JudgedArm",
+    "MetricOutcome",
+    "RouterJudge",
+    "arm_off_status",
+    "build_deepeval_judge",
+    "harden_deepeval_env",
+]
 
 
 @dataclass(frozen=True, slots=True)

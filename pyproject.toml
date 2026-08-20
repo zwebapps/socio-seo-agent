@@ -100,6 +100,26 @@ strict = true
 warn_unreachable = true
 exclude = ["frontend"]
 
+# `evals/ragas_runner.py` is the one module in this repo that does NOT run under this
+# interpreter. It executes inside `.venv-ragas`, whose whole reason to exist is that
+# `ragas` caps `openai<3.0.0` while we pin `openai>=3.2.0` (see `ARCHITECTURE.md` §14),
+# so `ragas` and `langchain_*` are correctly absent HERE and mypy cannot resolve them.
+#
+# `ignore_missing_imports`, NOT `ignore_errors`: everything the module writes itself is
+# still type-checked strictly, and only the unresolvable third-party imports are waived.
+# Silencing the whole file would let a genuine mistake in the one script we cannot
+# import-test go unnoticed.
+[[tool.mypy.overrides]]
+module = ["evals.ragas_runner"]
+ignore_missing_imports = true
+
+# The absent packages themselves, named explicitly. `ignore_missing_imports` on the
+# importing module is not enough: mypy resolves by TARGET module, so the waiver has to
+# name what cannot be found rather than who is looking for it.
+[[tool.mypy.overrides]]
+module = ["ragas.*", "ragas", "langchain_openai.*", "langchain_openai", "langchain_core.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["backend/tests"]

@@ -41,3 +41,8 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# The isolated environment the Ragas eval arm runs in (`make ragas-env`). A second
+# virtualenv is a build artifact; its exact contents are pinned in
+# evals/ragas-requirements.txt, which IS source.
+.venv-ragas/

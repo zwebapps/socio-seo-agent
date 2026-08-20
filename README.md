@@ -95,7 +95,28 @@ built on real `model_usage` rows.
 ```bash
 make check            # lint + types + tests — exactly what CI runs
 make images           # build both Docker images
+make ragas-env        # build .venv-ragas, only needed for `evals/run.py --ragas`
 ```
+
+### Evaluating it
+
+`uv run python evals/run.py` writes [`evals/report.md`](evals/report.md) from 20 cases
+across two arms (retrieval off vs on) plus a reference-answer control. Five scorers are
+deterministic — SEO, brand, format, grounding, coverage — and they are what gate a
+draft, because arithmetic cannot hallucinate a pass.
+
+Two optional LLM-judged arms close the one hole arithmetic cannot see: a sentence can
+cite a real chunk and then misdescribe it in words.
+
+| flag | judge | runs |
+|---|---|---|
+| `--deepeval` | DeepEval | in-process, judge routed through our own `ModelRouter` |
+| `--ragas` | Ragas | out-of-process in `.venv-ragas` — `ragas` caps `openai<3` and we pin `openai>=3.2`, so it cannot share this venv |
+
+Both are off by default, so CI stays hermetic. Running both is the interesting case:
+where two judges disagree on the same text, that gap measures the judges. `--live`
+spends real money and refuses to start if the router resolved to the fake provider — a
+report produced on canned responses under a live banner is worse than no report.
 
 ## Architecture in one rule
 

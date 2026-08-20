@@ -1,0 +1,22 @@
+# The ISOLATED environment the Ragas arm runs in. Not this project's venv, and it
+# cannot be: `ragas` depends on `instructor`, which caps `openai<3.0.0`, while this
+# project pins `openai>=3.2.0` deliberately (v3 is built on httpx2 — which is why
+# `httpx2` is a declared dev dependency here and why respx cannot intercept our
+# provider calls). See `ARCHITECTURE.md` §14.
+#
+# Create it with `make ragas-env`, which is idempotent. It is gitignored: a second
+# virtualenv is a build artifact, not source.
+#
+# Pinned exactly, because the whole reason this file exists is a version conflict and
+# a floating range is how the next one arrives unannounced. Verified 2026-08-20 to
+# install and import cleanly on Python 3.13.
+ragas==0.4.3
+openai==2.54.0
+# `ragas.llms.base` imports `langchain_community.chat_models.vertexai`, which was
+# REMOVED in langchain-community 1.x. Without this ceiling the environment installs
+# and then fails at import, which is the trap the first attempt fell into.
+langchain-community==0.3.31
+# Resolved rather than guessed: 0.2.x conflicts with the langchain-core that
+# langchain-community 0.3.31 requires. 1.6.0 is what the solver picks and what was
+# verified to import.
+langchain-openai==1.6.0
