@@ -15,13 +15,21 @@ The properties worth testing are the boundaries, not the prose:
 import json
 from decimal import Decimal
 from typing import Any, ClassVar
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from backend.app.agents.graph import run_graph
-from backend.app.agents.nodes import NodeDeps, build_nodes
-from backend.app.agents.state import AgentState, new_state
+from backend.app.agents.nodes import (
+    MAX_RETRIEVAL_TRACES,
+    RETRIEVAL_REASON_CHARS,
+    NodeDeps,
+    append_retrieval_trace,
+    build_nodes,
+    summarise_retrieval,
+)
+from backend.app.agents.state import AgentState, from_checkpoint, new_state, to_checkpoint
+from backend.app.agents.state_graph import run_state_graph
 from backend.app.agents.tools import (
     KB_SEARCH,
     PUBLISH,
@@ -32,6 +40,12 @@ from backend.app.agents.tools import (
 from backend.app.engines.seo import SeoFinding, SeoScoreResult
 from backend.app.engines.serp import SerpPage, SerpResult
 from backend.app.llm import Completion, TaskClass, ToolCall, Usage
+from backend.app.services.kb_service import (
+    ChunkGrade,
+    GroundingChunk,
+    RetrievalAttempt,
+    RetrievalTrace,
+)
 
 BUSINESS = uuid4()
 
@@ -1456,6 +1470,10 @@ class _ToolRouter(StubRouter):
         super().__init__()
         self.by_tool = answers
         self.offered: list[str] = []
+        #: Every message this router was sent, so a test can assert what actually
+        #: reached the PROMPT -- which is a different question from what reached the
+        #: checkpoint, and the retrieval summariser has to get both right.
+        self.seen_messages: list[Any] = []
 
     async def complete(
         self,
@@ -1474,6 +1492,7 @@ class _ToolRouter(StubRouter):
     ) -> Completion:
         name = next(iter(tools)).name if tools else "unknown"
         self.offered.append(name)
+        self.seen_messages.extend(messages)
         payload = self.by_tool.get(name)
         if payload is None:
             return Completion(text="prose", tool_calls=[], usage=_usage(), is_final=True)
@@ -1589,3 +1608,467 @@ async def test_a_clean_landing_page_reaches_review_with_its_audit() -> None:
     assert (result.state["landing_page"] or {})["primary_cta"] == "Checkliste anfordern"
     assert result.state.get("publication_blocked") is not True
     assert "REVIEW" in result.state["visited"]
+
+
+# --------------------------------------------------------------------------- #
+# The retrieval trace leaves the process
+#
+# `_retrieved` used to call `kb.search` and reduce the answer to prompt text on the
+# next line, so the rewritten queries, the per-chunk grades and the fallback decision
+# were computed and then dropped at the call site. They existed in a log line and
+# nowhere a reviewer could reach, which makes "our retrieval is agentic" a claim about
+# code nobody can check -- the one kind of claim this project is not allowed to make.
+#
+# What is asserted here is therefore the ROUND TRIP, not the summariser in isolation:
+# real nodes, the real `RetrievalTrace` model, the real `to_checkpoint`, and both graph
+# drivers. A test over a hand-written trace dict would keep passing on the day
+# `RetrievalAttempt.query` is renamed, and the panel would go blank in production.
+# --------------------------------------------------------------------------- #
+
+#: The chunk body. It is a sentinel: the whole point of the summariser is that this
+#: string reaches the model's prompt and NEVER the checkpoint, so every assertion
+#: about text-dropping is "this exact string is absent".
+CHUNK_BODY = (
+    "Sanitaernotdienst rund um die Uhr. Anfahrt 89 EUR pauschal, Arbeitszeit "
+    "ab 95 EUR je Stunde, Werktage von 08 bis 18 Uhr zum Normaltarif."
+)
+
+#: The grader's justification. Deliberately shares no phrase with `CHUNK_BODY`, so a
+#: test that finds the body has found the body and not a quotation of it.
+GRADE_REASON = "Names a call-out charge, which is what the query asked for."
+
+CHUNK_A = UUID("aaaaaaaa-0000-4000-8000-000000000001")
+CHUNK_B = UUID("bbbbbbbb-0000-4000-8000-000000000002")
+CHUNK_C = UUID("cccccccc-0000-4000-8000-000000000003")
+DOCUMENT = UUID("dddddddd-0000-4000-8000-000000000004")
+
+
+def _grade(chunk_id: UUID, grade: str, ordinal: int) -> ChunkGrade:
+    return ChunkGrade(
+        chunk_id=chunk_id,
+        document_id=DOCUMENT,
+        ordinal=ordinal,
+        distance=0.21 + ordinal / 100,
+        grade=grade,  # type: ignore[arg-type]
+        reason=GRADE_REASON,
+        # The field the summariser must drop. `kb_service` puts a 240-character
+        # excerpt here for rendering; the checkpoint cannot afford it eleven times.
+        excerpt=CHUNK_BODY,
+    )
+
+
+def _real_trace(question: str) -> RetrievalTrace:
+    """A two-attempt retrieval that ended in the web fallback.
+
+    The interesting case, and the one the review panel most has to be able to show: the
+    business's own documents did NOT answer, so the loop rewrote its query, graded the
+    second batch, gave up, and said so. A trace that always succeeded would let a
+    summariser that drops `outcome` pass.
+    """
+    return RetrievalTrace(
+        question=question,
+        business_id=BUSINESS,
+        needed=True,
+        need_reason="The page states a price, so it needs the business's own figures.",
+        attempts=[
+            RetrievalAttempt(
+                attempt=1,
+                query="notdienst anfahrt kosten",
+                query_rationale="Nouns the price list would use, not the node's question.",
+                limit=6,
+                grades=[_grade(CHUNK_A, "irrelevant", 1)],
+                relevant=0,
+                partial=0,
+                irrelevant=1,
+                decision="retry",
+                decision_reason="Nothing graded relevant, so the query was widened.",
+            ),
+            RetrievalAttempt(
+                attempt=2,
+                query="sanitaer notdienst preisliste koblenz",
+                query_rationale="Adds the city and the document's own word for a price list.",
+                limit=12,
+                grades=[_grade(CHUNK_B, "partial", 2), _grade(CHUNK_C, "irrelevant", 3)],
+                relevant=0,
+                partial=1,
+                irrelevant=1,
+                decision="exhausted",
+                decision_reason="Two attempts is the ceiling; one partial is not grounding.",
+            ),
+        ],
+        outcome="fallback_to_web",
+        outcome_reason=(
+            "No passage graded relevant after two attempts, so the run continues on "
+            "live research and says so."
+        ),
+        chunks=[
+            GroundingChunk(
+                chunk_id=CHUNK_B,
+                document_id=DOCUMENT,
+                ordinal=2,
+                content=CHUNK_BODY,
+                distance=0.23,
+                grade="partial",
+                reason=GRADE_REASON,
+            )
+        ],
+        model_calls=3,
+        cost_usd=Decimal("0.0042"),
+    )
+
+
+def _retrieving_router() -> _ToolRouter:
+    return _ToolRouter(
+        {
+            "record_opportunities": {
+                "opportunities": [
+                    {
+                        "title": "Angstpatienten",
+                        "rationale": "r",
+                        "target_keywords": ["zahnarzt koblenz"],
+                        "score": 90,
+                    }
+                ]
+            },
+            "record_outline": {"target_keyword": "zahnarzt koblenz", "headings": ["Ablauf"]},
+            "record_page": {
+                "title": "Angstfreie Zahnbehandlung in Koblenz",
+                "meta_description": "d" * 150,
+                "html": CLEAN_ARTICLE_HTML,
+            },
+            "record_landing_page": LANDING_ARGS,
+            "record_posts": {"posts": [{"channel": "linkedin", "body": "Sanfte Behandlung."}]},
+        }
+    )
+
+
+@pytest.fixture(params=["builtin", "langgraph"])
+def driver(request: pytest.FixtureRequest) -> Any:
+    """Both graph runtimes, one test body.
+
+    A fallback that behaves differently is not a fallback, and `retrieval_traces` is a
+    list every retrieving node rewrites -- exactly the shape a merge rule can get wrong
+    in one driver and right in the other.
+    """
+    return run_graph if request.param == "builtin" else run_state_graph
+
+
+async def _run_with_retrieval(driver: Any) -> tuple[AgentState, list[str]]:
+    asked: list[str] = []
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        asked.append(question)
+        return _real_trace(question)
+
+    result = await driver(
+        _state(dna=BANNED_DNA),
+        nodes=build_nodes(_deps(_retrieving_router(), retrieve=retrieve, score_page=_passing_seo)),
+    )
+    return result.state, asked
+
+
+async def test_the_checkpoint_holds_the_queries_the_grades_and_the_fallback_decision(
+    driver: Any,
+) -> None:
+    """The A2a contract, through the real serialiser.
+
+    Everything asserted here was being thrown away one line after it was computed.
+    """
+    state, asked = await _run_with_retrieval(driver)
+    checkpoint = to_checkpoint(state)
+
+    assert asked, "the nodes must actually have called the knowledge base"
+
+    traces = checkpoint["retrieval_traces"]
+    by_node = {entry["node"]: entry for entry in traces}
+    assert set(by_node) == {"HARVEST", "OPPORTUNITY", "PLAN", "GENERATE", "CONVERT"}, (
+        "every node granted kb.search must leave its evidence behind, not only the "
+        "one that happened to be wired first"
+    )
+
+    # GENERATE is the node where a missing passage becomes an invented sentence, so it
+    # is the node whose evidence matters most.
+    generate = by_node["GENERATE"]
+
+    # 1. The rewritten queries -- the field the whole "agentic" claim rests on.
+    assert [attempt["query"] for attempt in generate["attempts"]] == [
+        "notdienst anfahrt kosten",
+        "sanitaer notdienst preisliste koblenz",
+    ]
+    assert generate["attempts"][1]["query"] != generate["question"], (
+        "a system that embeds the node's own words is doing vector search; the rewrite "
+        "is what makes it retrieval the agent steered"
+    )
+    assert all(attempt["query_rationale"] for attempt in generate["attempts"])
+
+    # 2. A grade per chunk id.
+    graded = {
+        grade["chunk_id"]: grade["grade"]
+        for attempt in generate["attempts"]
+        for grade in attempt["grades"]
+    }
+    assert graded == {
+        str(CHUNK_A): "irrelevant",
+        str(CHUNK_B): "partial",
+        str(CHUNK_C): "irrelevant",
+    }
+    assert all(
+        grade["reason"] for attempt in generate["attempts"] for grade in attempt["grades"]
+    ), "a grade with no reason is unreviewable, which is the opposite of evidence"
+
+    # 3. The fallback decision, and the per-attempt decisions that led to it.
+    assert generate["outcome"] == "fallback_to_web"
+    assert "live research" in generate["outcome_reason"]
+    assert [attempt["decision"] for attempt in generate["attempts"]] == ["retry", "exhausted"]
+
+
+async def test_the_stored_trace_carries_no_chunk_body_text(driver: Any) -> None:
+    """The other half of A2a: bounded, which for a JSONB column means text-free.
+
+    The checkpoint is rewritten on EVERY node, so a chunk body carried here is written
+    eleven times a run and then sent to a model. The id, the ordinal and the grade are
+    the auditable part; the body is one indexed lookup away in `document_chunks`.
+    """
+    state, _ = await _run_with_retrieval(driver)
+    checkpoint = to_checkpoint(state)
+
+    serialised = json.dumps(checkpoint, default=str)
+    assert CHUNK_BODY not in serialised, "chunk bodies must not reach the checkpoint"
+    # And not by accident of an empty trace: the evidence IS there, minus the text.
+    assert GRADE_REASON in serialised
+    assert str(CHUNK_B) in serialised
+
+    for entry in checkpoint["retrieval_traces"]:
+        for attempt in entry["attempts"]:
+            for grade in attempt["grades"]:
+                assert "excerpt" not in grade
+                assert "content" not in grade
+                assert "text" not in grade
+
+
+async def test_the_passages_still_reach_the_prompt_the_trace_was_summarised_out_of(
+    driver: Any,
+) -> None:
+    """The control. Dropping the text from the CHECKPOINT must not drop it from the
+    PROMPT -- the model still has to see the passage it is grounding a sentence in, and
+    a summariser that quietly starved the prompt would look identical in every other
+    assertion here."""
+    router = _retrieving_router()
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        return _real_trace(question)
+
+    await driver(
+        _state(dna=BANNED_DNA),
+        nodes=build_nodes(_deps(router, retrieve=retrieve, score_page=_passing_seo)),
+    )
+
+    prompts = "\n".join(str(message.content) for message in router.seen_messages if message.content)
+    assert CHUNK_BODY in prompts
+
+
+async def test_both_drivers_record_the_same_retrieval_evidence() -> None:
+    """`retrieval_traces` is a list every retrieving node REPLACES with the whole
+    appended value, which is the shape a merge rule gets wrong in exactly one driver.
+    Asserted rather than assumed, because a fallback that records less is not one."""
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        return _real_trace(question)
+
+    def _shape(state: AgentState) -> list[tuple[int, str, str, tuple[str, ...]]]:
+        return [
+            (
+                entry["seq"],
+                entry["node"],
+                entry["outcome"],
+                tuple(attempt["query"] for attempt in entry["attempts"]),
+            )
+            for entry in state["retrieval_traces"]
+        ]
+
+    builtin = await run_graph(
+        _state(dna=BANNED_DNA),
+        nodes=build_nodes(_deps(_retrieving_router(), retrieve=retrieve, score_page=_passing_seo)),
+    )
+    compiled = await run_state_graph(
+        _state(dna=BANNED_DNA),
+        nodes=build_nodes(_deps(_retrieving_router(), retrieve=retrieve, score_page=_passing_seo)),
+    )
+
+    assert _shape(builtin.state) == _shape(compiled.state)
+    assert len(_shape(builtin.state)) == 5
+
+
+async def test_a_checkpoint_written_before_this_key_existed_still_resumes(
+    driver: Any,
+) -> None:
+    """Nothing migrates a JSONB column, so an older run has no `retrieval_traces` at
+    all -- and a run that cannot resume loses work a customer already paid for."""
+    state, _ = await _run_with_retrieval(driver)
+    old = to_checkpoint(state)
+    # Exactly what an older row looks like: the key is simply not there.
+    del old["retrieval_traces"]
+    assert "retrieval_traces" not in old
+
+    revived = from_checkpoint(old)
+    assert revived["retrieval_traces"] == [], "a missing key reads as no evidence, not a crash"
+
+    async def retrieve(question: str, **kwargs: Any) -> Any:
+        return _real_trace(question)
+
+    resumed = await driver(
+        revived,
+        nodes=build_nodes(_deps(_retrieving_router(), retrieve=retrieve, score_page=_passing_seo)),
+        resume=True,
+    )
+
+    assert resumed.state["outcome"] != "failed"
+    assert "retrieval_traces" in to_checkpoint(resumed.state)
+
+
+def test_a_hand_edited_checkpoint_cannot_smuggle_junk_into_the_graph() -> None:
+    """This column can also hold whatever a hand-run UPDATE put there. One malformed
+    entry must not travel into the graph as an entry."""
+    revived = from_checkpoint(
+        {"retrieval_traces": ["not a trace", None, {"node": "PLAN"}, 7], "errors": []}
+    )
+    assert revived["retrieval_traces"] == [{"node": "PLAN"}]
+
+    assert (
+        from_checkpoint({"retrieval_traces": "clearly not a list", "errors": []})[
+            "retrieval_traces"
+        ]
+        == []
+    )
+
+
+def test_the_documented_caps_are_the_enforced_ones() -> None:
+    """The literals are HERE on purpose, and the first version of this file did not have
+    them -- which is why it passed with the cap raised to 999.
+
+    A cap asserted only against itself is not a cap: the behaviour (trim the oldest,
+    keep `seq`) is identical at 12 and at 999, so nothing but the number can catch a
+    silent raise. And the number is what the module's own arithmetic rests on: 12 traces
+    x 3 attempts x 12 grades x 160 characters is the checkpoint budget, written eleven
+    times a run.
+    """
+    assert MAX_RETRIEVAL_TRACES == 12
+    assert RETRIEVAL_REASON_CHARS == 160
+
+
+def test_a_full_run_of_traces_stays_inside_the_checkpoint_budget() -> None:
+    """The caps expressed as the thing they are FOR, so a change to any one of them --
+    the count, the attempts, the grades, the reason length, or a body text creeping back
+    in -- is caught by arithmetic rather than by remembering to update a literal."""
+    state = _state()
+    for _ in range(MAX_RETRIEVAL_TRACES * 2):
+        state["retrieval_traces"] = append_retrieval_trace(
+            state, summarise_retrieval(_real_trace("q" * 200), node="GENERATE")
+        )
+
+    stored = len(json.dumps(state["retrieval_traces"]))
+    assert stored < 80_000, (
+        f"retrieval evidence is {stored} bytes and is rewritten on every node of every "
+        "run; the caps in agents.nodes exist to keep this small"
+    )
+
+
+def test_the_count_cap_drops_the_oldest_and_seq_says_that_it_did() -> None:
+    """A cap that trims evidence silently is worse than one that trims loudly: the
+    reader has to be able to tell "this is the whole retrieval" from "this is the tail
+    of it", and `seq` is what says which."""
+    state = _state()
+    for _ in range(MAX_RETRIEVAL_TRACES + 3):
+        state["retrieval_traces"] = append_retrieval_trace(
+            state, summarise_retrieval(_real_trace("q"), node="GENERATE")
+        )
+
+    stored = state["retrieval_traces"]
+    assert len(stored) == MAX_RETRIEVAL_TRACES
+    assert [entry["seq"] for entry in stored] == list(range(4, MAX_RETRIEVAL_TRACES + 4))
+    assert stored[0]["seq"] != 1, "a trimmed panel must not read as the whole retrieval"
+
+
+def test_the_summariser_keeps_the_grounding_ids_and_bounds_the_grade_reason() -> None:
+    """`grounding_chunk_ids` is the citable half -- relevant only, never partials -- and
+    the grader's reason is model prose that nothing on the way out clamps."""
+    trace = RetrievalTrace(
+        question="q",
+        business_id=BUSINESS,
+        needed=True,
+        need_reason="r",
+        attempts=[
+            RetrievalAttempt(
+                attempt=1,
+                query="rewritten",
+                query_rationale="why",
+                limit=6,
+                grades=[
+                    ChunkGrade(
+                        chunk_id=CHUNK_A,
+                        document_id=DOCUMENT,
+                        ordinal=1,
+                        distance=0.1,
+                        grade="relevant",
+                        reason="x" * (RETRIEVAL_REASON_CHARS + 400),
+                        excerpt=CHUNK_BODY,
+                    )
+                ],
+                relevant=1,
+                partial=0,
+                irrelevant=0,
+                decision="sufficient",
+                decision_reason="one relevant passage is enough to ground one claim",
+            )
+        ],
+        outcome="sufficient",
+        outcome_reason="answered from the business's own documents",
+        chunks=[
+            GroundingChunk(
+                chunk_id=CHUNK_A,
+                document_id=DOCUMENT,
+                ordinal=1,
+                content=CHUNK_BODY,
+                distance=0.1,
+                grade="relevant",
+                reason="x",
+            ),
+            GroundingChunk(
+                chunk_id=CHUNK_B,
+                document_id=DOCUMENT,
+                ordinal=2,
+                content=CHUNK_BODY,
+                distance=0.4,
+                grade="partial",
+                reason="x",
+            ),
+        ],
+    )
+
+    summary = summarise_retrieval(trace, node="GENERATE")
+
+    assert summary["outcome"] == "sufficient"
+    assert summary["grounding_chunk_ids"] == [str(CHUNK_A)], "partials are not citable"
+    assert summary["chunk_count"] == 2, "both were carried into the prompt, though"
+    reason = summary["attempts"][0]["grades"][0]["reason"]
+    assert len(reason) == RETRIEVAL_REASON_CHARS
+    assert summary["cost_usd"] == "0", "money is a string on the way to a JSONB column"
+
+
+def test_the_summariser_survives_a_trace_double_that_is_not_the_real_class() -> None:
+    """`retrieve` is injected, so this has to be duck-typed the way `summarise_crawl`
+    is -- a summariser that only works against the real class cannot be exercised
+    without the real one."""
+    summary = summarise_retrieval(_Trace(), node="PLAN")
+
+    assert summary["node"] == "PLAN"
+    # `_Trace` has an `outcome` and a `chunks` list and nothing else -- no `attempts`,
+    # no `grounding_chunk_ids`, no `cost_usd`. Every one of those has to read as absent
+    # rather than raise, or the summariser is untestable without a database.
+    assert summary["outcome"] == "sufficient"
+    assert summary["attempts"] == []
+    assert summary["attempts_total"] == 0
+    assert summary["chunk_count"] == 1
+    assert summary["grounding_chunk_ids"] == []
+    assert summary["question"] == ""
+    assert summary["model_calls"] == 0

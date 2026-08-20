@@ -46,6 +46,8 @@ import {
   type Measurement,
   type Published,
   type PublishedTarget,
+  type RetrievalAttempt,
+  type RetrievalTrace,
   type ReviewFinding,
   type RunReview,
   type SeoReport,
@@ -123,6 +125,15 @@ export function RunReviewTabs({ runId, runState }: { runId: string; runState: st
       label: "AI blocks",
       badge: review.aiBlocks?.blocks.length || undefined,
       panel: <AiBlocksPanel blocks={review.aiBlocks} note={review.aiBlocksNote} />,
+    },
+    {
+      // "Retrieval", not "Sources": this tab shows what was ASKED of the business's own
+      // documents and how every answer was judged, including the runs where the answer
+      // was "nothing useful". A tab called "Sources" would promise a citation list.
+      id: "retrieval",
+      label: "Retrieval",
+      badge: review.retrieval.length || undefined,
+      panel: <RetrievalPanel traces={review.retrieval} note={review.retrievalNote} />,
     },
     {
       // "Export pack", not "Publish": this tab produces text to paste and nothing else
@@ -506,6 +517,257 @@ function FindingRow({ finding }: { finding: ReviewFinding }) {
         </dl>
       )}
     </SoftCard>
+  );
+}
+
+/* ------------------------------------------------------------------------- */
+/* Tab — the retrieval trace: query -> chunks -> grades -> decision            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The fallback decision, IN WORDS.
+ *
+ * `fallback_to_web` is a decision the agent made, not an error it hit, and the words
+ * have to say so — this is the one field on the panel whose raw value would be read as a
+ * failure by anyone who has not read the code. `not_needed` is likewise a choice: judging
+ * that a step needs no business facts is one of the four decisions that make this
+ * retrieval agentic rather than a vector search with a nice name.
+ *
+ * An unrecognised outcome falls through to the raw value plus the server's own reason,
+ * for the same reason `runStateTone` does: the server owns this vocabulary and can add to
+ * it, and a screen that asserted otherwise would silently show the wrong sentence.
+ */
+const OUTCOME_WORDS: Record<string, string> = {
+  sufficient: "Answered from the business's own documents.",
+  fallback_to_web:
+    "Fell back to live web research: the business's own documents did not answer this.",
+  not_needed: "Decided no facts from the business's own documents were needed here.",
+};
+
+const OUTCOME_TONE: Record<string, "ok" | "warn" | "muted"> = {
+  sufficient: "ok",
+  // `warn`, not `err`. Nothing broke — the documents simply did not hold the answer, and
+  // the run said so and carried on. Painting it red would teach the owner to treat a
+  // correct degradation as an outage.
+  fallback_to_web: "warn",
+  not_needed: "muted",
+};
+
+/** `relevant` earns green; `partial` is weak context; `irrelevant` is not a fault. */
+const GRADE_TONE: Record<string, "ok" | "warn" | "muted"> = {
+  relevant: "ok",
+  partial: "warn",
+  irrelevant: "muted",
+};
+
+const DECISION_WORDS: Record<string, string> = {
+  sufficient: "enough to ground the claim — stopped here",
+  retry: "not enough — rewrote the query and searched again",
+  exhausted: "still not enough, and the attempt ceiling was reached",
+};
+
+function RetrievalPanel({
+  traces,
+  note,
+}: {
+  traces: RetrievalTrace[];
+  note: string | null;
+}) {
+  // The empty state renders the SERVER's sentence, which says that a business with no
+  // uploaded documents had nothing to retrieve and names the node that recorded it. A
+  // generic "nothing here yet" would read as a broken panel, and a panel that invented
+  // "retrieval failed" would report the absence of a knowledge base as a defect in the
+  // agent — sending the owner to hunt a bug instead of uploading a PDF.
+  const first = traces[0];
+  if (first === undefined) return <Nothing note={note} />;
+
+  // `seq` is a 1-based ordinal over the run's retrieval calls and it survives the cap on
+  // how many are stored, so a first entry numbered above 1 is the panel saying — without
+  // needing a flag — that earlier calls were dropped. A cap that trimmed evidence
+  // silently would be a quieter version of the bug this whole panel exists to fix.
+  const dropped = first.seq - 1;
+
+  return (
+    <div className="space-y-5">
+      <SoftCard className="p-5" size="md" as="div">
+        <h3 className="text-sm font-semibold">What was asked of this business&rsquo;s documents</h3>
+        <p className="mt-1.5 text-sm" style={{ color: "var(--text-muted)" }}>
+          Each node below decided whether it needed facts from the uploaded documents,
+          wrote its own search query, graded every passage that came back, and then decided
+          what to do about the result. The passages themselves are not shown here — a
+          passage id and its grade are what make a claim checkable.
+        </p>
+        {dropped > 0 && (
+          <p className="mt-2 text-xs" style={{ color: "var(--warn)" }}>
+            This run made more retrieval calls than are kept in its saved state; the
+            earliest {dropped} {dropped === 1 ? "is" : "are"} not shown.
+          </p>
+        )}
+      </SoftCard>
+
+      {traces.map((trace) => (
+        <TraceCard key={`${trace.seq}-${trace.node}`} trace={trace} />
+      ))}
+    </div>
+  );
+}
+
+function TraceCard({ trace }: { trace: RetrievalTrace }) {
+  const words = OUTCOME_WORDS[trace.outcome];
+  const tone = OUTCOME_TONE[trace.outcome] ?? "muted";
+
+  return (
+    <SoftCard className="p-5" size="md" as="div">
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className="text-[11px] font-semibold uppercase tracking-[0.18em]"
+          style={{ color: "var(--accent)" }}
+        >
+          {trace.node}
+        </span>
+        <Pill tone={tone}>{trace.outcome.replace(/_/g, " ")}</Pill>
+        {trace.groundingChunkIds.length > 0 && (
+          <Pill tone="ok">
+            {trace.groundingChunkIds.length} passage
+            {trace.groundingChunkIds.length === 1 ? "" : "s"} cited
+          </Pill>
+        )}
+      </div>
+
+      {/* The decision in words. The raw `fallback_to_web` reads as an error to anybody
+          who has not read the code, and it is not one. */}
+      <p className="mt-2.5 text-sm font-medium">{words ?? trace.outcome.replace(/_/g, " ")}</p>
+      {trace.outcomeReason && (
+        <p className="mt-1 text-sm" style={{ color: "var(--text-muted)" }}>
+          {trace.outcomeReason}
+        </p>
+      )}
+
+      <SoftWell className="mt-3.5 p-3">
+        <h4
+          className="text-[10px] font-semibold uppercase tracking-[0.16em]"
+          style={{ color: "var(--text-faint)" }}
+        >
+          What the node asked for
+        </h4>
+        <p className="mt-1 text-sm">{trace.question || <em>nothing recorded</em>}</p>
+        {trace.needReason && (
+          <p className="mt-1.5 text-xs" style={{ color: "var(--text-muted)" }}>
+            {trace.needed ? "Needed because" : "Not needed because"}: {trace.needReason}
+          </p>
+        )}
+      </SoftWell>
+
+      {trace.attempts.length > 0 && (
+        <ol className="mt-4 space-y-4">
+          {trace.attempts.map((attempt) => (
+            <li key={attempt.attempt}>
+              <AttemptRow attempt={attempt} total={trace.attemptsTotal} />
+            </li>
+          ))}
+        </ol>
+      )}
+
+      <dl className="mt-4 flex flex-wrap gap-x-6 gap-y-1 text-xs">
+        <div className="flex gap-1.5">
+          <dt style={{ color: "var(--text-faint)" }}>passages carried</dt>
+          <dd className="tabular font-semibold">{trace.chunkCount}</dd>
+        </div>
+        <div className="flex gap-1.5">
+          <dt style={{ color: "var(--text-faint)" }}>model calls</dt>
+          <dd className="tabular font-semibold">{trace.modelCalls}</dd>
+        </div>
+        {trace.costUsd && (
+          <div className="flex gap-1.5">
+            <dt style={{ color: "var(--text-faint)" }}>cost</dt>
+            <dd className="tabular font-semibold">${trace.costUsd}</dd>
+          </div>
+        )}
+        {trace.promptVersion && (
+          <div className="flex gap-1.5">
+            <dt style={{ color: "var(--text-faint)" }}>prompt</dt>
+            <dd className="font-semibold">{trace.promptVersion}</dd>
+          </div>
+        )}
+      </dl>
+
+      {trace.notes.length > 0 && (
+        <ul className="mt-3 space-y-1 text-xs" style={{ color: "var(--text-muted)" }}>
+          {trace.notes.map((entry) => (
+            <li key={entry}>{entry}</li>
+          ))}
+        </ul>
+      )}
+    </SoftCard>
+  );
+}
+
+function AttemptRow({ attempt, total }: { attempt: RetrievalAttempt; total: number }) {
+  const decision = DECISION_WORDS[attempt.decision];
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-baseline gap-2">
+        <span
+          className="text-[10px] font-semibold uppercase tracking-[0.16em]"
+          style={{ color: "var(--text-faint)" }}
+        >
+          Attempt {attempt.attempt} of {total || attempt.attempt}
+        </span>
+        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+          {attempt.relevant} relevant · {attempt.partial} partial · {attempt.irrelevant}{" "}
+          irrelevant
+        </span>
+      </div>
+
+      {/* The rewritten query. This is the field the whole "agentic" claim rests on: a
+          system that embeds the node's own question is doing vector search. */}
+      <p className="mt-1 text-sm">
+        <span style={{ color: "var(--text-faint)" }}>searched for </span>
+        <span className="font-medium">&ldquo;{attempt.query}&rdquo;</span>
+      </p>
+      {attempt.queryRationale && (
+        <p className="mt-0.5 text-xs" style={{ color: "var(--text-muted)" }}>
+          {attempt.queryRationale}
+        </p>
+      )}
+
+      {attempt.grades.length > 0 && (
+        <ul className="mt-2 space-y-2">
+          {attempt.grades.map((grade) => (
+            <li key={grade.chunkId} className="flex flex-wrap items-baseline gap-2 text-xs">
+              <Pill tone={GRADE_TONE[grade.grade] ?? "muted"}>{grade.grade}</Pill>
+              <code style={{ color: "var(--text-faint)" }}>
+                {grade.documentId}#{grade.ordinal}
+              </code>
+              {grade.distance !== null && (
+                <span className="tabular" style={{ color: "var(--text-faint)" }}>
+                  distance {grade.distance.toFixed(3)}
+                </span>
+              )}
+              {grade.reason && <span style={{ color: "var(--text-muted)" }}>{grade.reason}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {attempt.gradesTotal > attempt.grades.length && (
+        <p className="mt-1.5 text-xs" style={{ color: "var(--warn)" }}>
+          {attempt.gradesTotal} passages were graded; {attempt.grades.length} are kept in this
+          run&rsquo;s saved state.
+        </p>
+      )}
+
+      <p className="mt-1.5 text-xs">
+        <span style={{ color: "var(--text-faint)" }}>then: </span>
+        <span style={{ color: "var(--text-muted)" }}>{decision ?? attempt.decision}</span>
+      </p>
+      {attempt.decisionReason && (
+        <p className="mt-0.5 text-xs" style={{ color: "var(--text-muted)" }}>
+          {attempt.decisionReason}
+        </p>
+      )}
+    </div>
   );
 }
 

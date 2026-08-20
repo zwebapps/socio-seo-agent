@@ -769,7 +769,7 @@ A1 is the first code to create.
   section is correctly titled. The confusion is caused by the neighbouring stale caption, which is
   the more reason to fix it.
 
-- [ ] **A2a · Carry `RetrievalTrace` into `AgentState` so the agentic-RAG evidence leaves
+- [x] **A2a · Carry `RetrievalTrace` into `AgentState` so the agentic-RAG evidence leaves
   the process** — not previously in this backlog and it is the highest-stakes gap for
   grading. `nodes._retrieved()` calls `box.call(KB_SEARCH, question)` and immediately
   reduces the result to `_passages(trace)`, so the query rewrites, the per-chunk relevance
@@ -784,7 +784,7 @@ A1 is the first code to create.
   queries, a grade per chunk id, and the fallback decision; and asserts the stored trace
   carries no chunk body text.**
 
-- [ ] **A2b · A retrieval-trace panel on the review screen** — depends on A2a. Query →
+- [x] **A2b · A retrieval-trace panel on the review screen** — depends on A2a. Query →
   chunks → grades → decision, per node, with an honest empty state for a business with no
   documents (which is a normal state, not a failure).
   **done = a Vitest case renders a trace and asserts the fallback decision is shown in

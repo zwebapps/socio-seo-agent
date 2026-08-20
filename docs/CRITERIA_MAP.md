@@ -239,7 +239,7 @@ One scenario: **"Analyse my business and create a growth plan."** Run it against
 | 2 | Paste the URL → crawl + extracted Business DNA, user confirms | onboarding, interaction |
 | 3 | Upload a service PDF → ingested, chunk count shown | knowledge base |
 | 4 | Start the run → timeline streams nodes and **tool calls with live cost** | agent principles, function calling, cost tracking |
-| 5 | Open the **retrieval trace**: query → chunks → grades → fallback decision — **no UI yet**, so show it from the API response; the trace itself is real | **agentic RAG (Hard #1)** |
+| 5 | Open the **retrieval trace** on the review screen: per node, question → rewritten query → graded chunks → fallback decision, stated in words | **agentic RAG (Hard #1)** |
 | 6 | Point at a node that degraded (a source that failed) and the run continuing | error handling, edge cases |
 | 7 | Ranked opportunities with impact and effort | core functionality |
 | 8 | The draft: SEO score 87 with findings, and the retry that raised it from 79 | deterministic validation |

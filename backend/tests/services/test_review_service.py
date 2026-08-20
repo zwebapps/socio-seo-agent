@@ -471,3 +471,153 @@ def test_the_export_pack_carries_no_publish_status() -> None:
 
     assert "published" not in fields
     assert "measurement" not in fields
+
+
+# --------------------------------------------------------------------------- #
+# The retrieval trace: the agentic-RAG evidence, projected
+# --------------------------------------------------------------------------- #
+
+
+def _trace_entry(**over: Any) -> dict[str, Any]:
+    """A stored trace as `agents.nodes.summarise_retrieval` writes one.
+
+    Hand-written HERE on purpose, unlike the round-trip test above: this function is
+    the DEFENSIVE reader, and its job is to survive shapes the summariser would never
+    write. The contract with the real summariser is asserted in
+    `tests/agents/test_nodes.py`, through the real state and the real serialiser.
+    """
+    entry: dict[str, Any] = {
+        "seq": 1,
+        "node": "GENERATE",
+        "question": "notdienst koblenz",
+        "needed": True,
+        "need_reason": "The page states a price.",
+        "outcome": "fallback_to_web",
+        "outcome_reason": "No passage graded relevant, so the run continues on live research.",
+        "prompt_version": "kb_retrieve.v1",
+        "attempts": [
+            {
+                "attempt": 1,
+                "query": "notdienst anfahrt kosten",
+                "query_rationale": "The words the price list would use.",
+                "decision": "exhausted",
+                "decision_reason": "Two attempts is the ceiling.",
+                "relevant": 0,
+                "partial": 1,
+                "irrelevant": 1,
+                "grades": [
+                    {
+                        "chunk_id": "chunk-a",
+                        "document_id": "doc-1",
+                        "ordinal": 2,
+                        "grade": "partial",
+                        "reason": "Mentions a fee but not this one.",
+                        "distance": 0.23,
+                    }
+                ],
+                "grades_total": 2,
+                "notes": [],
+            }
+        ],
+        "attempts_total": 1,
+        "grounding_chunk_ids": [],
+        "chunk_count": 1,
+        "model_calls": 3,
+        "cost_usd": "0.0042",
+        "notes": [],
+    }
+    entry.update(over)
+    return entry
+
+
+def test_the_retrieval_panel_carries_the_query_the_grades_and_the_decision() -> None:
+    """The three things that were being discarded at the call site. Without them the
+    "agentic RAG" claim is about code nobody can look at."""
+    review = project_review({"retrieval_traces": [_trace_entry()]})
+
+    assert review.retrieval_note is None
+    (trace,) = review.retrieval
+    assert trace.node == "GENERATE"
+    assert trace.outcome == "fallback_to_web"
+    assert trace.outcome_reason is not None and "live research" in trace.outcome_reason
+    (attempt,) = trace.attempts
+    assert attempt.query == "notdienst anfahrt kosten"
+    assert attempt.decision == "exhausted"
+    (grade,) = attempt.grades
+    assert (grade.chunk_id, grade.grade) == ("chunk-a", "partial")
+    assert grade.reason == "Mentions a fee but not this one."
+
+
+def test_no_documents_reads_as_a_normal_run_and_names_the_node_that_recorded_it() -> None:
+    """The empty state that is easiest to get wrong. A business that uploaded nothing
+    has nothing to retrieve, so nothing was retrieved -- that is a complete run, and a
+    note that implied a fault would send the owner hunting a bug instead of uploading
+    a PDF."""
+    review = project_review({"fact_gaps": ["uploaded documents"], "errors": []})
+
+    assert review.retrieval == ()
+    note = review.retrieval_note
+    assert note is not None
+    assert "HARVEST" in note, "absence names the node that recorded it, as every note here does"
+    assert "normal run" in note
+    for word in ("fail", "error", "unavailable", "broke", "could not"):
+        assert word not in note.lower(), (
+            f"{word!r} would report the absence of a knowledge base as a defect in the agent"
+        )
+
+
+def test_a_checkpoint_written_before_the_key_existed_projects_without_raising() -> None:
+    """Nothing migrates a JSONB column. An older run simply has no `retrieval_traces`,
+    and from the reader's side that is the same answer as a business with no documents:
+    there is no retrieval evidence, and nothing failed."""
+    assert project_review({"draft": {"title": "t", "html": "<p>x</p>"}}).retrieval == ()
+    assert project_review({"retrieval_traces": "not a list"}).retrieval == ()
+    assert project_review({"retrieval_traces": None}).retrieval_note is not None
+
+
+def test_a_trace_that_cannot_say_which_node_asked_is_dropped_not_rendered() -> None:
+    """The panel is organised per node, so a trace with no node is evidence about
+    nothing -- and one malformed entry must not make a run unreviewable."""
+    review = project_review(
+        {
+            "retrieval_traces": [
+                "junk",
+                {"node": ""},
+                {"attempts": []},
+                _trace_entry(node="PLAN", seq=4),
+            ]
+        }
+    )
+
+    assert [t.node for t in review.retrieval] == ["PLAN"]
+    assert review.retrieval[0].seq == 4, (
+        "a first entry numbered 4 is how a trimmed panel says it is not the whole story"
+    )
+
+
+def test_a_trace_missing_its_totals_reports_what_it_listed_rather_than_zero() -> None:
+    """`attempts_total` and `grades_total` exist to REVEAL a trim. A zero default would
+    claim everything was trimmed on a checkpoint that simply never wrote the count."""
+    entry = _trace_entry()
+    del entry["attempts_total"]
+    del entry["attempts"][0]["grades_total"]
+    del entry["seq"]
+
+    (trace,) = project_review({"retrieval_traces": [entry]}).retrieval
+
+    assert trace.attempts_total == 1
+    assert trace.attempts[0].grades_total == 1
+    assert trace.seq == 1, "position in the list is the fallback ordinal"
+
+
+def test_no_chunk_body_text_can_reach_the_wire_because_none_is_read() -> None:
+    """The summariser drops chunk bodies before the state is written, and this reader
+    does not look for them either -- so a hand-edited checkpoint that smuggled one in
+    still cannot get it onto the review screen."""
+    entry = _trace_entry()
+    entry["attempts"][0]["grades"][0]["excerpt"] = "SECRET DOCUMENT TEXT"
+    entry["attempts"][0]["grades"][0]["content"] = "SECRET DOCUMENT TEXT"
+
+    review = project_review({"retrieval_traces": [entry]})
+
+    assert "SECRET DOCUMENT TEXT" not in review.model_dump_json()

@@ -3,7 +3,7 @@
 Read alongside docs/AGENT_RUNTIME.md section 3, which tabulates every node with its
 model tier, its tools and its failure mode.
 
-Four invariants this package exists to hold:
+Five invariants this package exists to hold:
 
 * **HARVEST and VALIDATE call no model.** They are the trustworthy half of the
   pipeline precisely because they are deterministic — one gathers evidence, the other
@@ -16,6 +16,14 @@ Four invariants this package exists to hold:
   :class:`~backend.app.agents.tools.NodeToolbox` built from `tools.NODE_TOOLS`, so
   the capability table in docs/AGENT_RUNTIME.md section 3 is enforced rather than
   merely described. A refusal is logged and lands in `state["errors"]`.
+* **Retrieval evidence LEAVES the process.** Every node that asks the knowledge base
+  goes through :func:`_retrieved`, which returns the trace as well as the passages and
+  puts a bounded, text-free summary of it on `state["retrieval_traces"]`. Before that,
+  the rewritten queries, the per-chunk grades and the fallback decision were computed
+  and then dropped at the call site, so the one artifact that shows the retrieval was
+  agentic — rather than a single vector search with a nice name — existed only in a log
+  line nobody reads. A capability nothing can show is indistinguishable from one that
+  is not there, which is the same rule the `fact_gaps` bullet above states for absence.
 * **A banned claim stops publication, deterministically.** The claim list is in the
   system prompt too, but a prompt is a request: untrusted page text can argue a
   model out of it, and a model can simply forget. VALIDATE re-checks the finished
@@ -33,7 +41,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Final, get_args
+from typing import Any, Final, NamedTuple, get_args
 from uuid import UUID
 
 from backend.app.actuators import (
@@ -145,6 +153,42 @@ _LEGAL_FORM_FIELDS: Final[frozenset[str]] = frozenset(get_args(FormFieldName.__v
 #: How many keyword seeds HARVEST searches. Each is a provider call, so this is the
 #: main lever on harvest cost.
 MAX_SEED_SEARCHES = 3
+
+# --------------------------------------------------------------------------- #
+# What of a RetrievalTrace reaches the checkpoint
+#
+# `state["retrieval_traces"]` is the agentic-RAG evidence, and it is carried in a
+# JSONB column that is rewritten on EVERY node -- the same constraint that produced
+# `run_executor.summarise_crawl`, and the same answer: compact it here, where the
+# object is in hand and the cheap losses are known.
+#
+# Five retrieval sites exist (HARVEST, OPPORTUNITY, PLAN, GENERATE, CONVERT) and
+# GENERATE and CONVERT can each re-run twice on the VALIDATE loop, so a run makes at
+# most nine calls. `kb_service` bounds each trace at two attempts and each attempt at
+# twelve graded chunks. The caps below sit at or just above those structural maxima:
+# they are a guard against a `retrieve` dependency that does not respect its own
+# contract, not a routine trim -- an ordinary run loses nothing to them.
+# --------------------------------------------------------------------------- #
+
+#: Retrieval calls kept per run. Above the structural maximum of nine, so the OLDEST
+#: entry is only ever dropped by a trace source that has stopped honouring its bounds.
+#: `seq` on each entry is what makes such a drop visible instead of silent.
+MAX_RETRIEVAL_TRACES: Final = 12
+
+#: Attempts kept per trace. `kb_service.MAX_RETRIEVAL_ATTEMPTS` is 2.
+MAX_RETRIEVAL_ATTEMPTS_KEPT: Final = 3
+
+#: Graded chunks kept per attempt. A widened second attempt asks for 12.
+MAX_RETRIEVAL_GRADES_KEPT: Final = 12
+
+#: Characters kept of a grader's justification for one chunk.
+#:
+#: The justification stays because a grade with no reason is unreviewable, which is
+#: `ChunkGrade`'s own stated rule. It is CLAMPED because it is model prose: the
+#: contract asks for one line, and nothing enforces that on the way out. At the caps
+#: above this is the dominant term -- 12 grades x 3 attempts x 160 characters is under
+#: 6 KB per entry, which is the budget this number was chosen to hold.
+RETRIEVAL_REASON_CHARS: Final = 160
 
 # --------------------------------------------------------------------------- #
 # EXPORT's vocabulary
@@ -703,18 +747,16 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         else:
             gaps.append("search results (no provider configured)")
 
+        grounding = _no_grounding()
         if box.available(KB_SEARCH):
-            try:
-                trace = await box.call(KB_SEARCH, state["goal"])
-                facts["knowledge"] = {
-                    "outcome": getattr(trace, "outcome", None),
-                    "chunks": len(getattr(trace, "chunks", []) or []),
-                }
-            except ToolNotAllowedError:
-                raise
-            except Exception as exc:  # broad on purpose, per-source degradation
-                logger.warning("harvest: retrieval failed: %s", exc)
+            grounding = await _retrieved(box, state["goal"], "HARVEST", state)
+            if grounding.failed:
                 gaps.append("uploaded documents")
+            elif grounding.trace is not None:
+                facts["knowledge"] = {
+                    "outcome": getattr(grounding.trace, "outcome", None),
+                    "chunks": len(getattr(grounding.trace, "chunks", []) or []),
+                }
         else:
             gaps.append("uploaded documents")
 
@@ -751,7 +793,13 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             gaps.append("AI answer-engine visibility (no probe configured)")
 
         return _with_refusals(
-            state, box, {"facts": facts, "fact_gaps": [*state["fact_gaps"], *gaps]}
+            state,
+            box,
+            {
+                "facts": facts,
+                "fact_gaps": [*state["fact_gaps"], *gaps],
+                **grounding.updates,
+            },
         )
 
     async def opportunity(state: AgentState) -> dict[str, Any]:
@@ -767,7 +815,8 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         # competitor also has. What a business can uniquely write about is in its own
         # documents, so a topic chosen without reading them is a topic anyone could
         # have chosen.
-        passages = await _retrieved(box, state["goal"], "opportunity")
+        grounding = await _retrieved(box, state["goal"], "OPPORTUNITY", state)
+        passages = grounding.passages
         args, cost = await _ask(
             deps,
             box=box,
@@ -787,14 +836,26 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             tool=OPPORTUNITY_TOOL,
         )
         if not args:
-            return _with_refusals(state, box, {"opportunity": None, "_cost": cost})
+            # The trace rides out even here. A retrieval that ran and a model that then
+            # answered with nothing is exactly the pair a reviewer needs to see: without
+            # it, "the documents had nothing to say" and "the model said nothing about
+            # the documents" look identical on the screen.
+            return _with_refusals(
+                state, box, {"opportunity": None, "_cost": cost, **grounding.updates}
+            )
 
         ranked = sorted(
             (o for o in args.get("opportunities", []) if o.get("title")),
             key=lambda o: -int(o.get("score", 0)),
         )
         return _with_refusals(
-            state, box, {"opportunity": ranked[0] if ranked else None, "_cost": cost}
+            state,
+            box,
+            {
+                "opportunity": ranked[0] if ranked else None,
+                "_cost": cost,
+                **grounding.updates,
+            },
         )
 
     async def plan(state: AgentState) -> dict[str, Any]:
@@ -806,7 +867,8 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         # the business in general. An outline needs the material about the thing being
         # written, which is what makes a section heading answerable from evidence.
         question = str(opp.get("title") or "").strip() or state["goal"]
-        passages = await _retrieved(box, question, "plan")
+        grounding = await _retrieved(box, question, "PLAN", state)
+        passages = grounding.passages
         args, cost = await _ask(
             deps,
             box=box,
@@ -827,7 +889,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 "the outline has no target keyword; a page without one cannot be "
                 "scored, and generating it would waste the run's budget"
             )
-        return _with_refusals(state, box, {"outline": args, "_cost": cost})
+        return _with_refusals(state, box, {"outline": args, "_cost": cost, **grounding.updates})
 
     async def generate(state: AgentState) -> dict[str, Any]:
         """Write the page, grounded in the evidence.
@@ -862,7 +924,8 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         # for. This is the node where a missing passage becomes an invented sentence,
         # so it is the node where the grant mattered most and had nothing behind it.
         keyword = str(outline.get("target_keyword") or "").strip() or state["goal"]
-        passages = await _retrieved(box, keyword, "generate")
+        grounding = await _retrieved(box, keyword, "GENERATE", state)
+        passages = grounding.passages
 
         args, cost = await _ask(
             deps,
@@ -885,7 +948,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         )
         if not args:
             raise ValueError("the model did not return a page; expected a record_page tool call")
-        return _with_refusals(state, box, {"draft": args, "_cost": cost})
+        return _with_refusals(state, box, {"draft": args, "_cost": cost, **grounding.updates})
 
     async def convert(state: AgentState) -> dict[str, Any]:
         """Write the landing page the content converts on, and the ask per channel.
@@ -915,16 +978,8 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         # knowledge base is a normal state: the page is then written from the DNA and
         # the harvested facts, and the deterministic check will report however many
         # sourced proof points actually exist.
-        passages = ""
-        if box.available(KB_SEARCH):
-            try:
-                trace = await box.call(KB_SEARCH, _proof_question(state))
-            except ToolNotAllowedError:
-                raise
-            except Exception as exc:  # broad on purpose: proof is an enhancement
-                logger.warning("convert: retrieval failed: %s", exc)
-            else:
-                passages = _passages(trace)
+        grounding = await _retrieved(box, _proof_question(state), "CONVERT", state)
+        passages = grounding.passages
 
         report = state.get("landing_report") or {}
         retry = ""
@@ -973,7 +1028,13 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             )
         spec = _landing_spec(args)
         return _with_refusals(
-            state, box, {"landing_page": spec.model_dump(mode="json"), "_cost": cost}
+            state,
+            box,
+            {
+                "landing_page": spec.model_dump(mode="json"),
+                "_cost": cost,
+                **grounding.updates,
+            },
         )
 
     async def validate(state: AgentState) -> dict[str, Any]:
@@ -1744,7 +1805,32 @@ def _clean_tags(declared: Any) -> list[str]:
     return out
 
 
-async def _retrieved(box: NodeToolbox, question: str, node: str) -> str:
+class _Grounding(NamedTuple):
+    """What one retrieval gave a node: prompt text, checkpoint evidence, and status.
+
+    Three values rather than one because they have three different audiences and only
+    one of them used to leave the process. `passages` is for the model and carries the
+    chunk BODIES; `updates` is for the checkpoint and carries none of them; `trace` is
+    the raw object, for the one caller (HARVEST) that summarises it differently.
+    `failed` is separate from ``trace is None`` because "there is no knowledge base"
+    and "the knowledge base could not be read" are opposite facts and only the second
+    one belongs in `fact_gaps`.
+    """
+
+    passages: str
+    #: ``{}`` or ``{"retrieval_traces": [...]}``. Spread into the node's own updates,
+    #: so it merges identically under both graph drivers -- each replaces the channel
+    #: with the value the node returned, and the value is the whole appended list.
+    updates: dict[str, Any]
+    trace: Any | None
+    failed: bool
+
+
+def _no_grounding(*, failed: bool = False) -> _Grounding:
+    return _Grounding(passages="", updates={}, trace=None, failed=failed)
+
+
+async def _retrieved(box: NodeToolbox, question: str, node: str, state: AgentState) -> _Grounding:
     """Passages from the business's own documents, fenced and labelled — or nothing.
 
     The same shape CONVERT has used since it shipped, lifted out so OPPORTUNITY, PLAN
@@ -1752,23 +1838,152 @@ async def _retrieved(box: NodeToolbox, question: str, node: str) -> str:
     never called it, which is the difference between a documented capability and a
     working one.
 
-    A missing knowledge base is a NORMAL state and returns an empty string: the caller
+    A missing knowledge base is a NORMAL state and returns empty grounding: the caller
     then writes from the DNA and the harvested facts, which is what a business with no
     uploaded documents legitimately has. A retrieval that raises is logged and also
     returns empty — grounding is an enhancement to a prompt, and losing it must not
     cost the run the work every other source produced. An allowlist refusal is
     re-raised, because that is a wiring fault or an attack and must be loud.
+
+    **It also carries the trace out of the process**, which is the whole reason this
+    returns a record rather than a string. The rewritten queries, the per-chunk grades
+    and the fallback decision were being computed and then dropped at this call site,
+    so the one artifact that shows the retrieval was agentic existed only in a log
+    line. It goes into the checkpoint now, compacted by :func:`summarise_retrieval`.
     """
     if not box.available(KB_SEARCH):
-        return ""
+        return _no_grounding()
     try:
         trace = await box.call(KB_SEARCH, question)
     except ToolNotAllowedError:
         raise
     except Exception as exc:  # broad on purpose: grounding is an enhancement
-        logger.warning("%s: retrieval failed: %s", node, exc)
-        return ""
-    return _passages(trace)
+        logger.warning("%s: retrieval failed: %s", node.lower(), exc)
+        return _no_grounding(failed=True)
+    return _Grounding(
+        passages=_passages(trace),
+        updates={
+            "retrieval_traces": append_retrieval_trace(state, summarise_retrieval(trace, node=node))
+        },
+        trace=trace,
+        failed=False,
+    )
+
+
+def append_retrieval_trace(state: AgentState, entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """The run's traces with ``entry`` on the end, capped, and numbered.
+
+    Returns the LIST rather than a new state, because a node returns update dicts and
+    both drivers merge a returned channel by REPLACEMENT. So the node has to hand back
+    the whole list; handing back only the new entry would mean each node's evidence
+    erased the last one's, which is precisely the invisible version of the bug this
+    key exists to fix.
+
+    `seq` is a 1-based ordinal over the run's retrieval calls and it survives the cap.
+    A panel that starts at ``seq: 4`` has said, without a flag or a note, that three
+    earlier calls were dropped — and a cap that trims evidence silently is the kind of
+    honesty failure this repo keeps paying to avoid.
+    """
+    existing = [entry for entry in (state.get("retrieval_traces") or []) if isinstance(entry, dict)]
+    last = existing[-1].get("seq") if existing else 0
+    previous = last if isinstance(last, int) and not isinstance(last, bool) and last > 0 else 0
+    return [*existing, {**entry, "seq": max(previous, len(existing)) + 1}][-MAX_RETRIEVAL_TRACES:]
+
+
+def summarise_retrieval(trace: Any, *, node: str) -> dict[str, Any]:
+    """Compact a `RetrievalTrace` into something safe to carry in state.
+
+    Lossy ON PURPOSE, and — as in `run_executor.summarise_crawl`, whose precedent this
+    follows — the losses are chosen rather than incidental.
+
+    **What survives is the argument that the retrieval was agentic**: the rewritten
+    query and the rationale for it, every chunk id with its grade and the grader's
+    reason, the per-attempt decision, and the final outcome with its reason. Those are
+    what let a reviewer answer "is this claim grounded, and how do we know" from the
+    checkpoint alone, which is what the trace was always for.
+
+    **What is dropped is every chunk BODY**: `ChunkGrade.excerpt` and
+    `GroundingChunk.content` are never read here. A chunk id plus a grade is auditable
+    — the text is one indexed lookup away in `document_chunks`, and it is the same text
+    the model was actually shown. Copying it into a JSONB column that is rewritten on
+    every node would put the business's knowledge base in the checkpoint eleven times a
+    run, and then send it to a model.
+
+    Duck-typed over ``getattr`` for the same reason `summarise_crawl` is: `retrieve` is
+    an injected dependency, the tests pass doubles, and a summariser that only works
+    against the one real class cannot be exercised without the real one.
+    """
+    attempts_raw = list(getattr(trace, "attempts", []) or [])
+    attempts: list[dict[str, Any]] = []
+    for attempt in attempts_raw[:MAX_RETRIEVAL_ATTEMPTS_KEPT]:
+        grades_raw = list(getattr(attempt, "grades", []) or [])
+        attempts.append(
+            {
+                "attempt": _as_int(getattr(attempt, "attempt", 0)),
+                # The rewrite, not the node's own words. This is the field the whole
+                # "agentic" claim rests on, and it was the first one being discarded.
+                "query": str(getattr(attempt, "query", "") or ""),
+                "query_rationale": str(getattr(attempt, "query_rationale", "") or ""),
+                "decision": str(getattr(attempt, "decision", "") or ""),
+                "decision_reason": str(getattr(attempt, "decision_reason", "") or ""),
+                "relevant": _as_int(getattr(attempt, "relevant", 0)),
+                "partial": _as_int(getattr(attempt, "partial", 0)),
+                "irrelevant": _as_int(getattr(attempt, "irrelevant", 0)),
+                "grades": [
+                    {
+                        "chunk_id": str(getattr(grade, "chunk_id", "") or ""),
+                        "document_id": str(getattr(grade, "document_id", "") or ""),
+                        "ordinal": _as_int(getattr(grade, "ordinal", 0)),
+                        "grade": str(getattr(grade, "grade", "") or ""),
+                        "reason": str(getattr(grade, "reason", "") or "")[:RETRIEVAL_REASON_CHARS],
+                        "distance": _as_float(getattr(grade, "distance", None)),
+                        # `excerpt` is deliberately absent. See the docstring.
+                    }
+                    for grade in grades_raw[:MAX_RETRIEVAL_GRADES_KEPT]
+                ],
+                # So a reader of the checkpoint can tell "six chunks were graded" from
+                # "six is all we kept" -- the same reason `summarise_crawl` carries
+                # `excerpt_truncated` beside its excerpt.
+                "grades_total": len(grades_raw),
+                "notes": [str(note) for note in (getattr(attempt, "notes", []) or [])],
+            }
+        )
+
+    return {
+        # The graph node that asked, so the panel can be read per node. The trace does
+        # not know this -- `kb_service` is called the same way from five places.
+        "node": node,
+        "question": str(getattr(trace, "question", "") or ""),
+        "needed": bool(getattr(trace, "needed", False)),
+        "need_reason": str(getattr(trace, "need_reason", "") or ""),
+        # The fallback decision, which is the other half of the evidence: `sufficient`,
+        # `fallback_to_web` or `not_needed`, with the reason the loop gave for it.
+        "outcome": str(getattr(trace, "outcome", "") or ""),
+        "outcome_reason": str(getattr(trace, "outcome_reason", "") or ""),
+        "prompt_version": str(getattr(trace, "prompt_version", "") or ""),
+        "attempts": attempts,
+        "attempts_total": len(attempts_raw),
+        "grounding_chunk_ids": [
+            str(chunk_id) for chunk_id in (getattr(trace, "grounding_chunk_ids", []) or [])
+        ],
+        "chunk_count": len(list(getattr(trace, "chunks", []) or [])),
+        "model_calls": _as_int(getattr(trace, "model_calls", 0)),
+        # A string, like every other money value that crosses a JSON boundary here.
+        "cost_usd": str(getattr(trace, "cost_usd", "0") or "0"),
+        "notes": [str(note) for note in (getattr(trace, "notes", []) or [])],
+    }
+
+
+def _as_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0
+    return int(value)
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 def _audit_own_nap(dna: Mapping[str, Any], site: Any) -> dict[str, Any] | None:

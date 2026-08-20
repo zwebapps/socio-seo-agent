@@ -28,7 +28,16 @@ so a review screen that invents a draft is worse than one that shows none.
 version of the state, a hand-run SQL statement, or a partially-written run put there. A
 malformed checkpoint degrades to "not available" rather than raising: a run whose review
 screen 500s cannot be reviewed at all, and the owner has no way to tell that apart from
-an outage.
+an outage. `retrieval` is the sharpest case of this: the key postdates the earliest
+checkpoints, so an older run simply has none, and that reads the same as a business with
+no documents -- which is why its note describes the mechanism instead of naming a fault.
+
+**No chunk text crosses this wire, and none is in the checkpoint to cross it.**
+:func:`backend.app.agents.nodes.summarise_retrieval` drops every chunk body before the
+state is written, so the retrieval panel carries chunk IDS, grades and decisions. That is
+the auditable part -- an id plus a grade plus the grader's reason answers "is this claim
+grounded, and how do we know" -- while the body is one indexed lookup away in
+`document_chunks` and would otherwise be re-serialised on every one of a run's nodes.
 
 One thing deliberately NOT returned: a per-channel character LIMIT. Two limit tables
 already disagree in this repo (``agents.nodes.CHANNEL_LIMITS`` against
@@ -102,6 +111,9 @@ __all__ = [
     "ExportPack",
     "ExportProofPoint",
     "Opportunity",
+    "RetrievalAttempt",
+    "RetrievalGrade",
+    "RetrievalTrace",
     "ReviewFinding",
     "RunReview",
     "SeoReport",
@@ -155,6 +167,27 @@ _OUTLINE_WITHOUT_BLOCKS: Final = (
     "outline, so the model returned none for this run — nothing has been hidden, and "
     "nothing has been invented to fill the tab."
 )
+#: Why there is no retrieval trace, phrased as the mechanism and NOT as a fault.
+#:
+#: This is the empty state that is easiest to get wrong, because the honest reading is
+#: counter-intuitive: for a business that has uploaded no documents there is nothing to
+#: retrieve, so nothing was retrieved, and that is a complete and successful run. A note
+#: that said "retrieval failed" or "no results" would report the absence of a knowledge
+#: base as a defect in the agent -- and would tell the owner to go looking for a bug
+#: instead of uploading a PDF.
+#:
+#: It names HARVEST because HARVEST is the node that records the absence, and that
+#: record is the thing the reader can already see: "uploaded documents" appears in
+#: `fact_gaps` above the tabs. Deliberately contains no word for failure -- there is
+#: nothing here to soften, and a hedge would imply there was.
+_NO_RETRIEVAL: Final = (
+    "No document retrieval ran for this run. Retrieval reads the business's own "
+    "uploaded documents, and this business has none on record -- so the work was "
+    "written from its confirmed profile and the live research instead, which HARVEST "
+    "records above under what it was written without. That is a normal run: there was "
+    "nothing to retrieve, so nothing was retrieved."
+)
+
 _NO_LANDING: Final = (
     "No landing page was written, so there is nothing for a click to land on. The page, "
     "its offer and its per-channel asks come from the CONVERT node, which has not "
@@ -292,6 +325,97 @@ class AiBlocks(_Wire):
     cta: str | None
 
 
+class RetrievalGrade(_Wire):
+    """One chunk, as retrieval judged it.
+
+    There is no chunk TEXT here and there is none in the checkpoint either -- the id,
+    the document and the ordinal are the citation, and the body is one indexed lookup
+    away. See `agents.nodes.summarise_retrieval`: carrying bodies would put the
+    business's knowledge base into a JSONB column that is rewritten eleven times a run.
+
+    ``reason`` is the grader's own justification and is the field that makes the grade
+    reviewable. A screen showing "irrelevant" with no reason is asking the owner to
+    take the model's word for it, which is the opposite of what this panel is for.
+    """
+
+    chunk_id: str
+    document_id: str
+    ordinal: int
+    #: ``relevant`` · ``partial`` · ``irrelevant``. A string, not a union: the
+    #: retrieval service owns this vocabulary and can add to it.
+    grade: str
+    reason: str | None
+    #: Vector distance. ``None`` when the trace did not record one -- which is not zero,
+    #: and rendering it as zero would report the worst possible match as the best.
+    distance: float | None
+
+
+class RetrievalAttempt(_Wire):
+    """One turn of the retrieval loop: the rewritten query, the grades, the decision.
+
+    ``query`` is the REWRITE -- what was actually embedded, in the words the documents
+    would use, rather than the node's own question. It is the single most load-bearing
+    field on this panel: a system that embeds the user's words verbatim is doing vector
+    search, and one that rewrites them, grades what comes back and decides what to do
+    next is doing agentic retrieval. Showing the rewrite is how that claim is checkable
+    rather than asserted.
+    """
+
+    attempt: int
+    query: str
+    query_rationale: str | None
+    #: ``sufficient`` · ``retry`` · ``exhausted``. A string, for the same reason
+    #: `RetrievalGrade.grade` is one.
+    decision: str
+    decision_reason: str | None
+    relevant: int
+    partial: int
+    irrelevant: int
+    grades: tuple[RetrievalGrade, ...]
+    #: How many chunks were graded, against how many are listed above. Equal on every
+    #: ordinary run; unequal says the summariser trimmed, which the reader is owed.
+    grades_total: int
+    notes: tuple[str, ...]
+
+
+class RetrievalTrace(_Wire):
+    """One node's whole retrieval: question, attempts, grades, and the final decision.
+
+    ``outcome`` is the fallback decision and the reason this projection exists.
+    ``fallback_to_web`` means the business's own documents did not answer, so the run
+    went on with live research instead -- a decision the agent MADE, and one a reviewer
+    has to be able to see it make. ``not_needed`` is likewise a decision and not a
+    miss: judging that a step needs no business facts is one of the choices that makes
+    this retrieval agentic.
+    """
+
+    #: 1-based ordinal over the run's retrieval calls, carried through the count cap.
+    #: A panel whose first entry is not ``1`` has said that earlier calls were dropped.
+    seq: int
+    #: The graph node that asked. The trace itself does not know -- the same retrieval
+    #: service is called from five nodes.
+    node: str
+    #: What the node asked for, before rewriting.
+    question: str
+    needed: bool
+    need_reason: str | None
+    #: ``sufficient`` · ``fallback_to_web`` · ``not_needed``.
+    outcome: str
+    outcome_reason: str | None
+    prompt_version: str | None
+    attempts: tuple[RetrievalAttempt, ...]
+    attempts_total: int
+    #: Chunks graded ``relevant``: the only citable evidence.
+    grounding_chunk_ids: tuple[str, ...]
+    #: Chunks retrieval stood behind, relevant and partial together. Larger than
+    #: ``grounding_chunk_ids`` when partials were carried as weak context.
+    chunk_count: int
+    model_calls: int
+    #: A string, like every money value on this wire.
+    cost_usd: str | None
+    notes: tuple[str, ...]
+
+
 class Opportunity(_Wire):
     """Why this topic and not another. Context for the draft tab, not a tab of its own."""
 
@@ -371,6 +495,12 @@ class RunReview(_Wire):
     ai_blocks: AiBlocks | None
     ai_blocks_note: str | None
     opportunity: Opportunity | None
+    #: The agentic-RAG evidence, per node, in the order the run produced it. Empty for
+    #: a business with no uploaded documents, which is a normal run -- see
+    #: `retrieval_note`, which says so rather than leaving the panel to be read as a
+    #: fault.
+    retrieval: tuple[RetrievalTrace, ...]
+    retrieval_note: str | None
     fact_gaps: tuple[str, ...]
     errors: tuple[dict[str, str], ...]
     #: What EXPORT did, or `None` when it never ran -- which is the case for every run
@@ -681,6 +811,97 @@ def _opportunity(checkpoint: Mapping[str, Any]) -> Opportunity | None:
     )
 
 
+def _retrieval(checkpoint: Mapping[str, Any]) -> tuple[tuple[RetrievalTrace, ...], str | None]:
+    """The retrieval traces, and the reason there are none when there are none.
+
+    Read defensively like everything else here, and with one extra reason to be: this
+    key postdates the first checkpoints ever written, so an older run legitimately has
+    no `retrieval_traces` at all. That is indistinguishable, from here, from a run whose
+    business had no documents — both get the same honest note, because from the reader's
+    side both mean "there is no retrieval evidence for this run" and neither means the
+    agent failed at anything.
+
+    A malformed entry is DROPPED rather than raising, per this module's contract: one
+    bad row must not make a whole run unreviewable. An entry with no node is dropped
+    too, because the panel is organised per node and a trace that cannot say which node
+    asked is evidence about nothing.
+    """
+    raw = checkpoint.get("retrieval_traces")
+    if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
+        return (), _NO_RETRIEVAL
+
+    traces: list[RetrievalTrace] = []
+    for index, item in enumerate(raw, start=1):
+        entry = _mapping(item)
+        node = _optional_text(entry.get("node"))
+        if node is None:
+            continue
+        attempts = tuple(
+            _retrieval_attempt(_mapping(attempt)) for attempt in _sequence(entry.get("attempts"))
+        )
+        traces.append(
+            RetrievalTrace(
+                # Position in the list is the fallback, not zero: a trace written before
+                # `seq` existed still has a place in the run's order, and numbering it 0
+                # would claim earlier calls were dropped when none were.
+                seq=_int(entry.get("seq"), index),
+                node=node,
+                question=_text(entry.get("question")),
+                needed=bool(entry.get("needed", False)),
+                need_reason=_optional_text(entry.get("need_reason")),
+                outcome=_text(entry.get("outcome")),
+                outcome_reason=_optional_text(entry.get("outcome_reason")),
+                prompt_version=_optional_text(entry.get("prompt_version")),
+                attempts=attempts,
+                # Falls back to the number of attempts LISTED rather than to zero: this
+                # field exists to reveal a trim, and a zero here would claim a trim of
+                # everything on a checkpoint that simply never wrote the count.
+                attempts_total=_int(entry.get("attempts_total"), len(attempts)),
+                grounding_chunk_ids=_strings(entry.get("grounding_chunk_ids")),
+                chunk_count=_int(entry.get("chunk_count")),
+                model_calls=_int(entry.get("model_calls")),
+                cost_usd=_optional_text(entry.get("cost_usd")),
+                notes=_strings(entry.get("notes")),
+            )
+        )
+
+    return tuple(traces), (None if traces else _NO_RETRIEVAL)
+
+
+def _retrieval_attempt(entry: Mapping[str, Any]) -> RetrievalAttempt:
+    grades = tuple(
+        RetrievalGrade(
+            chunk_id=_text(grade.get("chunk_id")),
+            document_id=_text(grade.get("document_id")),
+            ordinal=_int(grade.get("ordinal")),
+            grade=_text(grade.get("grade")),
+            reason=_optional_text(grade.get("reason")),
+            distance=_float_or_none(grade.get("distance")),
+        )
+        for grade in (_mapping(item) for item in _sequence(entry.get("grades")))
+    )
+    return RetrievalAttempt(
+        attempt=_int(entry.get("attempt")),
+        query=_text(entry.get("query")),
+        query_rationale=_optional_text(entry.get("query_rationale")),
+        decision=_text(entry.get("decision")),
+        decision_reason=_optional_text(entry.get("decision_reason")),
+        relevant=_int(entry.get("relevant")),
+        partial=_int(entry.get("partial")),
+        irrelevant=_int(entry.get("irrelevant")),
+        grades=grades,
+        grades_total=_int(entry.get("grades_total"), len(grades)),
+        notes=_strings(entry.get("notes")),
+    )
+
+
+def _sequence(value: Any) -> tuple[Any, ...]:
+    """A list of anything, or empty. Strings are not sequences of items here."""
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        return ()
+    return tuple(value)
+
+
 def _errors(checkpoint: Mapping[str, Any]) -> tuple[dict[str, str], ...]:
     raw = checkpoint.get("errors")
     if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
@@ -719,6 +940,8 @@ def project_review(checkpoint: Mapping[str, Any] | None) -> RunReview:
             ai_blocks=None,
             ai_blocks_note=_NO_CHECKPOINT,
             opportunity=None,
+            retrieval=(),
+            retrieval_note=_NO_CHECKPOINT,
             fact_gaps=(),
             errors=(),
             published=None,
@@ -734,6 +957,7 @@ def project_review(checkpoint: Mapping[str, Any] | None) -> RunReview:
 
     published, published_note = _published(checkpoint)
     measurement, measurement_note = _measurement(checkpoint)
+    retrieval, retrieval_note = _retrieval(checkpoint)
 
     return RunReview(
         has_output=bool(draft or seo or social or (ai_blocks and ai_blocks.blocks)),
@@ -746,6 +970,8 @@ def project_review(checkpoint: Mapping[str, Any] | None) -> RunReview:
         ai_blocks=ai_blocks,
         ai_blocks_note=ai_note,
         opportunity=_opportunity(checkpoint),
+        retrieval=retrieval,
+        retrieval_note=retrieval_note,
         fact_gaps=_strings(checkpoint.get("fact_gaps")),
         errors=_errors(checkpoint),
         published=published,

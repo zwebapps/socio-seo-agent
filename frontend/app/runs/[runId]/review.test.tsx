@@ -16,7 +16,7 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RunReview } from "@/app/lib/review-api";
+import type { RetrievalTrace, RunReview } from "@/app/lib/review-api";
 import { RunReviewTabs } from "@/app/runs/[runId]/review";
 
 /** The notes the API actually sends, each naming the node responsible. */
@@ -31,6 +31,15 @@ const NOTES = {
   measurement:
     "Nothing has been measured yet. MEASURE runs after EXPORT, so there is nothing to " +
     "measure until something has been published.",
+  // Verbatim from `review_service._NO_RETRIEVAL`. The wording is the point of the test
+  // that uses it: it names HARVEST, it says the run was normal, and it contains no word
+  // for failure — because a business that uploaded nothing had nothing to retrieve.
+  retrieval:
+    "No document retrieval ran for this run. Retrieval reads the business's own uploaded " +
+    "documents, and this business has none on record -- so the work was written from its " +
+    "confirmed profile and the live research instead, which HARVEST records above under " +
+    "what it was written without. That is a normal run: there was nothing to retrieve, so " +
+    "nothing was retrieved.",
 } as const;
 
 function review(over: Partial<RunReview> = {}): RunReview {
@@ -44,6 +53,8 @@ function review(over: Partial<RunReview> = {}): RunReview {
     socialNote: NOTES.social,
     aiBlocks: null,
     aiBlocksNote: NOTES.ai,
+    retrieval: [],
+    retrievalNote: NOTES.retrieval,
     published: null,
     publishedNote: NOTES.published,
     measurement: null,
@@ -398,5 +409,200 @@ describe("Delivery panel", () => {
 
     expect(screen.getByText("published")).toBeInTheDocument();
     expect(screen.queryByText(/dry run, not a delivery/i)).toBeNull();
+  });
+});
+
+/**
+ * The retrieval trace panel — `BUILD_ORDER.md` Phase 3 calls this panel "the Hard #1
+ * evidence", and until it existed the rewritten queries, the per-chunk grades and the
+ * fallback decision were computed inside the process and discarded there.
+ *
+ * Two rules are load-bearing and both are asserted below.
+ *
+ * **The decision must be in WORDS.** `fallback_to_web` is a decision the agent made, and
+ * anybody who has not read the code reads the raw token as an error. A panel that printed
+ * the enum value and nothing else would be reporting a correct degradation as a fault.
+ *
+ * **The empty state must read as normal.** A business that uploaded no documents has
+ * nothing to retrieve, so nothing was retrieved — that is a complete run, and copy that
+ * hinted at failure would send the owner hunting a bug instead of uploading a PDF.
+ */
+describe("retrieval trace panel", () => {
+  function trace(over: Partial<RetrievalTrace> = {}): RetrievalTrace {
+    return {
+      seq: 1,
+      node: "GENERATE",
+      question: "notdienst koblenz preise",
+      needed: true,
+      needReason: "The page states a price, so it needs the business's own figures.",
+      outcome: "fallback_to_web",
+      outcomeReason:
+        "No passage graded relevant after two attempts, so the run continues on live research.",
+      promptVersion: "kb_retrieve.v1",
+      attempts: [
+        {
+          attempt: 1,
+          query: "notdienst anfahrt kosten",
+          queryRationale: "Nouns the price list would use, not the node's own question.",
+          decision: "retry",
+          decisionReason: "Nothing graded relevant, so the query was widened.",
+          relevant: 0,
+          partial: 0,
+          irrelevant: 1,
+          grades: [
+            {
+              chunkId: "chunk-a",
+              documentId: "doc-1",
+              ordinal: 1,
+              grade: "irrelevant",
+              reason: "Describes opening hours, not a call-out charge.",
+              distance: 0.41,
+            },
+          ],
+          gradesTotal: 1,
+          notes: [],
+        },
+        {
+          attempt: 2,
+          query: "sanitaer notdienst preisliste koblenz",
+          queryRationale: "Adds the city and the document's own word for a price list.",
+          decision: "exhausted",
+          decisionReason: "Two attempts is the ceiling; one partial is not grounding.",
+          relevant: 0,
+          partial: 1,
+          irrelevant: 0,
+          grades: [
+            {
+              chunkId: "chunk-b",
+              documentId: "doc-1",
+              ordinal: 2,
+              grade: "partial",
+              reason: "Mentions a fee, but not the call-out one.",
+              distance: 0.23,
+            },
+          ],
+          gradesTotal: 1,
+          notes: [],
+        },
+      ],
+      attemptsTotal: 2,
+      groundingChunkIds: [],
+      chunkCount: 1,
+      modelCalls: 3,
+      costUsd: "0.0042",
+      notes: [],
+      ...over,
+    };
+  }
+
+  async function openRetrieval() {
+    await mount();
+    await userEvent.click(screen.getByRole("tab", { name: /Retrieval/ }));
+    return panelFor(/Retrieval/);
+  }
+
+  it("states the fallback decision in words rather than printing the raw value", async () => {
+    body = review({ hasOutput: true, retrieval: [trace()], retrievalNote: null });
+
+    const panel = await openRetrieval();
+
+    // The sentence, not the token. This is the assertion the panel exists for.
+    expect(panel).toHaveTextContent(
+      "Fell back to live web research: the business's own documents did not answer this.",
+    );
+    // The server's own reason travels with it, so the words are backed by the run's.
+    expect(panel).toHaveTextContent(/continues on live research/);
+    // And each turn's decision is also words: "retry" alone says nothing about what
+    // happened next, which is the whole content of a retrieval loop.
+    expect(panel).toHaveTextContent(/rewrote the query and searched again/);
+    expect(panel).toHaveTextContent(/attempt ceiling was reached/);
+  });
+
+  it("shows the rewritten query for every attempt, and the node that asked", async () => {
+    // A system that embeds the node's own question is doing vector search. The rewrite is
+    // the difference, so it is the one thing this panel may not summarise away.
+    body = review({ hasOutput: true, retrieval: [trace()], retrievalNote: null });
+
+    const panel = await openRetrieval();
+
+    expect(panel).toHaveTextContent("notdienst anfahrt kosten");
+    expect(panel).toHaveTextContent("sanitaer notdienst preisliste koblenz");
+    expect(panel).toHaveTextContent("GENERATE");
+    expect(panel).toHaveTextContent("Attempt 1 of 2");
+  });
+
+  it("shows a grade and a reason against every graded passage", async () => {
+    body = review({ hasOutput: true, retrieval: [trace()], retrievalNote: null });
+
+    const panel = await openRetrieval();
+
+    expect(panel).toHaveTextContent("irrelevant");
+    expect(panel).toHaveTextContent("partial");
+    expect(panel).toHaveTextContent("Describes opening hours, not a call-out charge.");
+    expect(panel).toHaveTextContent("doc-1#2");
+  });
+
+  it("names the node in the no-documents state and does not imply retrieval failed", async () => {
+    // The normal state for most businesses on day one. `retrieval: []` with the server's
+    // own note, which is what a business that has uploaded nothing gets.
+    body = review();
+
+    const panel = await openRetrieval();
+
+    // It names the node that recorded the absence, so the reader can connect the panel to
+    // the "written without: uploaded documents" line above the tabs.
+    expect(panel).toHaveTextContent("HARVEST");
+    expect(panel).toHaveTextContent(/normal run/);
+    expect(panel).toHaveTextContent(/nothing to retrieve, so nothing was retrieved/);
+
+    // And nothing in it reads as a fault. Asserted as an explicit negative because the
+    // failure mode here is a helpful-sounding word, not a blank panel.
+    const text = (panel.textContent ?? "").toLowerCase();
+    for (const word of ["fail", "error", "unavailable", "broke", "could not", "problem"]) {
+      expect(text).not.toContain(word);
+    }
+  });
+
+  it("renders no fabricated trace when the API sends none", async () => {
+    // The invented-content rule, applied here. A sample query with a plausible grade would
+    // be the worst possible lie on this screen: it is the evidence panel.
+    body = review();
+
+    const panel = await openRetrieval();
+
+    expect(panel).not.toHaveTextContent(/searched for/);
+    expect(panel).not.toHaveTextContent(/Attempt 1/);
+  });
+
+  it("says so when the stored trace count was capped instead of quietly starting at 4", async () => {
+    // `seq` survives the cap, so a first entry numbered above 1 means earlier calls were
+    // dropped. A panel that showed the tail as if it were the whole retrieval would be a
+    // quieter version of exactly the bug this key was added to fix.
+    body = review({ hasOutput: true, retrieval: [trace({ seq: 4 })], retrievalNote: null });
+
+    const panel = await openRetrieval();
+
+    expect(panel).toHaveTextContent(/the earliest 3 are not shown/);
+  });
+
+  it("falls through to the server's value for an outcome it does not recognise", async () => {
+    // The server owns this vocabulary and can add to it, and an app in a browser tab is
+    // older than the API it is talking to. Showing the raw value beats showing the wrong
+    // sentence, and beats showing nothing.
+    body = review({
+      hasOutput: true,
+      retrieval: [
+        trace({
+          outcome: "deferred_to_operator",
+          outcomeReason: "A future outcome this build has never heard of.",
+        }),
+      ],
+      retrievalNote: null,
+    });
+
+    const panel = await openRetrieval();
+
+    expect(panel).toHaveTextContent("deferred to operator");
+    expect(panel).toHaveTextContent("A future outcome this build has never heard of.");
   });
 });

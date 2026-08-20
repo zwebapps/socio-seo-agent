@@ -74,6 +74,81 @@ export type AiBlocks = {
   cta: string | null;
 };
 
+/**
+ * One chunk, as retrieval judged it.
+ *
+ * There is no chunk TEXT here, and there is none in the checkpoint either. The id, the
+ * document and the ordinal are the citation; the body is one indexed lookup away on the
+ * server and would otherwise be re-serialised into a JSONB column on every node of every
+ * run. `reason` is the grader's own justification and is what makes the grade reviewable
+ * — "irrelevant" with no reason asks the owner to take the model's word for it.
+ */
+export type RetrievalGrade = {
+  chunkId: string;
+  documentId: string;
+  ordinal: number;
+  /** `relevant` · `partial` · `irrelevant`. A string, not a union: the server owns it. */
+  grade: string;
+  reason: string | null;
+  /** `null` when the trace recorded none — which is NOT zero, i.e. not a perfect match. */
+  distance: number | null;
+};
+
+/**
+ * One turn of the retrieval loop.
+ *
+ * `query` is the REWRITE — what was actually embedded, in the words the documents would
+ * use rather than the node's own question. It is the load-bearing field on this panel: a
+ * system that embeds the question verbatim is doing vector search, and one that rewrites,
+ * grades and then decides is doing retrieval the agent steered.
+ */
+export type RetrievalAttempt = {
+  attempt: number;
+  query: string;
+  queryRationale: string | null;
+  /** `sufficient` · `retry` · `exhausted`. A string, for the same reason `grade` is. */
+  decision: string;
+  decisionReason: string | null;
+  relevant: number;
+  partial: number;
+  irrelevant: number;
+  grades: RetrievalGrade[];
+  /** How many were graded, against how many are listed. Unequal means a trim. */
+  gradesTotal: number;
+  notes: string[];
+};
+
+/**
+ * One node's whole retrieval: question → rewritten queries → graded chunks → decision.
+ *
+ * `outcome` is the fallback decision and the reason this panel exists. `fallback_to_web`
+ * means the business's own documents did not answer, so the run went on with live
+ * research — a decision the agent MADE. `not_needed` is also a decision, not a miss.
+ */
+export type RetrievalTrace = {
+  /** 1-based over the run's retrieval calls. A panel not starting at 1 has been trimmed. */
+  seq: number;
+  /** The graph node that asked. The trace itself does not know — five nodes call it. */
+  node: string;
+  question: string;
+  needed: boolean;
+  needReason: string | null;
+  /** `sufficient` · `fallback_to_web` · `not_needed`. */
+  outcome: string;
+  outcomeReason: string | null;
+  promptVersion: string | null;
+  attempts: RetrievalAttempt[];
+  attemptsTotal: number;
+  /** Chunks graded `relevant`: the only citable evidence. */
+  groundingChunkIds: string[];
+  /** Chunks carried into the prompt, partials included. */
+  chunkCount: number;
+  modelCalls: number;
+  /** A string, like every money value on this wire. */
+  costUsd: string | null;
+  notes: string[];
+};
+
 export type ReviewOpportunity = {
   title: string;
   rationale: string | null;
@@ -91,6 +166,15 @@ export type RunReview = {
   aiBlocks: AiBlocks | null;
   aiBlocksNote: string | null;
   opportunity: ReviewOpportunity | null;
+  /**
+   * The agentic-RAG evidence, per node, in the order the run produced it.
+   *
+   * Empty for a business with no uploaded documents, and for any run whose checkpoint
+   * predates the field. Both are normal, and `retrievalNote` is the server's own sentence
+   * saying so — render it, never a generic "nothing here".
+   */
+  retrieval: RetrievalTrace[];
+  retrievalNote: string | null;
   /** What could NOT be gathered. Rendered so the screen never implies research happened. */
   factGaps: string[];
   errors: { node: string; code: string; message: string }[];

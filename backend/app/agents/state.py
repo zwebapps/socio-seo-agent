@@ -16,6 +16,15 @@ Design notes worth keeping:
 * **The state must survive a JSON round trip**, because the checkpoint is a JSONB
   column. A state that cannot serialise cannot resume, and a run that cannot resume
   loses work the customer already paid for.
+* **Anything carried here is written once per node, so it is bounded once per node.**
+  The checkpoint is rewritten eleven times a run, so a field that grows with the
+  evidence -- the crawl, the retrieval trace -- is compacted before it gets in. The
+  compaction lives next to whatever produces the thing (`summarise_crawl` in
+  `run_executor`, `summarise_retrieval` in `agents.nodes`), because that is the only
+  place that knows which losses are the cheap ones.
+* **A reader of this state does not get to assume its own version wrote it.** Keys are
+  added over time and nothing migrates a JSONB column, so every key added after the
+  first checkpoint is `NotRequired` and :func:`from_checkpoint` supplies the default.
 """
 
 from dataclasses import dataclass
@@ -170,6 +179,22 @@ class AgentState(TypedDict):
     #: What MEASURE measured, and -- at least as important -- what it could not.
     #: A metric nobody measured is ABSENT here, never zero.
     measurement: NotRequired[dict[str, Any] | None]
+    #: The agentic-RAG evidence: what each retrieving node asked its own documents,
+    #: how every returned chunk was graded, and what the loop then decided.
+    #:
+    #: BOUNDED and TEXT-FREE, and both halves matter. The checkpoint is a JSONB
+    #: column rewritten on EVERY node, so anything carried here is paid for eleven
+    #: times a run -- the same reason `run_executor.summarise_crawl` exists. So this
+    #: holds chunk IDS, grades and decisions and never chunk bodies: an id plus a
+    #: grade is what makes a claim auditable, while the body is already in
+    #: `document_chunks` and would put the whole knowledge base in the checkpoint.
+    #: `nodes.summarise_retrieval` does the dropping and `nodes.append_retrieval_trace`
+    #: applies the count cap.
+    #:
+    #: Absent on every checkpoint written before this key existed, which is why it is
+    #: `NotRequired` and why `from_checkpoint` supplies an empty list. A reader of a
+    #: JSONB column does not get to assume its own version wrote it.
+    retrieval_traces: NotRequired[list[dict[str, Any]]]
     #: True when the run ended because content could not be made publishable, as
     #: opposed to ending because the budget or the step count ran out. Kept
     #: separate from `outcome` on purpose: "partial" is the persisted run state
@@ -217,6 +242,7 @@ def new_state(
         approved_by=None,
         published=None,
         measurement=None,
+        retrieval_traces=[],
         publication_blocked=False,
         caps=caps or RunCaps(),
         step_count=0,
@@ -315,6 +341,17 @@ def from_checkpoint(payload: dict[str, Any]) -> AgentState:
     )
     restored["cost_usd"] = Decimal(str(payload.get("cost_usd", "0")))
     restored["errors"] = [NodeError.model_validate(e) for e in payload.get("errors", [])]
+    # `retrieval_traces` postdates the first checkpoints ever written, so an older row
+    # simply has no such key -- and a run that cannot resume because a DISPLAY field is
+    # missing would lose work a customer already paid for. Normalised rather than merely
+    # defaulted: this column can also hold whatever a hand-run UPDATE put there, and one
+    # malformed entry must not travel into the graph as an entry.
+    raw_traces = payload.get("retrieval_traces")
+    restored["retrieval_traces"] = (
+        [entry for entry in raw_traces if isinstance(entry, dict)]
+        if isinstance(raw_traces, list)
+        else []
+    )
     # The payload came from JSON, so the static type is a promise about what
     # to_checkpoint wrote, not a fact the checker can verify. One cast, named.
     return cast("AgentState", restored)
