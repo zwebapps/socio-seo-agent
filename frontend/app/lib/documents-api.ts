@@ -158,3 +158,21 @@ export function statusTone(status: string): "ok" | "warn" | "err" | "muted" {
   if (status === "failed") return "err";
   return "muted";
 }
+
+/**
+ * The pill colour for a whole document, which is NOT always its status's colour.
+ *
+ * `indexed` with zero chunks is a real state — the backend's `DocumentOut` docstring
+ * says so, and it is why the API sends `status` and `chunkCount` as two fields. A green
+ * pill on that document contradicts the sentence beside it ("nothing here the agent can
+ * quote") and the half a customer reads is the colour, so the count has to be able to
+ * override the status.
+ *
+ * `warn`, not `err`: nothing failed. The file was read and held no passages, which is
+ * the customer's to fix (usually with OCR) and is exactly what `no_text` means — so it
+ * gets `no_text`'s colour, because it is the same fact arrived at down a different path.
+ */
+export function documentTone(document: Document): "ok" | "warn" | "err" | "muted" {
+  if (document.status === "indexed" && document.chunkCount === 0) return "warn";
+  return statusTone(document.status);
+}

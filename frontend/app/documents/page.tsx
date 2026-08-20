@@ -40,9 +40,9 @@ import {
   type DocumentList,
   type UploadResult,
   deleteDocument,
+  documentTone,
   fetchDocuments,
   statusExplanation,
-  statusTone,
   uploadDocument,
 } from "@/app/lib/documents-api";
 
@@ -251,7 +251,7 @@ function UploadOutcome({ result }: { result: UploadResult }) {
   return (
     <SoftWell className="mt-4 p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <Pill tone={statusTone(result.status)}>{result.status.replace(/_/g, " ")}</Pill>
+        <Pill tone={documentTone(result.document)}>{result.status.replace(/_/g, " ")}</Pill>
         <span className="text-sm font-medium">{result.document.filename}</span>
       </div>
       <p className="mt-2 text-sm" style={{ color: "var(--text-muted)" }}>
@@ -291,7 +291,7 @@ function DocumentRow({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <Pill tone={statusTone(document.status)}>
+              <Pill tone={documentTone(document)}>
                 {document.status.replace(/_/g, " ")}
               </Pill>
               <span className="text-sm font-medium">{document.filename}</span>

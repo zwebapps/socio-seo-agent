@@ -82,7 +82,7 @@ jobs:
         run: uv run pytest backend/tests/db -q --no-header -p no:randomly | tee /tmp/db.txt && ! grep -q "skipped" /tmp/db.txt
 
   web:
-    name: Web — types, build
+    name: Web — types, tests, build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -103,6 +103,12 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+
+      # Vitest + React Testing Library, in jsdom. Every request is faked at `fetch`, so
+      # like the Python suite this makes no network call. Run as its own step rather than
+      # chained onto typecheck, for the reason in CLAUDE.md: `a && b` skips `b` silently.
+      - run: pnpm test
+
       - run: pnpm build
 
   images:
