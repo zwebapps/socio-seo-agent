@@ -83,7 +83,7 @@ The single most important rule in this codebase.
 
 | | Engines | Actuators | Agents |
 |---|---|---|---|
-| Examples | `crawl`, `seo`, `serp`, `geo`, `kb`, `nap`, `claims`, `landing`, `channel` | `notify.email` (real, behind `RESEND_API_KEY`), `social.post` (refuses without a platform connection), `publish.page` (real — this app serves the page, so there is no credential to be missing) | the nine graph nodes in `agents/nodes/` |
+| Examples | `crawl`, `seo`, `serp`, `geo`, `kb`, `nap`, `claims`, `landing`, `channel` | `notify.owner` (the transactional owner notice EXPORT sends — real behind `RESEND_API_KEY` + `OWNER_NOTICE_FROM`, and it REFUSES any marketing field, which is what stops it becoming the door marketing uses to skip the consent rule), `notify.email` (the marketing type, real behind `RESEND_API_KEY`; deliberately granted to no node), `social.post` (refuses without a platform connection), `publish.page` (real — this app serves the page, so there is no credential to be missing) | the nine graph nodes in `agents/nodes/` |
 | Determinism | total | total, given the key | none |
 | Test style | unit, faked HTTP | unit + replay test proving no double-execute | eval harness |
 | Failure | typed error | returns prior result, or fails closed | wrong choice → caught by `VALIDATE` |
