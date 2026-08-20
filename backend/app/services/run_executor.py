@@ -45,11 +45,13 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 from uuid import UUID
 
+from backend.app.actuators import Actuator, FakeActuator
 from backend.app.agents.graph import GraphResult, run_graph
 from backend.app.agents.nodes import NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
 from backend.app.agents.state_graph import run_state_graph
 from backend.app.core.config import get_settings
+from backend.app.db.adapters.action_store import PostgresActionStore
 from backend.app.engines.nap import extract_nap_listings
 from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
@@ -241,12 +243,59 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         retrieve=await _build_retrieve(business_id, router),
         load_memory=_build_load_memory(business_id),
         geo_probe=_build_geo_probe(business_id, router),
+        actuator_for=_build_actuator_resolver(),
+        actuator_store=PostgresActionStore(),
         # Same rule as `serp_search` and for the same reason: a FAKE search result
         # reaching a draft is worse than no search at all, because afterwards nothing
         # can tell it apart from a real one. GENERATE then reports that the search did
         # not run rather than treating an empty answer as a finding.
         web_search=serp_search,
     )
+
+
+def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
+    """Resolve a dotted action type to the actuator that will perform it.
+
+    A resolver rather than a mapping because the answer is per action type AND per
+    deployment: email is a real send the moment `RESEND_API_KEY` is set, while every
+    social channel is still gated on per-platform App Review (`docs/CHANNELS.md` §2). So
+    one run can legitimately have a real emailer and a simulated publisher, and EXPORT
+    has to be able to say which was which.
+
+    **Nothing here silently becomes a no-op.** `notify.email` is built by the email
+    actuator's own credential check, which returns a FAKE that names the missing variable
+    when there is no key; `social.post` and `publish.page` fall back to `FakeActuator`,
+    whose `Outcome.fake` reaches `published.simulated` and the timeline sentence, so a
+    surface cannot report "Published 3 of 3" about three posts that never left the
+    process. An unknown action type gets `None`, which EXPORT records as unwired rather
+    than guessing.
+    """
+    from backend.app.actuators.email import build_email_actuator
+    from backend.app.actuators.social import SocialPostActuator
+    from backend.app.db.adapters.connection_store import PostgresConnectionStore
+
+    def resolve(action_type: str) -> Actuator | None:
+        if action_type == "notify.email":
+            return build_email_actuator()
+        if action_type == "social.post":
+            # `publisher=None` is the only configuration that exists: no real
+            # `SocialPublisher` is written, because none could be exercised without a
+            # platform approval nobody has yet. It simulates and says so.
+            #
+            # The connection store is still passed, and that matters: the actuator's
+            # refusals (no connection, expired, revoked) are evaluated BEFORE the
+            # simulate shortcut, so a run against a business with no LinkedIn connection
+            # reports "not connected" rather than a cheerful simulated post.
+            return SocialPostActuator(connections=PostgresConnectionStore())
+        if action_type == "publish.page":
+            # The landing page is served by this app (`api/pages.py`), so "publishing" it
+            # is a status change rather than an outbound call -- but `publish_landing_page`
+            # has no caller yet and wiring it here would be inventing a flow. Simulated,
+            # visibly, until that lands.
+            return FakeActuator(action_type)
+        return None
+
+    return resolve
 
 
 def _build_geo_probe(business_id: UUID, router: ModelRouter) -> Callable[..., Awaitable[Any]]:

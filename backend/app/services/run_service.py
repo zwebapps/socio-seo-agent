@@ -27,7 +27,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from backend.app.agents.state import AgentState, from_checkpoint, to_checkpoint
+from backend.app.agents.state import AgentState, approve, from_checkpoint, to_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +394,35 @@ class RunService:
         run.current_node = current_node
         run.state = "running"
         await self._store.update(run)
+
+    async def record_approval(self, run_id: UUID, *, approver: str) -> bool:
+        """Write the approver into the parked run's checkpoint. Returns whether it stuck.
+
+        This is the step that makes `approved_by` a real fact rather than a seam. EXPORT
+        publishes nothing without it (and says so), so until something called this, every
+        real run correctly published nothing.
+
+        **It writes to the CHECKPOINT rather than to a column**, because the checkpoint is
+        what a resume restores: an approver stored anywhere else would have to be threaded
+        back into `AgentState` by the executor, which is a second path to keep in step
+        with the first. `to_checkpoint` round-trips it already.
+
+        Returns False when there is no checkpoint to write into, which the route turns
+        into a refusal. That is not a hypothetical: a run can be parked before its first
+        checkpoint if it fails early, and approving one would be approving nothing.
+
+        The run's `state` is deliberately NOT changed here. `resume` is what starts it,
+        and doing both in one method would make "approved but not yet running" impossible
+        to represent -- which is exactly the state a run is in between the two calls.
+        """
+        run = await self._require(run_id)
+        if not run.checkpoint:
+            return False
+
+        state = approve(from_checkpoint(run.checkpoint), approver=approver)
+        run.checkpoint = to_checkpoint(state)
+        await self._store.update(run)
+        return True
 
     async def restore(self, run_id: UUID) -> AgentState | None:
         run = await self._store.get(run_id)

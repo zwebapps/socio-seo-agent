@@ -984,3 +984,92 @@ async def test_a_malformed_cursor_is_refused_rather_than_silently_restarting() -
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "bad_cursor"
+
+
+# --------------------------------------------------------------------------- #
+# Approval: the human decision the whole machine is built around
+# --------------------------------------------------------------------------- #
+
+
+async def test_approving_a_parked_run_records_who_did_it_and_resumes() -> None:
+    """The route that made EXPORT reachable at all.
+
+    `REVIEW` is an interrupt and EXPORT sits after it in `ORDER`, so nothing could pass
+    the gate: `await_approval` wrote a state and no actor, and `resume` refuses a parked
+    run outright. EXPORT's "no approver" refusal therefore fired on every real run —
+    correctly, and uselessly.
+
+    The approver is the AUTHENTICATED user, never a client-supplied value: it lands on
+    every `actions` row, so "who authorised this post" has to be answerable from the
+    ledger months later.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    state = new_state(business_id=BUSINESS, goal="more leads")
+    await service.checkpoint(run.id, state=state, current_node="REVIEW")
+    await service.await_approval(run.id)
+
+    executor = _RecordingExecutor()
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/approve")
+
+    assert response.status_code == 202, response.text
+    assert response.json()["state"] == "running"
+    assert [(run_id, resume) for run_id, _, _, resume in executor.submitted] == [(run.id, True)], (
+        "approval has to RESUME the run, not restart it"
+    )
+
+    restored = await service.restore(run.id)
+    assert restored is not None
+    approver = restored.get("approved_by") or ""
+    assert approver.startswith("user:"), f"the approver must be a real identity, got {approver!r}"
+
+
+async def test_a_run_that_is_not_parked_cannot_be_approved() -> None:
+    """409 with the state named, rather than a generic refusal: approving a `running`
+    run and approving a `done` one are different mistakes with different fixes."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/approve")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "run_not_awaiting_approval"
+    assert "queued" in response.json()["detail"]["message"]
+
+
+async def test_approving_a_run_with_no_checkpoint_is_refused() -> None:
+    """Not hypothetical: a run can be parked before it produces anything, and approving
+    that would be approving nothing. The approver has nowhere to be written."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    await service.await_approval(run.id)
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/approve")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "no_checkpoint"
+
+
+async def test_another_businesss_run_cannot_be_approved() -> None:
+    """404, not 403: whether a run exists is itself information."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=uuid4(), goal="not yours")
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/approve")
+
+    assert response.status_code == 404
+
+
+async def test_approval_needs_a_session() -> None:
+    app = create_app()
+    app.dependency_overrides[runs_api.get_run_service] = lambda: RunService(InMemoryRunStore())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/v1/runs/{uuid4()}/approve")
+
+    assert response.status_code == 401

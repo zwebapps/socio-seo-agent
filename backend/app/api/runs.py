@@ -535,6 +535,74 @@ async def resume_run(
     return StartRunResponse(run_id=run.id, state="running")
 
 
+@router.post(
+    "/{run_id}/approve",
+    response_model=StartRunResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Approve a parked run and let it publish",
+)
+async def approve_run(
+    run_id: UUID,
+    user: CurrentUser,
+    business_id: Annotated[UUID, Depends(current_business)],
+    service: Annotated[RunService, Depends(get_run_service)],
+    executor: Annotated[RunExecutor, Depends(get_executor)],
+) -> StartRunResponse:
+    """The human decision the whole machine is built around, finally reachable.
+
+    `REVIEW` is an interrupt: the graph stops there, and EXPORT and MEASURE sit AFTER it
+    in `ORDER` and are unreachable without passing through. Until this route existed,
+    nothing in the product could pass through — `await_approval` wrote a state and no
+    actor, and `resume` deliberately refuses a parked run ("waiting for a human decision,
+    not stalled"). So a run could be reviewed and never published, and EXPORT's refusal
+    for a missing approver fired on every real run. Correctly, and uselessly.
+
+    **The approver is the AUTHENTICATED USER, and that is the point of doing it here.**
+    It lands in `approved_by`, which reaches `Actuation.approved_by` and is persisted on
+    every `actions` row — so "who authorised this post" is answerable from the audit
+    ledger months later. A client-supplied approver would be the client making an
+    authorisation decision, which is the same mistake `current_business` exists to avoid.
+
+    202, not 200: approving starts work that takes minutes. The state returned is
+    `running`, not `done`.
+
+    Deliberately NOT idempotent-by-silence: a second approval of an already-running run
+    is a 409 rather than a no-op, because the caller believes they are approving something
+    and the honest answer is that it is already going.
+    """
+    run = await _require_own_run(run_id, business_id, service)
+
+    if run.state != "awaiting_approval":
+        # Every other state is a different sentence, and lumping them together would
+        # send somebody to check the wrong thing.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_not_awaiting_approval",
+                "message": (
+                    f"This run is {run.state}, not waiting for approval. "
+                    "Only a run parked at the review gate can be approved."
+                ),
+            },
+        )
+
+    if not await service.record_approval(run_id, approver=f"user:{user.id}"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "no_checkpoint",
+                "message": (
+                    "This run has no checkpoint, so there is nothing to approve. It was "
+                    "parked before it produced anything."
+                ),
+            },
+        )
+
+    executor.submit(run.id, business_id, run.goal, resume=True)
+    return StartRunResponse(run_id=run.id, state="running")
+
+
 @router.get("/{run_id}/events")
 async def stream_events(
     run_id: UUID,
