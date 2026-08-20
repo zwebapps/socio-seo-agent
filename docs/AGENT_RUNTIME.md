@@ -109,10 +109,35 @@ fails the build if the two disagree — so the doc cannot drift from the runtime
 either direction. Every tool call, ours or the model's, goes through
 `NodeToolbox`: our code asking for an ungranted tool raises, and a model asking for
 one is refused, logged, and recorded in `state["errors"]` with the code
-`tool_not_allowed`. A grant is a *permission*, not a promise that the tool is wired:
-`kb.search` is granted to OPPORTUNITY, PLAN and GENERATE by design and is not
-implemented in those nodes yet, which `NodeToolbox.available()` reports as
-unavailable rather than as a violation.
+`tool_not_allowed`. A grant is a *permission*, not a promise that the tool is wired,
+and `NodeToolbox.available()` reports the difference. **Every grant in the table above
+is now implemented** — `kb.search` in OPPORTUNITY/PLAN/GENERATE, `geo.probe` and
+`nap.audit` in HARVEST, `web_search` in GENERATE all landed in `a0c011a` — so
+"unavailable" no longer means "the build has not reached this". It now means a fact
+about the DEPLOYMENT or the TENANT, and each one is deliberate:
+
+* `serp.search` and `web_search` are wired only when a REAL provider is configured,
+  because a fake search result that reaches a draft cannot be told apart from a real
+  one afterwards;
+* `kb.search` is wired only when the business has actually indexed a document, because
+  a retriever over an empty store answers "nothing relevant" and that reads as a
+  business whose own material had nothing to say about the topic;
+* `geo.probe` needs a business name and a city, and refuses rather than probing an
+  empty prompt set that would score zero visibility it never measured.
+
+In every case the node turns "unavailable" into a NAMED `fact_gap`, which is what lets
+the review screen say what the work was written *without*.
+
+Two notes on the newly wired ones, because both are narrower than their names suggest.
+**`nap.audit` is a self-consistency audit**: its listings come from
+`engines/nap/extract.py`, which reads the business's own `LocalBusiness` JSON-LD and
+its Impressum — the two places a German business publishes its NAP and routinely
+disagrees with itself. It does NOT read Gelbe Seiten, Das Örtliche or a Google Business
+Profile: scraping a directory at scale is a terms-of-service and blocking problem and no
+paid aggregator is decided, so the audit's payload carries its own scope sentence rather
+than letting a score be read as "your address is consistent online". **`web_search` in
+GENERATE is a bounded loop**, not an agent: at most two requests, the record tool always
+offered first, and every result fenced as untrusted before the model sees it.
 
 Three names in this column changed when it became executable, and the old ones were
 wrong rather than merely informal: `INTAKE` was documented as holding no tools while

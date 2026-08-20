@@ -116,7 +116,19 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [ ] Per-business model override (`model_routes.business_id`) — one nullable column, no demand yet
 
 ## Phase 11 — Security hardening
-- [ ] Two channel-limit tables disagree, and one is wrong. `agents/nodes.CHANNEL_LIMITS` is
+- [x] Two channel-limit tables disagree, and one is wrong — `ca9f030`. Resolved by
+  `backend/app/engines/channel/specs.py`: ONE table, keyed on the names the PRODUCT already
+  stores (`link_service._CHANNEL_TAGS`, `renderings`, every short link), with the rubric's
+  `facebook_post`/`instagram_caption`/`blog_article` as aliases so the twenty eval cases keep
+  naming their channel exactly as they did. `nodes.CHANNEL_LIMITS` is derived from it and
+  `evals/rubric.CHANNEL_LIMITS` is deleted. It changed one number honestly: Facebook's ceiling
+  is its real 63,206 rather than the 2,000 that used to live in the node table, because 2,000
+  is an editorial target and truncating good copy at a target is not enforcement — being over
+  the target is REPORTED instead. The `channel_specs` config TABLE is not built and is not
+  needed: nothing has asked for per-tenant channel limits, and the drift this item was about
+  was between two code copies. Original text kept below.
+
+  ~~Two channel-limit tables disagree, and one is wrong.~~ `agents/nodes.CHANNEL_LIMITS` is
   `Mapping[str, int]` (plain ceilings: linkedin 3000, facebook 2000, instagram 2200, x 280) while
   `evals/rubric.CHANNEL_LIMITS` holds the richer spec the rubric grades against (min_chars,
   hashtag ranges, link rules). The channel NAMES do not even match — `facebook` vs
@@ -179,7 +191,15 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 ## Found while building, still open
 - [x] **`GET /api/v1/runs/{id}`, `/events` and `/review` 404'd for EVERY run against the real store** — fixed in `c8ee697`; see the fuller entry below. The tenant is now constructor-injected from the `current_business` dependency every route already had, so there was never a chicken-and-egg, and it exposed a second bug: `update`/`append_event` double-began a transaction, so checkpointing could never have worked either
 - [x] **Nothing executed the graph** — `services/run_executor.py`, `f287b2b`; see the fuller entry below for the four things it has to get right and the in-process limitation
-- [ ] **REPACK discards the hashtags it asked the model for.** `REPACK_TOOL` accepts
+- [x] **REPACK discards the hashtags it asked the model for** — `ca9f030`. `renderings` is now a
+  mapping per channel (body, surviving hashtags, how many code removed, how many are still
+  missing, whether the post is over its editorial target), and readers tolerate the old flat
+  string because those rows are in the database. It also turned out `channel.validate` was
+  granted to REPACK and implemented by NOTHING, so `enforce_hashtags` had never once run inside
+  a run — the engine was correcting hashtags in the eval harness and not in the product. The
+  review screen shows the counters rather than hiding them: three tidy hashtags shown without
+  saying five were cut credits the model for the renderer's work. Original text: `REPACK_TOOL`
+  accepts
   `posts[].hashtags`, but the node stores only `renderings[channel] = body`, so they never reach
   the checkpoint and the social tab cannot show them
 - [x] RLS policies were not null-safe: an emptied tenant GUC RAISED instead of returning zero rows — `d9deedf`
@@ -233,19 +253,43 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   Still open, and larger: every other `db` test file writes to the same shared tables, so the same
   class of interference exists wherever teardown is by pattern rather than by transaction rollback.
   The real answer is a transaction-per-test or a schema-per-run.
-- [ ] **`docs/AGENT_RUNTIME.md` documents four tools that are granted but not wired**
-  (`geo.probe`, `nap.audit` on HARVEST; `kb.search` on OPPORTUNITY/PLAN/GENERATE; `web_search` on
-  GENERATE). `NodeToolbox.available()` now distinguishes "not granted" (design) from "not wired"
-  (build state) instead of narrowing the doc to today's code.
-- [ ] **Text extraction is NOT a security boundary, and is now measured rather than assumed.**
+- [x] **`docs/AGENT_RUNTIME.md` documents four tools that are granted but not wired** — all four
+  wired in `a0c011a`.
+  - `kb.search` in OPPORTUNITY, PLAN and GENERATE. Topics were being chosen from the crawl and
+    the SERP alone, which is exactly the evidence a competitor also has. PLAN retrieves against
+    the chosen opportunity rather than the run goal — retrieving against "more local leads"
+    returns whatever is most on-topic in general.
+  - `nap.audit` in HARVEST, which needed a SOURCE rather than code. New `engines/nap/extract.py`
+    reads the business's own `LocalBusiness` JSON-LD and its Impressum, the two places a German
+    business publishes its NAP and routinely disagrees with itself. **No directory scraping and
+    no paid aggregator**, so the audit's scope is self-consistency and the payload SAYS so —
+    "94" would otherwise be read as "your address is consistent online".
+  - `geo.probe` in HARVEST, carrying `ShareOfVoice.headline` rather than a bare percentage: a
+    rendering that physically cannot print a share without its denominator.
+  - `web_search` in GENERATE, as a bounded tool loop in `_ask` (two rounds, results fenced as
+    untrusted, the record tool offered FIRST because `FakeProvider` answers with `tools[0]`).
+  Found while doing it: `box.offer` filtered on the allowlist alone, so an UNWIRED tool was
+  still offered to the model — which contradicts §4's own rule that a tool the node will not get
+  is removed so it never plans around it. `NodeToolbox.available()`'s meaning has correspondingly
+  narrowed: "not wired" now means a deployment or tenant fact (no real search provider, no
+  indexed documents) rather than a build state, and every caller turns it into a named
+  `fact_gap`.
+- [x] **Text extraction is NOT a security boundary, and is now measured rather than assumed** —
+  DELIBERATE, closed as recorded rather than as fixed. There is nothing to implement: the point
+  of the item is that the limit is MEASURED, and the tests assert the survivals as well as the
+  drops precisely so this can never be upgraded into "hidden instructions never reach the
+  model". The barrier that does the work is the per-node tool allowlist, not the extractor.
   `display:none`, `visibility:hidden` and HTML comments are dropped by trafilatura, but
   `font-size:0` and off-screen text survive into `main_text`, and instruction text in `img alt`
   survives into `facts`. Tests assert both the drops AND the survivals, so this cannot be upgraded
   into "hidden instructions never reach the model".
-- [ ] **Login CSRF is not closed** (a pre-login request carries no cookie to check). `SameSite=Lax`
+- [x] **Login CSRF is not closed** — DELIBERATE, and recorded rather than fixed. A pre-login
+  request carries no cookie to check, so closing it properly needs a pre-session synchronizer
+  token, which the Origin-validation design deliberately avoids. `SameSite=Lax`
   blocks the cross-site POST; closing it properly needs a pre-session synchronizer token, which the
   Origin-validation design deliberately avoids.
-- [ ] **A cookie-bearing request from a non-browser client is now refused** (no `Origin`/`Referer`).
+- [x] **A cookie-bearing request from a non-browser client is now refused** — INTENDED, and
+  recorded so nobody re-discovers it as a bug. No `Origin`/`Referer` means no session:
   Intended — the cookie is a browser credential and there is no machine-to-machine mode — but it is a
   behaviour change for anyone curling with a session cookie.
 
@@ -315,10 +359,18 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   message. Matched on the error CODE, not on any error being present — `record_error` also carries
   ordinary degradations, so keying on "are there errors" would report a good judgement as a failure
   whenever a crawl lost a page. Three tests, including that one.
-- [ ] `/api/v1/onboarding` has only `/preview` — nothing persists the drafted Business DNA, so
+- [x] `/api/v1/onboarding` has only `/preview` — **stale when written; closed by `310b735`**,
+  which added `/confirm`, `save_confirmed_dna` and the `/onboard` screen's confirm step, with
+  `tests/db/test_onboarding_confirm.py` against real Postgres. Ticked here rather than deleted
+  because the consequence it named is worth keeping in view: until it landed,
   `tone`/`audience`/`banned_claims` are empty for every business (created at signup with `dna = {}`).
   Consequence: the regulated-claim guard has no claims to enforce for a real tenant.
-- [ ] `/auth/me` exposes no `businessId`, which is why the memory routes derive the tenant from the
+- [x] `/auth/me` exposes no `businessId` — `417c5f8`. `null` rather than an error for an account
+  with no business, because mid-signup is a legitimate state and it is the screen's job to say
+  "finish onboarding". The lookup is factored out of `runs.current_business` and takes a session
+  rather than opening one: two queries answering "whose business is this" is how a screen and an
+  authorisation check start disagreeing. Original text: this is why the memory routes derive the
+  tenant from the
   session instead of taking a path id like their `proposals` sibling.
 
 ## Closed after the developer console landed (2026-08-19)
@@ -348,7 +400,21 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   to `""`. Invisible because the tracer is a no-op without Langfuse keys — and it also meant a
   `model_usage` row could not have been attributed to anything even once a writer existed. The one
   node call site now passes business_id, node and prompt_version.
-- [ ] **The ledger cannot be demonstrated end to end on the current credential.** A live run's only
+- [x] **The ledger cannot be demonstrated end to end on the current credential** — closed by
+  `4fca6e1`, though not the way this item expected. Wiring retrieval into a real run gave the
+  ledger something to record on EVERY run: driving the app produced 26 rows across
+  OPPORTUNITY, PLAN, GENERATE, CONVERT and the retrieval loop. At $0, because the run was
+  deliberately made against the fake provider — which is the honest way to demonstrate the
+  ledger's WIRING without claiming a cost measurement.
+
+  It also found a real bug of exactly the kind this project has fixed before: 18 of those 26
+  rows carried an EMPTY `node`, because the agentic retrieval loop makes three cheap calls per
+  attempt and none of them passed trace context. `kb_service.retrieve` now threads `trace`
+  through all three, labelled `KB` rather than a graph node's name — the calls belong to the
+  loop, and borrowing HARVEST's name would put another node's spend in its column. Verified
+  against the live ledger. The ⛔ part of this item is unchanged and unblocked only by the
+  OpenRouter account setting: a LIVE run's mid-tier call is still refused, so real dollar
+  amounts still cannot be shown here. Original text: a live run's only
   model call is at OPPORTUNITY, which routes to the MID tier and is refused by this OpenRouter
   account's data policy — and a failed call has no usage to record, correctly. So `model_usage` fills
   in the DB tests but stays empty on a real run here. Unblocked by the same account setting as the
@@ -377,15 +443,71 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
 - [x] **`--border` was referenced by several screens and defined NOWHERE**, so
   `borderColor: var(--border)` silently fell back to `currentColor` — a border that took
   the text colour. Aliased to `--edge`.
-- [ ] **`Pill` with `tone="accent"`** renders `--accent` as text at ~2.54:1 on the surface,
+- [x] **`Pill` with `tone="accent"`** — `4fca6e1`. Fixed by FILLING the accent pill:
+  `--accent-ink` on `--accent` measures 6.09:1 light and 7.14:1 dark, and it is the token that
+  exists for exactly this — it keeps the brand orange instead of darkening a colour used all
+  over the app. The other four tones pass as text on surface and are left alone; filling all
+  five would repaint every screen to fix one. Original text: it renders `--accent` as text at
+  ~2.54:1 on the surface,
   failing AA for its 11px label. Pre-existing (the run timeline already used it). No
   information is lost — the pill always shows text as well as colour — only legibility.
   Needs either `--accent-ink` on a filled pill or a darkened text-only variant.
-- [ ] **`POST /api/v1/runs/{id}/resume` still has no UI caller.** A run stranded `running`
+- [x] **`POST /api/v1/runs/{id}/resume` still has no UI caller** — `4fca6e1`. A "resume if
+  stalled" control on the runs list, for a `queued` or `running` run only (mirroring the
+  endpoint's own refusals rather than guessing at them). The API's refusal is printed VERBATIM:
+  a run that is genuinely executing looks identical from the list, only the executor can tell
+  "a task is driving this" from "a process died and left it there", and hiding that behind a
+  generic error would turn a working safeguard into a mystery. Original text: a run stranded
+  `running`
   by a dead process is recoverable only by curl. The runs list is its natural home.
 - [ ] **No frontend test framework exists** (no vitest/jest in `package.json`), so none of
   the React code has automated tests — the backend half of this work has 18, the UI half
   has none. Worth an explicit decision rather than drift.
-- [ ] **`GET /api/v1/runs` has a cap, not pagination.** The page says "showing N (the most
+- [x] **`GET /api/v1/runs` has a cap, not pagination** — `417c5f8`. A keyset cursor on
+  `(created_at, id)` — the tuple the query already orders by — compared as a row value, because
+  `created_at < stamp` alone drops every run sharing that microsecond and `<=` repeats it.
+  Offset was the wrong tool for a correctness reason rather than a speed one: a run started
+  while somebody reads page one shifts every offset by a row. `nextCursor` rather than a total,
+  base64url so a `+` in an ISO offset cannot decode as a space, and a malformed cursor is a 422
+  rather than a silent first page. The poll re-reads only the first page. Original text: the
+  page says "showing N (the most
   recent 50)" rather than claiming a total, so it is honest, but a business past 50 runs
   cannot reach the older ones.
+
+## Found while closing the tail (2026-08-20)
+
+- [x] **The knowledge base was built, tested, and UNREACHABLE** — `a0c011a` + `4fca6e1`. Not in
+  this backlog before, and the largest gap in the product: `kb_service.ingest_document`
+  extracts, chunks, embeds and stores a file, and it was called from twenty tests and nowhere
+  else. No route, no UI, no `documents` row — so no business could ever hold a chunk, which made
+  the pgvector store, the pdf/docx extractors and the whole agentic retrieval loop unreachable,
+  and made `docs/FEATURES.md` §7's step 1 ("crawl site, ingest documents") half true.
+  `POST/GET/DELETE /api/v1/documents`, a `PostgresDocumentStore` for the table nothing had ever
+  written to, and a `/documents` screen. Verified end to end against real Postgres: upload →
+  extract → chunk → embed → store → list, with the refusals (415 unreadable format, 413
+  oversize, 422 empty, 503 missing parser) each exercised.
+- [x] **`build_real_deps` passed `retrieve=None, load_memory=None`, so no real run had ever read
+  a document or a remembered preference** — `a0c011a`. Two headline claims were true of the test
+  suite and not of the product. Memory is wired unconditionally (our own data, so an empty
+  result means "nothing remembered yet"); retrieval is wired only when the business has indexed
+  something, which is the rule this function already applied to the search provider — a
+  retriever over an empty store answers "nothing relevant", and that reads as a business whose
+  own material had nothing to say. Verified on a live run: `fact_gaps` no longer names "uploaded
+  documents" once a document exists.
+- [x] **`langgraph` was a declared dependency that nothing imported** — `862e7e9`. Not in this
+  backlog before either. `ARCHITECTURE.md` §14 called this a "LangGraph state machine", which
+  was a claim about the SHAPE (bounded steps, a defined human interrupt, resumable, per-node
+  evaluation) and true of the hand-written driver — but not a claim about the code, and a reader
+  grepping for the import would not have found one. `agents/state_graph.py` compiles the
+  identical machine with the library; `agent_runtime` selects it (default) or the builtin driver;
+  and every test in `tests/agents/test_graph.py` now runs against BOTH, because a fallback that
+  is not equivalent is not a fallback. The builtin driver should be deleted if it goes a release
+  untouched.
+- [ ] ⛔ **Ragas cannot be installed here, and the module criteria name it.** `ragas>=0.4.3`
+  depends on `instructor`, which caps `openai<3.0.0`; this project pins `openai>=3.2.0`
+  deliberately (v3 is built on httpx2 — see the dev-dependency comment about respx). Older
+  `ragas==0.3.1` imports `langchain_community.chat_models.vertexai`, which no longer exists in
+  langchain-community 1.x, so it fails at import. **DeepEval** is used instead, which the
+  criteria permit ("Ragas or DeepEval") — see `evals/`. Left OPEN rather than ticked because
+  somebody grading against the literal word "Ragas" deserves to find this paragraph rather than
+  a silent substitution.
