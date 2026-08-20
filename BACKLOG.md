@@ -792,7 +792,7 @@ A1 is the first code to create.
   retrieval failed. Then delete "no UI yet" from `CRITERIA_MAP.md` §8 step 5 — and not
   before.**
 
-- [ ] **A3 · Connect / callback / disconnect routes for `platform_connections`** — genuinely
+- [x] **A3 · Connect / callback / disconnect routes for `platform_connections`** — genuinely
   loop-safe, no credential: `get_oauth_provider()` returns `FakeOAuthProvider` for every
   platform, `PLATFORM_CREDENTIAL_KEY=ephemeral` is the documented local cipher mode
   (`.env.example:49`), and `connection_service.begin_connect/complete_connect/
@@ -953,6 +953,33 @@ A1 is the first code to create.
   and the prose is the screen's job to get right — which is the principle A9 established.
   **done = no gated route asserts what KIND of thing it is refusing unless it actually knows;
   a test pins the cost route's 403 body against the claim it makes.**
+
+- [ ] **A3-i · `revoke_connection` can make disconnecting IMPOSSIBLE** — found by A3 and worked
+  around at the route rather than fixed at the source, deliberately, because the service is
+  not the route's file and is separately tested. `connection_service.revoke_connection` calls
+  `reveal_access` first, which raises `CredentialUnreadableError` on an envelope that will not
+  open — a rotated key, or the ephemeral vault after ANY restart, which is the documented local
+  configuration. Unhandled that is a 500, and a customer could never disconnect an account.
+  `DELETE /connections/{platform}` now catches `TokenCipherError` and reaches the honest end
+  state (`set_status(REVOKED, forget_credential=True)`), with a test that simulates a restart.
+  **done = the SERVICE decides what an unreadable credential means for revocation, so every
+  caller gets it right rather than each one catching separately; the route's workaround folds
+  into it.**
+- [ ] **A3-ii · Nothing writes `expired` to a platform connection** — `refresh_connection` and
+  `mark_expired_if_stale` exist and are unexposed. No SCREEN is wrong (usability is derived by
+  the pure `unusable_reason` on every read, which is why the settings view and the publish
+  refusal cannot disagree), but a SQL-level report would disagree with the API. This wants a
+  sweep, not a route — same shape as the payment-style reconcilers.
+- [ ] **A3-iii · `backend/tests/conftest.py` does not strip `PLATFORM_CREDENTIAL_KEY`** the way
+  it strips the six outbound credentials. Not a network risk, but a developer with a real AES
+  key set gets `AesGcmCipher` where CI gets `NotConfiguredCipher` — the class of divergence that
+  ends in "works in CI, fails on the box", which this repo has already been bitten by once.
+  A3's own tests inject the cipher explicitly and are immune; other suites may not be.
+- [ ] **A3-iv · No frontend screen for platform connections** — the four routes exist and are
+  tested; nothing renders them, so a business still cannot connect an account from the UI.
+  Deliberately out of A3's scope (routes + tests only).
+  **done = a settings screen lists connections with their derived usability, starts a connect,
+  and disconnects; the secret is never rendered beyond its mask.**
 
 ## B · ⛔ BLOCKED — what the human must supply, and the exact question
 
