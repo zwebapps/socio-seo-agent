@@ -1,11 +1,15 @@
 /**
  * Chrome shared by every `/developer` screen.
  *
- * A server component, deliberately: it renders navigation and nothing else, so it needs
- * no state and no client bundle. The pages themselves are `"use client"` because their
- * API calls MUST run in the browser — the Origin-CSRF middleware refuses a cookie-bearing
- * write with no `Origin` header, and `fetch` from a server component sends none. See the
- * note in `app/lib/admin-api.ts`.
+ * Still a server component; the nav inside it is not, and the reason is a bug this
+ * file's comment used to justify. It said the nav "needs no state and no client
+ * bundle" — but knowing WHICH section you are on is state, and without it all four
+ * pills rendered identically on every screen. See `nav.tsx`.
+ *
+ * The pages themselves are `"use client"` because their API calls MUST run in the
+ * browser — the Origin-CSRF middleware refuses a cookie-bearing write with no `Origin`
+ * header, and `fetch` from a server component sends none. See the note in
+ * `app/lib/admin-api.ts`.
  *
  * The nav is a `<nav>` with an `aria-label`, not a row of styled links: there are two
  * landmark-level link groups on these pages once the error card renders a "sign in"
@@ -18,33 +22,12 @@
  * step with the real one.
  */
 
-import Link from "next/link";
-
-const SECTIONS = [
-  { href: "/developer/models", label: "Model routing" },
-  { href: "/developer/runtime", label: "Sampling & prompts" },
-  { href: "/developer/tools", label: "Tool access" },
-  { href: "/developer/cost", label: "Cost" },
-] as const;
+import { DeveloperNav } from "./nav";
 
 export default function DeveloperLayout({ children }: { children: React.ReactNode }) {
   return (
     <div>
-      <nav aria-label="Developer settings" className="mx-auto max-w-5xl px-6 pt-10">
-        <ul className="flex flex-wrap gap-2">
-          {SECTIONS.map((section) => (
-            <li key={section.href}>
-              <Link
-                href={section.href}
-                className="soft-raised soft-edge soft-press inline-block px-4 py-2 text-sm font-medium"
-                style={{ borderRadius: "var(--r-pill)", color: "var(--text)" }}
-              >
-                {section.label}
-              </Link>
-            </li>
-          ))}
-        </ul>
-      </nav>
+      <DeveloperNav />
       {children}
     </div>
   );
