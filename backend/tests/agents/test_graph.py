@@ -7,16 +7,39 @@ correctness question, and that is this file.
 
 Nodes are injected as plain callables so the whole graph runs with no model, no
 database and no network.
+
+**Every test in this file runs against BOTH runtimes.** `graph.run_graph` is the
+hand-written driver and `state_graph.run_state_graph` is the LangGraph-compiled one,
+and they are signature-compatible so the executor can choose between them. A fallback
+that is not equivalent is not a fallback, so equivalence is asserted here rather than
+asserted in prose -- and every branch below (the bounded retry, the two cap exits, the
+compliance block, the resume, the event stream) is checked twice, once per driver.
 """
 
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
 from typing import Any
 
-from backend.app.agents.graph import build_graph, run_graph
+import pytest
+
+from backend.app.agents.graph import GraphResult, build_graph, run_graph
 from backend.app.agents.state import AgentState, NodeError, RunCaps, new_state
+from backend.app.agents.state_graph import AFTER_REVIEW, build_state_graph, run_state_graph
 
 Node = Callable[[AgentState], Awaitable[dict[str, object]]]
+
+#: One run of the machine, whichever runtime is driving it.
+Driver = Callable[..., Awaitable[GraphResult]]
+
+
+@pytest.fixture(params=["builtin", "langgraph"])
+def driver(request: pytest.FixtureRequest) -> Driver:
+    """Both runtimes, one test body.
+
+    Named in the parameter id so a failure says which driver broke rather than only
+    that something did.
+    """
+    return run_graph if request.param == "builtin" else run_state_graph
 
 
 def _state(caps: RunCaps | None = None) -> AgentState:
@@ -33,8 +56,10 @@ def _ok(name: str, **updates: object) -> Node:
     return node
 
 
-async def test_a_clean_run_visits_every_node_in_order_and_pauses_for_approval() -> None:
-    result = await run_graph(_state(), nodes=_nodes(seo_score=91))
+async def test_a_clean_run_visits_every_node_in_order_and_pauses_for_approval(
+    driver: Driver,
+) -> None:
+    result = await driver(_state(), nodes=_nodes(seo_score=91))
 
     assert result.state["visited"] == [
         "INTAKE",
@@ -55,11 +80,11 @@ async def test_a_clean_run_visits_every_node_in_order_and_pauses_for_approval() 
     assert result.interrupted is True, "the run must stop at REVIEW, not publish itself"
 
 
-async def test_a_failing_score_loops_back_to_generate_then_proceeds() -> None:
+async def test_a_failing_score_loops_back_to_generate_then_proceeds(driver: Driver) -> None:
     """The retry is the point: VALIDATE must be able to send work back."""
     scores = iter([72, 88])
 
-    result = await run_graph(_state(), nodes=_nodes(seo_score=lambda: next(scores)))
+    result = await driver(_state(), nodes=_nodes(seo_score=lambda: next(scores)))
 
     visited = result.state["visited"]
     assert visited.count("GENERATE") == 2, "the draft should have been regenerated once"
@@ -68,9 +93,11 @@ async def test_a_failing_score_loops_back_to_generate_then_proceeds() -> None:
     assert result.state["outcome"] == "awaiting_approval"
 
 
-async def test_the_retry_loop_is_bounded_and_returns_a_partial_not_an_infinite_run() -> None:
+async def test_the_retry_loop_is_bounded_and_returns_a_partial_not_an_infinite_run(
+    driver: Driver,
+) -> None:
     """A draft that never reaches the bar must stop, with a reason, not spin."""
-    result = await run_graph(_state(), nodes=_nodes(seo_score=40))
+    result = await driver(_state(), nodes=_nodes(seo_score=40))
 
     assert result.state["outcome"] == "partial"
     assert result.state["validate_loops"] == 2, "exactly the documented two loops"
@@ -78,30 +105,32 @@ async def test_the_retry_loop_is_bounded_and_returns_a_partial_not_an_infinite_r
     assert result.interrupted is False
 
 
-async def test_a_step_cap_ends_the_run_with_a_stated_reason() -> None:
+async def test_a_step_cap_ends_the_run_with_a_stated_reason(driver: Driver) -> None:
     caps = RunCaps(max_steps=3, max_usd=Decimal("1"), max_validate_loops=2)
-    result = await run_graph(_state(caps), nodes=_nodes(seo_score=91))
+    result = await driver(_state(caps), nodes=_nodes(seo_score=91))
 
     assert result.state["outcome"] == "partial"
     assert "max_steps" in (result.state["finished_reason"] or "")
 
 
-async def test_a_budget_cap_ends_the_run_before_the_call_that_would_exceed_it() -> None:
+async def test_a_budget_cap_ends_the_run_before_the_call_that_would_exceed_it(
+    driver: Driver,
+) -> None:
     caps = RunCaps(max_steps=99, max_usd=Decimal("0.05"), max_validate_loops=2)
-    result = await run_graph(_state(caps), nodes=_nodes(seo_score=91, cost=Decimal("0.02")))
+    result = await driver(_state(caps), nodes=_nodes(seo_score=91, cost=Decimal("0.02")))
 
     assert result.state["outcome"] == "partial"
     assert "max_usd" in (result.state["finished_reason"] or "")
     assert result.state["cost_usd"] <= caps.max_usd, "a refused charge must not be booked"
 
 
-async def test_a_node_that_raises_degrades_the_run_instead_of_killing_it() -> None:
+async def test_a_node_that_raises_degrades_the_run_instead_of_killing_it(driver: Driver) -> None:
     """HARVEST losing one source is normal. It must not end the run."""
 
     async def flaky_harvest(state: AgentState) -> dict[str, object]:
         raise RuntimeError("SERP quota exhausted")
 
-    result = await run_graph(_state(), nodes=_nodes(seo_score=91, harvest=flaky_harvest))
+    result = await driver(_state(), nodes=_nodes(seo_score=91, harvest=flaky_harvest))
 
     assert result.state["outcome"] == "awaiting_approval", "the run continued"
     codes = [e.code for e in result.state["errors"]]
@@ -109,35 +138,35 @@ async def test_a_node_that_raises_degrades_the_run_instead_of_killing_it() -> No
     assert any(e.node == "HARVEST" for e in result.state["errors"])
 
 
-async def test_no_opportunity_ends_the_run_early_and_honestly() -> None:
-    result = await run_graph(_state(), nodes=_nodes(seo_score=91, opportunity=None))
+async def test_no_opportunity_ends_the_run_early_and_honestly(driver: Driver) -> None:
+    result = await driver(_state(), nodes=_nodes(seo_score=91, opportunity=None))
 
     assert result.state["outcome"] == "done"
     assert "no opportunity" in (result.state["finished_reason"] or "").lower()
     assert "GENERATE" not in result.state["visited"], "nothing should be written with no target"
 
 
-async def test_a_run_resumes_from_its_checkpoint_rather_than_starting_over() -> None:
+async def test_a_run_resumes_from_its_checkpoint_rather_than_starting_over(driver: Driver) -> None:
     """Kill the worker mid-run: the work already paid for must not be repeated."""
     import json
 
     from backend.app.agents.state import from_checkpoint, to_checkpoint
 
-    first = await run_graph(_state(), nodes=_nodes(seo_score=91, stop_after="PLAN"))
+    first = await driver(_state(), nodes=_nodes(seo_score=91, stop_after="PLAN"))
     assert first.state["outcome"] == "running"
 
     revived = from_checkpoint(json.loads(json.dumps(to_checkpoint(first.state))))
-    resumed = await run_graph(revived, nodes=_nodes(seo_score=91), resume=True)
+    resumed = await driver(revived, nodes=_nodes(seo_score=91), resume=True)
 
     assert resumed.state["visited"].count("INTAKE") == 1, "INTAKE must not run twice"
     assert resumed.state["outcome"] == "awaiting_approval"
 
 
-async def test_every_sse_event_is_emitted_for_the_timeline() -> None:
+async def test_every_sse_event_is_emitted_for_the_timeline(driver: Driver) -> None:
     """The UI timeline and the persisted run_events both read from this stream."""
     events: list[tuple[str, str]] = []
 
-    await run_graph(
+    await driver(
         _state(), nodes=_nodes(seo_score=91), on_event=lambda n, s, _: events.append((n, s))
     )
 
@@ -148,6 +177,38 @@ async def test_every_sse_event_is_emitted_for_the_timeline() -> None:
 
 def test_the_graph_compiles() -> None:
     assert build_graph() is not None
+
+
+def test_the_langgraph_runtime_is_actually_a_langgraph_state_graph() -> None:
+    """`langgraph` was a declared dependency that nothing imported, and
+    `ARCHITECTURE.md` §14 described the machine as a "LangGraph state machine" —
+    which was a claim about the shape, not about the code. This asserts the code.
+
+    It checks the compiled artifact rather than the import, because an import proves
+    only that a module was loaded: what matters is that the nodes, the branches and
+    the human gate are the library's graph rather than our `while` loop.
+    """
+    from langgraph.graph.state import CompiledStateGraph
+
+    compiled = build_state_graph(_nodes(seo_score=91))
+
+    assert isinstance(compiled, CompiledStateGraph)
+
+    nodes = set(compiled.get_graph().nodes)
+    for name in build_graph():
+        assert name in nodes, f"{name} is missing from the compiled graph"
+    assert AFTER_REVIEW in nodes, "the human gate needs a node to pause before"
+
+
+def test_the_human_gate_is_the_runtimes_interrupt_and_not_a_return_statement() -> None:
+    """The pause is armed by LangGraph, and it is armed only while it is unspent: a
+    run whose REVIEW has already been seen by a human must not be parked at the gate
+    a second time, or no approval could ever get past it."""
+    armed = build_state_graph(_nodes(seo_score=91))
+    assert list(armed.interrupt_before_nodes) == [AFTER_REVIEW]
+
+    spent = build_state_graph(_nodes(seo_score=91), arm_interrupt=False)
+    assert list(spent.interrupt_before_nodes) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -230,25 +291,23 @@ def _claim_verdict(passed: bool, claim: str = "schmerzfrei") -> dict[str, object
     }
 
 
-async def test_a_banned_claim_sends_the_draft_back_to_generate_first() -> None:
+async def test_a_banned_claim_sends_the_draft_back_to_generate_first(driver: Driver) -> None:
     """The gate is not a hair trigger: the model gets the same two chances it gets on a
     low score, with the offending phrase named."""
     verdicts = iter([_claim_verdict(False), _claim_verdict(True)])
 
-    result = await run_graph(
-        _state(), nodes=_nodes(seo_score=91, claim_check=lambda: next(verdicts))
-    )
+    result = await driver(_state(), nodes=_nodes(seo_score=91, claim_check=lambda: next(verdicts)))
 
     assert result.state["visited"].count("GENERATE") == 2, "the draft was rewritten once"
     assert result.state["outcome"] == "awaiting_approval", "the rewrite fixed it"
     assert result.state.get("publication_blocked") is not True
 
 
-async def test_a_draft_that_keeps_the_banned_claim_never_reaches_review() -> None:
+async def test_a_draft_that_keeps_the_banned_claim_never_reaches_review(driver: Driver) -> None:
     """The load-bearing assertion of the whole guard. REVIEW is where a human can
     approve, and EXPORT publishes what was approved -- so a run that cannot produce
     compliant copy has to stop BEFORE the approval, not at it."""
-    result = await run_graph(
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(False))
     )
 
@@ -260,12 +319,12 @@ async def test_a_draft_that_keeps_the_banned_claim_never_reaches_review() -> Non
     assert "NOT sent for approval" in (result.state["finished_reason"] or "")
 
 
-async def test_a_compliance_block_is_distinguishable_from_a_quality_partial() -> None:
+async def test_a_compliance_block_is_distinguishable_from_a_quality_partial(driver: Driver) -> None:
     """Both end as `partial`, and they mean opposite things to whoever reads the run: a
     weak page is publishable after a human edit, a blocked one is not publishable as
     written. `publication_blocked` is what separates them."""
-    weak = await run_graph(_state(), nodes=_nodes(seo_score=40))
-    blocked = await run_graph(
+    weak = await driver(_state(), nodes=_nodes(seo_score=40))
+    blocked = await driver(
         _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(False))
     )
 
@@ -276,17 +335,17 @@ async def test_a_compliance_block_is_distinguishable_from_a_quality_partial() ->
     assert "publication blocked" in (blocked.state["finished_reason"] or "").lower()
 
 
-async def test_a_run_with_no_claim_verdict_behaves_exactly_as_before() -> None:
+async def test_a_run_with_no_claim_verdict_behaves_exactly_as_before(driver: Driver) -> None:
     """An absent verdict means VALIDATE has not written one, which must not be read as
     a failure -- that would block every run whose node set predates the gate."""
-    result = await run_graph(_state(), nodes=_nodes(seo_score=91, claim_check=None))
+    result = await driver(_state(), nodes=_nodes(seo_score=91, claim_check=None))
 
     assert result.state["outcome"] == "awaiting_approval"
     assert result.interrupted is True
 
 
-async def test_a_clean_claim_check_does_not_consume_a_validate_loop() -> None:
-    result = await run_graph(
+async def test_a_clean_claim_check_does_not_consume_a_validate_loop(driver: Driver) -> None:
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, claim_check=lambda: _claim_verdict(True))
     )
 
@@ -294,10 +353,10 @@ async def test_a_clean_claim_check_does_not_consume_a_validate_loop() -> None:
     assert result.state["outcome"] == "awaiting_approval"
 
 
-async def test_a_banned_claim_blocks_even_when_the_seo_score_passes() -> None:
+async def test_a_banned_claim_blocks_even_when_the_seo_score_passes(driver: Driver) -> None:
     """The two verdicts are independent. A perfect score must not carry a forbidden
     claim past the gate."""
-    result = await run_graph(
+    result = await driver(
         _state(), nodes=_nodes(seo_score=100, claim_check=lambda: _claim_verdict(False))
     )
 
@@ -335,13 +394,15 @@ def _landing_verdict(passed: bool, score: int = 55) -> dict[str, object]:
     }
 
 
-async def test_a_failing_landing_page_goes_back_to_convert_and_not_to_generate() -> None:
+async def test_a_failing_landing_page_goes_back_to_convert_and_not_to_generate(
+    driver: Driver,
+) -> None:
     """The article passed, so rewriting it would pay the strong tier to fix a
     headline on a different page. The shortest edge that can fix the failure is the
     one the graph must take."""
     verdicts = iter([_landing_verdict(False), _landing_verdict(True)])
 
-    result = await run_graph(
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, landing_report=lambda: next(verdicts))
     )
 
@@ -352,10 +413,12 @@ async def test_a_failing_landing_page_goes_back_to_convert_and_not_to_generate()
     assert result.state["outcome"] == "awaiting_approval"
 
 
-async def test_a_landing_page_that_never_passes_is_a_quality_partial_not_a_block() -> None:
+async def test_a_landing_page_that_never_passes_is_a_quality_partial_not_a_block(
+    driver: Driver,
+) -> None:
     """A page that cannot convert is publishable-after-editing, unlike one making a
     forbidden claim. The two must stay distinguishable to whoever reads the run."""
-    result = await run_graph(
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, landing_report=lambda: _landing_verdict(False))
     )
 
@@ -366,13 +429,15 @@ async def test_a_landing_page_that_never_passes_is_a_quality_partial_not_a_block
     assert "needs human edit" in reason
 
 
-async def test_a_failing_draft_takes_the_longer_edge_even_when_it_fails_alongside() -> None:
+async def test_a_failing_draft_takes_the_longer_edge_even_when_it_fails_alongside(
+    driver: Driver,
+) -> None:
     """When the draft is what failed, CONVERT's own re-run is a consequence of being
     downstream -- not a reason to skip GENERATE."""
     scores = iter([70, 91])
     verdicts = iter([_landing_verdict(False), _landing_verdict(True)])
 
-    result = await run_graph(
+    result = await driver(
         _state(),
         nodes=_nodes(seo_score=lambda: next(scores), landing_report=lambda: next(verdicts)),
     )
@@ -383,19 +448,19 @@ async def test_a_failing_draft_takes_the_longer_edge_even_when_it_fails_alongsid
     assert result.state["outcome"] == "awaiting_approval"
 
 
-async def test_an_absent_landing_report_is_not_read_as_a_failure() -> None:
+async def test_an_absent_landing_report_is_not_read_as_a_failure(driver: Driver) -> None:
     """A run whose CONVERT node produced nothing has already recorded that as an
     error. Treating the missing verdict as a failure would burn both retries on a
     node that cannot succeed, and would block every run whose node set predates this
     gate."""
-    result = await run_graph(_state(), nodes=_nodes(seo_score=91, landing_report=None))
+    result = await driver(_state(), nodes=_nodes(seo_score=91, landing_report=None))
 
     assert result.state["outcome"] == "awaiting_approval"
     assert result.state["validate_loops"] == 0
 
 
-async def test_a_passing_landing_page_costs_no_retry() -> None:
-    result = await run_graph(
+async def test_a_passing_landing_page_costs_no_retry(driver: Driver) -> None:
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, landing_report=lambda: _landing_verdict(True))
     )
 
@@ -403,10 +468,10 @@ async def test_a_passing_landing_page_costs_no_retry() -> None:
     assert result.state["outcome"] == "awaiting_approval"
 
 
-async def test_a_banned_claim_still_blocks_when_the_landing_page_is_fine() -> None:
+async def test_a_banned_claim_still_blocks_when_the_landing_page_is_fine(driver: Driver) -> None:
     """The claim check covers the article AND the landing copy as one verdict, so a
     clean landing audit cannot buy a forbidden claim past the gate."""
-    result = await run_graph(
+    result = await driver(
         _state(),
         nodes=_nodes(
             seo_score=95,
@@ -424,7 +489,9 @@ async def test_a_banned_claim_still_blocks_when_the_landing_page_is_fine() -> No
 # --------------------------------------------------------------------------- #
 
 
-async def test_a_failed_opportunity_node_is_not_reported_as_nothing_worth_writing() -> None:
+async def test_a_failed_opportunity_node_is_not_reported_as_nothing_worth_writing(
+    driver: Driver,
+) -> None:
     """The fabrication this branch exists to prevent.
 
     An empty `opportunity` has two causes that mean opposite things. Observed in
@@ -441,7 +508,7 @@ async def test_a_failed_opportunity_node_is_not_reported_as_nothing_worth_writin
     async def exploding_opportunity(state: AgentState) -> dict[str, object]:
         raise RuntimeError("All 2 provider(s) failed for task 'prioritise'")
 
-    result = await run_graph(
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, opportunity_node=exploding_opportunity)
     )
 
@@ -456,13 +523,13 @@ async def test_a_failed_opportunity_node_is_not_reported_as_nothing_worth_writin
     )
 
 
-async def test_an_opportunity_node_that_ran_and_chose_nothing_still_says_so() -> None:
+async def test_an_opportunity_node_that_ran_and_chose_nothing_still_says_so(driver: Driver) -> None:
     """The other half. Without this, the fix above would just relabel every empty result.
 
     A business genuinely can have nothing worth writing about this week, and saying so
     is the honest outcome — inventing a topic to fill the slot is not.
     """
-    result = await run_graph(_state(), nodes=_nodes(seo_score=91, opportunity=None))
+    result = await driver(_state(), nodes=_nodes(seo_score=91, opportunity=None))
 
     reason = result.state["finished_reason"] or ""
     assert result.state["outcome"] == "done"
@@ -470,7 +537,9 @@ async def test_an_opportunity_node_that_ran_and_chose_nothing_still_says_so() ->
     assert "could not run" not in reason
 
 
-async def test_an_unrelated_degradation_does_not_turn_a_judgement_into_a_failure() -> None:
+async def test_an_unrelated_degradation_does_not_turn_a_judgement_into_a_failure(
+    driver: Driver,
+) -> None:
     """`record_error` is also used for ordinary degradations, so the code must be matched.
 
     HARVEST losing one fact source is normal and is recorded the same way. If this
@@ -489,7 +558,7 @@ async def test_an_unrelated_degradation_does_not_turn_a_judgement_into_a_failure
             ],
         }
 
-    result = await run_graph(
+    result = await driver(
         _state(), nodes=_nodes(seo_score=91, opportunity=None, harvest=flaky_harvest)
     )
 

@@ -45,7 +45,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from backend.app.agents.state import (
     AgentState,
@@ -94,7 +94,13 @@ def build_graph() -> tuple[str, ...]:
     return ORDER
 
 
-def _emit(sink: EventSink | None, node: str, status: str, payload: Mapping[str, Any]) -> None:
+def emit(sink: EventSink | None, node: str, status: str, payload: Mapping[str, Any]) -> None:
+    """Push one timeline event, if anybody is listening.
+
+    Public because the LangGraph runtime in `state_graph.py` emits the same stream --
+    the SSE timeline and the persisted `run_events` rows must not be able to tell
+    which driver produced them.
+    """
     if sink is not None:
         sink(node, status, payload)
 
@@ -111,13 +117,13 @@ async def _run_node(
     ordinary, and the correct response is to carry on with less evidence and say
     so -- which is why the error is appended to the state rather than propagated.
     """
-    _emit(sink, name, "started", {})
+    emit(sink, name, "started", {})
     try:
         updates = await node(state)
     except Exception as exc:
         logger.warning("node %s failed: %s", name, exc, exc_info=True)
         state = record_error(state, NodeError(node=name, code="node_failed", message=str(exc)))
-        _emit(sink, name, "failed", {"error": str(exc)})
+        emit(sink, name, "failed", {"error": str(exc)})
         return state
 
     cost = updates.get("_cost")
@@ -126,11 +132,11 @@ async def _run_node(
 
     merged = {k: v for k, v in updates.items() if not k.startswith("_")}
     state = {**state, **merged}  # type: ignore[typeddict-item]
-    _emit(sink, name, "done", {"cost_usd": str(state["cost_usd"])})
+    emit(sink, name, "done", {"cost_usd": str(state["cost_usd"])})
     return state
 
 
-def _node_failure(state: AgentState, node: str) -> str | None:
+def node_failure(state: AgentState, node: str) -> str | None:
     """The message from this node's own crash, if it crashed.
 
     `_run_node` converts a raise into a `NodeError(code="node_failed")` so one dead
@@ -176,6 +182,126 @@ def _quality_reason(
     )
 
 
+def verdicts(state: AgentState) -> tuple[bool, bool, bool]:
+    """VALIDATE's three verdicts as ``(blocked, weak_draft, weak_landing)``.
+
+    Pure, and shared by both drivers, because "is this run publication-blocked" is
+    exactly the kind of question that must not have two implementations -- this repo
+    has already paid for two copies of a channel-limit table disagreeing, and this
+    one decides whether content a human could approve reaches the approval screen.
+
+    A regulated claim is a HARD gate, not a score. It routes back to GENERATE like a
+    failing score does, but when the retries run out the outcomes differ: a weak page
+    is returned for a human to edit, while a page making a forbidden claim must not
+    reach REVIEW at all, because REVIEW is where a human can approve it and EXPORT
+    publishes what was approved.
+
+    An ABSENT landing report is not a failure: a run whose CONVERT node produced
+    nothing has already recorded that as an error, and there is no verdict to gate on.
+    """
+    report = state.get("seo_report") or {}
+    claims = state.get("claim_check") or {}
+    landing = state.get("landing_report") or {}
+
+    blocked = bool(claims) and claims.get("passed") is False
+    weak_landing = bool(landing) and landing.get("passed") is False
+    weak_draft = blocked or not report.get("passed", False)
+    return blocked, weak_draft, weak_landing
+
+
+def opportunity_exit(state: AgentState) -> dict[str, Any] | None:
+    """The terminal updates for a run that has no opportunity, or ``None`` to carry on.
+
+    An empty `opportunity` has TWO causes and they mean opposite things: the node ran
+    and judged that nothing was worth writing about, or the node could not run at all.
+    Reporting the second as the first tells a customer their business has no story in
+    it, on the strength of a provider outage.
+
+    Observed in production, which is why this branch exists: OPPORTUNITY failed with
+    `AllProvidersFailedError` (the credential's data policy refused every mid-tier
+    model) and the run finished `done` saying "No opportunity met the bar for this
+    business."
+
+    This is the same rule the project already applies to share of voice, where
+    `no_answer` is excluded from the denominator because a model outage must never be
+    recorded as the brand being absent -- that is the difference between a measurement
+    and a fabrication. A judgement the agent never made is exactly that kind of
+    fabrication.
+    """
+    if state.get("opportunity"):
+        return None
+
+    failure = node_failure(state, "OPPORTUNITY")
+    if failure is not None:
+        return {
+            # `partial`, not `failed`: HARVEST's audit findings are real work and are
+            # returned. Not `done` either -- nothing was decided, so the run did not
+            # do what it set out to do.
+            "outcome": "partial",
+            # The human sentence FIRST and the provider detail last, because this
+            # string is clamped to the column width (`run_service.clamp_reason`) and a
+            # provider error can be hundreds of characters. Ordered this way,
+            # truncation costs the machine detail; ordered the other way it would cut
+            # the clarification that is the whole point of this branch.
+            "finished_reason": (
+                "Opportunity selection could not run, so no topic was chosen. This is "
+                "a failure to look, NOT a finding that nothing was worth writing "
+                f"about; the audit findings gathered before it are returned. Cause: {failure}"
+            ),
+        }
+
+    # Nothing worth writing about. Returning the audit is the honest outcome;
+    # inventing a topic to fill the slot is not.
+    return {
+        "outcome": "done",
+        "finished_reason": (
+            "No opportunity met the bar for this business. The audit findings are returned instead."
+        ),
+    }
+
+
+def validate_exit(state: AgentState, *, blocked: bool) -> dict[str, Any]:
+    """The terminal updates for a run that has run out of revisions."""
+    report = state.get("seo_report") or {}
+    claims = state.get("claim_check") or {}
+    landing = state.get("landing_report") or {}
+    _, weak_draft, weak_landing = verdicts(state)
+
+    if blocked:
+        found = ", ".join(sorted({str(hit.get("claim")) for hit in claims.get("hits", [])}))
+        return {
+            "outcome": "partial",
+            "publication_blocked": True,
+            "finished_reason": (
+                f"Publication blocked: after {state['validate_loops']} revisions the "
+                f"draft still makes the forbidden claim(s) {found}. The draft is "
+                "returned for a human to rewrite and was NOT sent for approval."
+            ),
+        }
+
+    return {
+        "outcome": "partial",
+        "finished_reason": _quality_reason(
+            report=report,
+            landing=landing,
+            loops=state["validate_loops"],
+            weak_draft=weak_draft,
+            weak_landing=weak_landing,
+        ),
+    }
+
+
+def cap_exit(exc: CapExceededError) -> dict[str, Any]:
+    """The terminal updates for a run that hit a cap. Stated, never silent."""
+    return {
+        "outcome": "partial",
+        "finished_reason": (
+            f"Run stopped: {exc.cap} reached (limit {exc.limit}). "
+            "Returning what was produced so far."
+        ),
+    }
+
+
 async def run_graph(
     state: AgentState,
     *,
@@ -205,115 +331,23 @@ async def run_graph(
             state = step(state, name)
             state = await _run_node(name, nodes[name], state, on_event)
 
-            if name == "OPPORTUNITY" and not state.get("opportunity"):
-                # An empty `opportunity` has TWO causes and they mean opposite things:
-                # the node ran and judged that nothing was worth writing about, or the
-                # node could not run at all. Reporting the second as the first tells a
-                # customer their business has no story in it, on the strength of a
-                # provider outage.
-                #
-                # Observed in production, which is why this branch exists: OPPORTUNITY
-                # failed with `AllProvidersFailedError` (the credential's data policy
-                # refused every mid-tier model) and the run finished `done` saying "No
-                # opportunity met the bar for this business."
-                #
-                # This is the same rule the project already applies to share of voice,
-                # where `no_answer` is excluded from the denominator because "a model
-                # outage must never be recorded as the brand being absent -- that is the
-                # difference between a measurement and a fabrication". A judgement the
-                # agent never made is exactly that kind of fabrication.
-                failure = _node_failure(state, name)
-                if failure is not None:
+            if name == "OPPORTUNITY":
+                exit_updates = opportunity_exit(state)
+                if exit_updates is not None:
                     return GraphResult(
-                        state={
-                            **state,
-                            # `partial`, not `failed`: HARVEST's audit findings are real
-                            # work and are returned. Not `done` either -- nothing was
-                            # decided, so the run did not do what it set out to do.
-                            "outcome": "partial",
-                            # The human sentence FIRST and the provider detail last,
-                            # because this string is clamped to the column width
-                            # (`run_service.clamp_reason`) and a provider error can be
-                            # hundreds of characters. Ordered this way, truncation costs
-                            # the machine detail; ordered the other way it would cut the
-                            # clarification that is the whole point of this branch.
-                            "finished_reason": (
-                                "Opportunity selection could not run, so no topic was "
-                                "chosen. This is a failure to look, NOT a finding that "
-                                "nothing was worth writing about; the audit findings "
-                                f"gathered before it are returned. Cause: {failure}"
-                            ),
-                        },
-                        interrupted=False,
+                        state=cast("AgentState", {**state, **exit_updates}), interrupted=False
                     )
 
-                # Nothing worth writing about. Returning the audit is the honest
-                # outcome; inventing a topic to fill the slot is not.
-                return GraphResult(
-                    state={
-                        **state,
-                        "outcome": "done",
-                        "finished_reason": (
-                            "No opportunity met the bar for this business. The audit "
-                            "findings are returned instead."
-                        ),
-                    },
-                    interrupted=False,
-                )
-
             if name == "VALIDATE":
-                report = state.get("seo_report") or {}
-                claims = state.get("claim_check") or {}
-                landing = state.get("landing_report") or {}
-                # A regulated claim is a HARD gate, not a score. The draft goes back
-                # to GENERATE with the offending phrase named, exactly as a failing
-                # score does -- but when the retries run out the two outcomes differ:
-                # a weak page is returned for a human to edit and publish, while a
-                # page making a forbidden claim must not reach REVIEW at all, because
-                # REVIEW is where a human can approve it and EXPORT publishes what
-                # was approved.
-                blocked = bool(claims) and claims.get("passed") is False
-                # An ABSENT landing report is not a failure: a run whose CONVERT node
-                # produced nothing has already recorded that as an error, and there
-                # is no verdict to gate on. A present, failing one is a quality
-                # failure attributable to CONVERT alone.
-                weak_landing = bool(landing) and landing.get("passed") is False
-                weak_draft = blocked or not report.get("passed", False)
+                blocked, weak_draft, weak_landing = verdicts(state)
                 if weak_draft or weak_landing:
                     try:
                         state = enter_validate_loop(state)
                     except CapExceededError:
-                        if blocked:
-                            found = ", ".join(
-                                sorted({str(hit.get("claim")) for hit in claims.get("hits", [])})
-                            )
-                            return GraphResult(
-                                state={
-                                    **state,
-                                    "outcome": "partial",
-                                    "publication_blocked": True,
-                                    "finished_reason": (
-                                        "Publication blocked: after "
-                                        f"{state['validate_loops']} revisions the draft "
-                                        f"still makes the forbidden claim(s) {found}. "
-                                        "The draft is returned for a human to rewrite "
-                                        "and was NOT sent for approval."
-                                    ),
-                                },
-                                interrupted=False,
-                            )
                         return GraphResult(
-                            state={
-                                **state,
-                                "outcome": "partial",
-                                "finished_reason": _quality_reason(
-                                    report=report,
-                                    landing=landing,
-                                    loops=state["validate_loops"],
-                                    weak_draft=weak_draft,
-                                    weak_landing=weak_landing,
-                                ),
-                            },
+                            state=cast(
+                                "AgentState", {**state, **validate_exit(state, blocked=blocked)}
+                            ),
                             interrupted=False,
                         )
                     # The shortest edge that can fix what failed. See the module
@@ -334,16 +368,6 @@ async def run_graph(
             index += 1
 
     except CapExceededError as exc:
-        return GraphResult(
-            state={
-                **state,
-                "outcome": "partial",
-                "finished_reason": (
-                    f"Run stopped: {exc.cap} reached (limit {exc.limit}). "
-                    "Returning what was produced so far."
-                ),
-            },
-            interrupted=False,
-        )
+        return GraphResult(state=cast("AgentState", {**state, **cap_exit(exc)}), interrupted=False)
 
     return GraphResult(state={**state, "outcome": "done"}, interrupted=False)

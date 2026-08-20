@@ -100,7 +100,10 @@ async def _deps(business_id: UUID, usage_sink: object = None) -> NodeDeps:
 
 
 def _executor(service: RunService, graph: _Graph, monkeypatch: pytest.MonkeyPatch) -> RunExecutor:
-    monkeypatch.setattr(executor_module, "run_graph", graph)
+    # `select_runtime` is the seam, not `run_graph`: the executor now picks a runtime
+    # per run (LangGraph by default, the builtin driver by configuration), so patching
+    # one of the two would leave the other one running for real.
+    monkeypatch.setattr(executor_module, "select_runtime", lambda: graph)
     return RunExecutor(service_factory=lambda _bid: service, deps_factory=_deps)
 
 
@@ -334,7 +337,8 @@ async def test_only_the_configured_number_of_runs_execute_at_once(
                 live -= 1
             return await super().__call__(state, nodes=nodes, on_event=on_event, resume=resume)
 
-    monkeypatch.setattr(executor_module, "run_graph", _Counting())
+    counting = _Counting()
+    monkeypatch.setattr(executor_module, "select_runtime", lambda: counting)
     ex = RunExecutor(service_factory=lambda _bid: service, deps_factory=_deps, max_concurrent=2)
     runs = [await service.start(business_id=BUSINESS, goal=f"goal {i}") for i in range(5)]
 
@@ -485,7 +489,7 @@ async def test_only_one_event_write_is_ever_in_flight(
             return type("Result", (), {"state": state, "interrupted": False})()
 
     graph = _Burst(events=[(f"NODE{i}", "done") for i in range(8)])
-    monkeypatch.setattr(executor_module, "run_graph", graph)
+    monkeypatch.setattr(executor_module, "select_runtime", lambda: graph)
     ex = RunExecutor(service_factory=lambda _bid: cast("RunService", tracker), deps_factory=_deps)
     run = await service.start(business_id=BUSINESS, goal="more leads")
 
@@ -572,7 +576,8 @@ async def test_the_router_gets_the_recorders_sink(
         seen.append(usage_sink)
         return NodeDeps(router=object())
 
-    monkeypatch.setattr(executor_module, "run_graph", _Graph())
+    stub = _Graph()
+    monkeypatch.setattr(executor_module, "select_runtime", lambda: stub)
     ex = RunExecutor(service_factory=lambda _bid: service, deps_factory=capturing_deps)
     run = await service.start(business_id=BUSINESS, goal="more leads")
 
@@ -609,3 +614,36 @@ def test_a_short_reason_is_left_exactly_as_written() -> None:
 # `InMemoryRunStore` is a dict with no column width, so a test here passes whether or not
 # the reason is clamped -- it cannot fail for its own reason. Only real Postgres raises
 # `StringDataRightTruncationError`, which is the failure being guarded against.
+
+
+# --------------------------------------------------------------------------- #
+# Which runtime drives a run
+# --------------------------------------------------------------------------- #
+
+
+def test_the_default_runtime_is_the_langgraph_one() -> None:
+    """`langgraph` was a declared dependency nothing imported. The compiled graph is
+    now the default path a real run takes, not an alternative sitting beside it."""
+    from backend.app.agents.state_graph import run_state_graph
+    from backend.app.services.run_executor import select_runtime
+
+    assert select_runtime() is run_state_graph
+
+
+def test_the_builtin_driver_stays_reachable_by_configuration() -> None:
+    """The fallback has to be one environment variable away, or it is not a fallback.
+    Equivalence between the two is asserted in `tests/agents/test_graph.py`, which
+    runs every branch of the machine against both."""
+    from backend.app.agents.graph import run_graph
+    from backend.app.services.run_executor import select_runtime
+
+    assert select_runtime("builtin") is run_graph
+
+
+def test_an_unrecognised_runtime_still_starts_the_run() -> None:
+    """Read on the way into a run: refusing to start one over a typo in an optional
+    setting would cost a run to save nothing."""
+    from backend.app.agents.state_graph import run_state_graph
+    from backend.app.services.run_executor import select_runtime
+
+    assert select_runtime("lnagraph") is run_state_graph

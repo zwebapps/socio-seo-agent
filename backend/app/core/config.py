@@ -18,6 +18,9 @@ DEFAULT_SESSION_SECRET = "insecure-local-development-secret-change-me"  # noqa: 
 Environment = Literal["local", "ci", "staging", "production"]
 
 
+AgentRuntime = Literal["langgraph", "builtin"]
+
+
 class Settings(BaseSettings):
     """Runtime settings, loaded from the environment or a local .env file."""
 
@@ -76,6 +79,17 @@ class Settings(BaseSettings):
     # would make `pytest` and `make dev` fail on a fresh checkout, and the usual
     # workaround for that is a shared secret in a committed .env -- which is worse.
     session_secret: str = DEFAULT_SESSION_SECRET
+
+    # Which graph runtime drives a run. `langgraph` compiles the machine with the
+    # library (`agents/state_graph.py`); `builtin` is the hand-written driver
+    # (`agents/graph.py`) that predates it.
+    #
+    # A setting rather than a deletion, and the reason is the risk profile: both are
+    # asserted equivalent by the same parametrised test suite, so this is a lever to
+    # pull if the library's behaviour surprises us in production, not a fork to
+    # maintain. If it goes a release without being touched, the builtin driver should
+    # go with it.
+    agent_runtime: AgentRuntime = "langgraph"
 
 
 @lru_cache

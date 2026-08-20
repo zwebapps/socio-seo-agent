@@ -45,9 +45,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 from uuid import UUID
 
-from backend.app.agents.graph import run_graph
+from backend.app.agents.graph import GraphResult, run_graph
 from backend.app.agents.nodes import NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
+from backend.app.agents.state_graph import run_state_graph
+from backend.app.core.config import get_settings
 from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
 from backend.app.services.usage_recorder import UsageRecorder
@@ -82,6 +84,29 @@ MAX_HEADINGS_PER_PAGE: Final = 8
 #: string, so attributing this to INTAKE would silently interleave a status message
 #: with that node's real entries and make the timeline lie about what ran.
 EXECUTOR_NODE: Final = "EXECUTOR"
+
+
+#: One run of the machine. Both runtimes satisfy it, which is the whole point.
+GraphRuntime = Callable[..., Awaitable[GraphResult]]
+
+
+def select_runtime(runtime: str | None = None) -> GraphRuntime:
+    """The graph runtime this deployment drives runs with.
+
+    `langgraph` compiles the machine with the library; `builtin` is the hand-written
+    driver that predates it. Chosen by configuration rather than by import so the
+    fallback is one environment variable away at 3am, and asserted equivalent by
+    `tests/agents/test_graph.py`, which runs every branch of the machine against both.
+
+    An unrecognised value takes the LangGraph path rather than raising: this is read
+    on the way into a run, and refusing to start a run over a typo in an optional
+    setting would be the wrong trade.
+    """
+    resolved = runtime if runtime is not None else get_settings().agent_runtime
+    if resolved == "builtin":
+        logger.info("driving runs with the builtin graph driver")
+        return run_graph
+    return run_state_graph
 
 
 #: Builds the node dependencies for one run. Takes the usage sink so the router it
@@ -325,7 +350,8 @@ class RunExecutor:
 
         drain = asyncio.create_task(self._drain_events(run_id, queue, service, recorder))
         try:
-            result = await run_graph(state, nodes=build_nodes(deps), on_event=sink, resume=resume)
+            drive = select_runtime()
+            result = await drive(state, nodes=build_nodes(deps), on_event=sink, resume=resume)
         finally:
             # Sentinel, in the `finally`, so the drain terminates even when the graph
             # raised -- otherwise a failed run leaks a task that waits forever.
