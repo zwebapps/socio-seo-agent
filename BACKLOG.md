@@ -811,7 +811,7 @@ A1 is the first code to create.
   is refused; the response never contains a token or ciphertext, only the mask; and
   business B cannot see or revoke business A's connection (RLS).**
 
-- [ ] **A4 · `notify.owner`: a transactional action type, not a widened `CONSENT_BASES`** —
+- [x] **A4 · `notify.owner`: a transactional action type, not a widened `CONSENT_BASES`** —
   depends on nothing; ruling settled here. The item asks whether the node supplies the
   missing fields or owner notifications get their own action type. **It is the second**, and
   the reasons are not stylistic: (a) `actuators/email.py`'s own comment says a transactional
@@ -834,7 +834,7 @@ A1 is the first code to create.
   parser; a test asserts the actuation's `target` contains no `@`; and the recipient comes
   from the account, not from `dna`. Plus the claims fix below, in the same sitting.**
 
-- [ ] **A4b · The test double for `notify.email` is wider than the actuator, and asserts a
+- [x] **A4b · The test double for `notify.email` is wider than the actuator, and asserts a
   green path the product does not have** — `tests/agents/test_export.py::test_the_owner_is_told_what_went_live_and_what_did_not`
   asserts `notified is True` using a generic `Publisher(NOTIFY_ACTION)`. Against the real
   actuator that same payload is refused (no sender, no body, no unsubscribe, no consent
@@ -1040,7 +1040,7 @@ A1 is the first code to create.
   **done = a reviewer at the gate can approve from the screen; the button appears ONLY in
   `awaiting_approval`; both 409s render their own sentence rather than a generic failure; a test
   asserts the client never sends an approver.**
-- [ ] **A10b · Reject — RULED 2026-08-20 (architect); no longer a decision. A new terminal
+- [x] **A10b · Reject — RULED 2026-08-20 (architect); no longer a decision. A new terminal
   `rejected` state, NO `feedback_service` write, and a reason is REQUIRED.** Backend only; the
   control is A10c. The three questions, answered from what the code actually permits:
   - **(1) A new `rejected` state, NOT `partial`.** Reusing `partial` makes a human's "no"
@@ -1101,7 +1101,7 @@ A1 is the first code to create.
     fails on rows it believes it fixed. The core-schema migration's own comment
     (`3b8336ae2975`, above the RLS block) already states this rule — follow it rather than
     rediscovering it. Mirror the seventh value in `models.py`'s `CheckConstraint` and in
-    `RunState`. **`AgentState`'s `Outcome` literal stays at six values**: the graph never concludes
+    `RunState`. **`AgentState`'s `Outcome` literal is left EXACTLY as it is** (five values: `running`, `awaiting_approval`, `done`, `partial`, `failed` — an earlier draft of this entry said six, which was wrong; `queued` is a run-row state and never a graph outcome. The count is not a target, the instruction is "do not add `rejected`"): the graph never concludes
     a rejection, a person does, and `run_executor` already clamps graph outcomes to
     `{done, failed, partial}`.
   - **Contract** — `POST /api/v1/runs/{run_id}/reject`, body `{"reason": str}`. Mirrors approve
@@ -1140,7 +1140,7 @@ A1 is the first code to create.
   set a rejected run sails straight past the review gate and publishes, which is the real hole
   here; the checkpoint survives, proven by projecting the review after rejecting; and `alembic
   upgrade head` then `alembic downgrade -1` both succeed on a database containing a rejected run.**
-- [ ] **A10c · The reject control, and a rejected run that reads as a decision rather than a
+- [x] **A10c · The reject control, and a rejected run that reads as a decision rather than a
   fault** — UI only, no schema. Depends on A10a (the decision card) and A10b (the route). The
   control lives in the SAME card as approve, because a decision surface with one option is not a
   decision; it is visually SECONDARY to approve (approve is the intended path) and NOT an alarming

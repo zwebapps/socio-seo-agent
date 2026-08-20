@@ -702,3 +702,79 @@ def test_social_post_still_simulates_so_the_two_stay_distinguishable() -> None:
 def test_an_unknown_action_type_is_unwired_rather_than_guessed() -> None:
     """EXPORT records `None` as unwired. Guessing an actuator would publish somewhere."""
     assert executor_module._build_actuator_resolver()("publish.telepathy") is None
+
+
+def test_the_owner_notice_resolves_to_the_transactional_actuator() -> None:
+    """The wiring guard for A4, and the reason it needs one.
+
+    EXPORT's notify tests INJECT their actuator, so every one of them would still pass if
+    this resolver handed out the marketing `EmailActuator` for `notify.owner` -- and the
+    product would go back to what it did for months: an owner notice refused on every run
+    for want of a consent basis and an unsubscribe link it must not have.
+    """
+    from backend.app.actuators.email import EmailActuator
+
+    resolve = executor_module._build_actuator_resolver()
+
+    notice = resolve("notify.owner")
+
+    assert notice is not None, "notify.owner must be wired, or nobody is ever told"
+    assert notice.action_type == "notify.owner"
+    assert not isinstance(notice, EmailActuator), (
+        "notify.owner must NOT be performed by the marketing email actuator: it demands a "
+        "consent basis and an in-body unsubscribe link, which is why every owner notice "
+        "the node ever built was refused"
+    )
+
+
+def test_the_marketing_type_is_still_wired_and_is_still_a_different_actuator() -> None:
+    """Two types, two actuators. `notify.email` is not deleted -- it is just not this."""
+    resolve = executor_module._build_actuator_resolver()
+
+    assert resolve("notify.email") is not None
+    assert resolve("notify.email") is not resolve("notify.owner")
+
+
+# --------------------------------------------------------------------------- #
+# Who the owner notice is addressed to
+#
+# `tests/db/test_owner_notice_recipient.py` owns the SQL. These two own the ordering
+# and the absence, which are the parts a database cannot demonstrate.
+# --------------------------------------------------------------------------- #
+
+
+async def test_no_sender_configured_is_answered_without_touching_the_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cheap check first, and asserted rather than assumed.
+
+    With no sending identity there is no notice to send, so reading the account holder's
+    address would be a query whose answer cannot be used. The session is replaced with one
+    that raises, so this test fails if the order is ever reversed.
+    """
+
+    def exploding_session() -> None:
+        raise AssertionError("the account address must not be read when no sender is set")
+
+    monkeypatch.setattr(executor_module, "session", exploding_session)
+
+    assert await executor_module._resolve_owner_notice(BUSINESS, env={}) is None
+
+
+async def test_a_failed_read_means_no_notice_rather_than_a_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direction is the point: a database that will not answer must not be answered
+    with the crawled contact address. EXPORT reports a named note instead."""
+    from backend.app.actuators.owner_notice import SENDER_ENV
+
+    def exploding_session() -> None:
+        raise RuntimeError("no database today")
+
+    monkeypatch.setattr(executor_module, "session", exploding_session)
+
+    resolved = await executor_module._resolve_owner_notice(
+        BUSINESS, env={SENDER_ENV: "SMA <notices@sma.test>"}
+    )
+
+    assert resolved is None

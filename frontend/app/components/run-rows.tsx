@@ -263,16 +263,25 @@ export function RunRows({
  *   fact about such a run. A run on this deployment typically stops at OPPORTUNITY, and
  *   "stopped at OPPORTUNITY" tells an owner it never reached GENERATE and so produced no
  *   draft — which is the difference between reading the state and understanding it.
+ * - on `rejected` it is where a PERSON ended it, which is neither of the above and needs
+ *   its own verb: "waiting at REVIEW" implies a decision still pending when one has been
+ *   made, and "stopped at REVIEW" implies the machine gave up on a run that in fact
+ *   finished its work and had its output refused. Both existing verbs lie about it, which
+ *   is why the third branch is not a nicety.
  *
  * A `done` run carries a null node from the API, so there is nothing here to mislabel.
  */
 function nodeCaption(state: string, node: string): string {
   if (state === "awaiting_approval") return `waiting at ${node}`;
+  if (state === "rejected") return `rejected at ${node}`;
   if (TERMINAL_FOR_CAPTION.has(state)) return `stopped at ${node}`;
   return node;
 }
 
-/** `awaiting_approval` is deliberately absent — see `nodeCaption`. */
+/**
+ * `awaiting_approval` is deliberately absent, and so is `rejected` — see `nodeCaption`.
+ * This set means "the machine stopped here", which is what earns the word "stopped".
+ */
 const TERMINAL_FOR_CAPTION = new Set(["done", "failed", "partial"]);
 
 function RunRow({ run, onResumed }: { run: RunSummary; onResumed?: () => void }) {
@@ -311,9 +320,20 @@ function RunRow({ run, onResumed }: { run: RunSummary; onResumed?: () => void })
           "partial" on its own is a word an owner cannot act on, and the sentence next to it
           is the difference between "this product is broken" and "this deployment's
           credential cannot reach the mid tier".
+
+          `warn` on every state EXCEPT `rejected`. On a rejected run this field holds the
+          reviewer's own sentence about output they refused, and painting a person's stated
+          reason in a warning colour reports their decision as a fault of the machine — the
+          same misattribution `runStateTone`'s `partial` rule exists to avoid, pointed the
+          other way.
         */}
         {run.finishedReason && (
-          <span className="mt-1.5 block text-xs" style={{ color: "var(--warn)" }}>
+          <span
+            className="mt-1.5 block text-xs"
+            style={{
+              color: run.state === "rejected" ? "var(--text-muted)" : "var(--warn)",
+            }}
+          >
             {run.finishedReason}
           </span>
         )}

@@ -97,7 +97,6 @@ rather than a rewrite.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from collections.abc import Mapping
@@ -108,6 +107,12 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel
 
+from backend.app.actuators.addresses import (
+    address_fingerprint,
+    address_handle,
+    identity_address,
+    looks_like_address,
+)
 from backend.app.actuators.contract import (
     Actuation,
     ActuationRefusedError,
@@ -162,6 +167,13 @@ DEFAULT_TIMEOUT_S: Final = 10.0
 #: from the unsubscribe requirement, so admitting it here would mean admitting an
 #: exemption to the one rule this module enforces hardest. A password reset is a
 #: different action type with different rules, not this one with a flag.
+#:
+#: That action type now exists: `owner_notice.py` performs `notify.owner`, and it is the
+#: proof that this comment was a design statement rather than a deferral. Note what would
+#: have happened had `existing_customer` been borrowed for it instead -- that basis is a
+#: soft-opt-in MARKETING basis, so an owner service notice would have been recorded in the
+#: ledger as marketing to a customer, and would have had to carry an unsubscribe link
+#: offering to switch off "your run published 3 of 4".
 CONSENT_BASES: Final[frozenset[str]] = frozenset(
     {
         # The recipient asked, once.
@@ -211,18 +223,12 @@ ONE_CLICK: Final = "List-Unsubscribe=One-Click"
 def recipient_fingerprint(address: str) -> str:
     """A short, stable handle for a recipient, for logs and metrics.
 
-    **Honest about what this is.** It is a CORRELATION handle, not anonymisation: an
-    address has far too little entropy for a bare digest to resist a dictionary attack,
-    exactly as `core/rate_limit.py` says of the same trick. What it buys is that a log
-    line contains no address, so a shipped log is not an address book -- while two sends
-    to the same person can still be tied together when debugging.
-
-    `rate_limit` can key its HMAC on the session secret because it is already holding
-    settings; this module deliberately holds no configuration beyond one API key, so the
-    digest is unkeyed and the docstring says so rather than implying more.
+    Kept as this module's name for the shared `address_fingerprint`: the transactional
+    actuator needs the identical digest, and two copies of a hash would be two handles
+    for one person the moment either changed. See `addresses.py` for what it is and,
+    more importantly, what it is not.
     """
-    normalised = address.strip().lower()
-    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:12]
+    return address_fingerprint(address)
 
 
 def recipient_target(address: str) -> str:
@@ -237,7 +243,7 @@ def recipient_target(address: str) -> str:
     log from inside this module. Being a pure function of the address, it keeps every
     idempotency property `contract.py` asks of a target.
     """
-    return f"{TARGET_PREFIX}{recipient_fingerprint(address)}"
+    return address_handle(TARGET_PREFIX, address)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,9 +255,14 @@ def recipient_target(address: str) -> str:
 class EmailMessage:
     """One validated email, ready to hand to a provider.
 
-    Constructed only by `parse_email_payload`, which is where every legal check lives, so
-    the existence of this object means the checks passed. Nothing downstream re-validates
-    and nothing downstream may skip it.
+    Constructed only by a payload parser -- `parse_email_payload` here, or
+    `parse_owner_notice_payload` in `owner_notice.py` -- which is where every check lives,
+    so the existence of this object means the checks for its own action type passed.
+    Nothing downstream re-validates and nothing downstream may skip it.
+
+    Shared by the two mail-shaped action types deliberately: the RULES differ (one demands
+    a consent basis and an in-body unsubscribe link, the other refuses both), while the
+    wire shape a provider takes is identical, so `ResendSender` is written once.
     """
 
     sender: str
@@ -458,7 +469,7 @@ def _check_single_recipient(recipient: str) -> None:
             "consent basis is recorded per recipient, and a batch behind one "
             "idempotency key cannot be retried for the addresses it missed."
         )
-    if not _looks_like_address(recipient):
+    if not looks_like_address(recipient):
         raise ActuationRefusedError(
             "payload['to'] is not a usable email address (expected one local@domain). "
             "The value itself is withheld from this message deliberately."
@@ -489,31 +500,13 @@ def _check_target_is_a_handle(target: str, recipient: str) -> None:
     )
 
 
-def _looks_like_address(value: str) -> bool:
-    """Deliberately shallow: exactly one `@`, and something either side of it.
-
-    Not an RFC 5322 parser and not trying to be. Full validation is a famous rabbit hole
-    whose reward is rejecting addresses that work, and the provider is the real authority
-    -- a 422 from Resend is mapped non-retryable precisely so this function does not have
-    to be right about the hard cases. It only has to catch an obviously empty or
-    malformed field before we pay for a round trip.
-    """
-    local, _, domain = value.partition("@")
-    if not local or not domain or "@" in domain:
-        return False
-    return "." in domain and not domain.startswith(".") and not domain.endswith(".")
-
-
 def _check_sender_identity(sender: str) -> None:
     """Sender identity, the third of §6's four constraints and the easiest to check.
 
     Accepts `Name <addr@domain>` as well as a bare address, because a display name is
     part of identifying yourself rather than an obstacle to it.
     """
-    address = sender
-    if "<" in sender and sender.rstrip().endswith(">"):
-        address = sender[sender.index("<") + 1 : sender.rstrip().rindex(">")].strip()
-    if not _looks_like_address(address):
+    if not looks_like_address(identity_address(sender)):
         raise ActuationRefusedError(
             "the sender identity is not a usable email address. Every send must say who "
             "it is from -- an unidentifiable sender is the plainest legal failure there "

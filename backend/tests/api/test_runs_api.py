@@ -1200,3 +1200,358 @@ async def test_approval_needs_a_session() -> None:
         response = await client.post(f"/api/v1/runs/{uuid4()}/approve")
 
     assert response.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Rejection: the other half of the gate, and the hole it closes
+#
+# The interesting test in this section is not the happy path. It is
+# `test_resuming_a_rejected_run_is_refused_and_never_reaches_the_executor`:
+# until `rejected` joined resume's finished set, a rejected run was neither
+# finished nor `awaiting_approval` as far as that route could tell, so it fell
+# past BOTH refusals into `executor.submit(..., resume=True)` and the graph
+# carried on through EXPORT -- publishing the draft a human had just refused.
+# A review gate that the button beside it walks around is not a gate.
+# --------------------------------------------------------------------------- #
+
+REASON = "Tone is far too formal for this client"
+
+
+async def _parked_run(service: RunService, *, goal: str = "more leads") -> UUID:
+    """A run at the gate WITH a checkpoint, the way a real run arrives there."""
+    run = await service.start(business_id=BUSINESS, goal=goal)
+    state = new_state(business_id=BUSINESS, goal=goal)
+    await service.checkpoint(run.id, state=state, current_node="REVIEW")
+    await service.await_approval(run.id)
+    return run.id
+
+
+async def test_rejecting_a_parked_run_is_200_and_writes_a_terminal_state() -> None:
+    """200 and not 202: rejecting starts no work, so it IS complete when it returns.
+
+    `rejected` rather than `partial`, because the two answer different questions. A
+    reviewer's refusal recorded as `partial` is indistinguishable in SQL from a node that
+    fell short, so "how often do reviewers refuse what we produce" -- the one number that
+    says whether this product is any good -- stops being askable.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {"runId": str(run_id), "state": "rejected", "finishedReason": REASON}
+
+    stored = await service.get(run_id)
+    assert stored is not None
+    assert stored.state == "rejected"
+    assert stored.finished_reason == REASON
+
+
+async def test_the_response_reports_the_stored_reason_rather_than_the_one_sent() -> None:
+    """`finishedReason` is the third field for a reason: the screen must render what was
+    PERSISTED. Whitespace is collapsed on the way in, so a request whose reason differs
+    from the stored one is exactly the case that proves the response is a read-back."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+    sent = "  Tone   is\n\n far too\tformal   "
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": sent})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["finishedReason"] == "Tone is far too formal"
+
+    stored = await service.get(run_id)
+    assert stored is not None
+    assert stored.finished_reason == "Tone is far too formal"
+    assert stored.finished_reason != sent, "the echo must not be the request reflected back"
+
+
+def test_the_reason_bounds_are_the_numbers_the_ruling_names() -> None:
+    """Pinned as LITERALS, on purpose, and this test is not redundant with the 422 cases.
+
+    Those cases derive their boundary from `REJECT_REASON_MAX`, so moving the constant moves
+    them with it and they cannot notice. What matters about 240 is a RELATIONSHIP: it must
+    stay strictly under `MAX_FINISHED_REASON` (255, the width of `runs.finished_reason`),
+    because `clamp_reason` truncates SILENTLY. Raise the ceiling to 255 and a person's stated
+    reason starts getting quietly shortened -- which is the exact outcome the ruling picked
+    240 to prevent, and it would otherwise happen without a single test going red.
+
+    The client mirrors these two numbers the way it mirrors `GOAL_MIN`/`GOAL_MAX`, so a
+    change here is also a change to a published contract.
+    """
+    from backend.app.services.run_service import MAX_FINISHED_REASON
+
+    assert runs_api.REJECT_REASON_MIN == 10
+    assert runs_api.REJECT_REASON_MAX == 240
+    assert runs_api.REJECT_REASON_MAX < MAX_FINISHED_REASON, (
+        "the API ceiling must sit UNDER the column width, or clamp_reason silently truncates "
+        "a human's reason and the 422 stops being the only length refusal they can meet"
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param("", id="empty"),
+        pytest.param("   \n\t  ", id="whitespace-only"),
+        pytest.param("too short", id="nine-characters"),
+        pytest.param("x" * (runs_api.REJECT_REASON_MAX + 1), id="one-over-the-ceiling"),
+    ],
+)
+async def test_a_rejection_without_a_usable_reason_is_422_before_any_write(
+    reason: str | None,
+) -> None:
+    """A reasonless rejection is the one input this product can do nothing with, and the
+    reviewer is the only person who will ever know why.
+
+    Whitespace-only is in this list deliberately: the bounds are measured AFTER collapse,
+    so eleven spaces is not a reason that happens to be long enough.
+
+    The ceiling is 240 and not 255, the width of `runs.finished_reason`, because
+    `clamp_reason` truncates SILENTLY -- so a 422 is the only length refusal a human can
+    meet, and nothing quietly shortens what a person said.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+    payload: dict[str, object] = {} if reason is None else {"reason": reason}
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run_id}/reject", json=payload)
+
+    assert response.status_code == 422, response.text
+
+    unchanged = await service.get(run_id)
+    assert unchanged is not None
+    assert unchanged.state == "awaiting_approval", "a refused request must write nothing"
+    assert unchanged.finished_reason is None
+
+
+async def test_a_reason_at_the_ceiling_is_accepted_and_not_clamped() -> None:
+    """The boundary in the other direction. 240 characters fit the column with room to
+    spare, so nothing may be truncated -- if this ever fails, the ceiling and the column
+    have drifted apart and a reviewer's words are being cut without being told."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+    reason = "n" * runs_api.REJECT_REASON_MAX
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": reason})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["finishedReason"] == reason
+    assert "..." not in response.json()["finishedReason"]
+
+
+@pytest.mark.parametrize("state", ["queued", "running", "done", "failed", "partial"])
+async def test_a_run_that_is_not_parked_cannot_be_rejected(state: str) -> None:
+    """The SAME code as approve, because it is the same condition -- one client handler
+    serves both buttons. Only the sentence differs."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    if state != "queued":
+        await service.finish(run.id, outcome=state)  # type: ignore[arg-type]
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/reject", json={"reason": REASON})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "run_not_awaiting_approval"
+    assert state in detail["message"]
+    assert "rejected" in detail["message"]
+
+
+async def test_a_second_rejection_is_409_and_does_not_overwrite_the_first_reason() -> None:
+    """Deliberately not idempotent-by-silence. The caller believes they are deciding
+    something; the honest answer is that it is already decided -- and the first
+    reviewer's words must survive the second click."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+
+    async with _client(service) as client:
+        first = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+        second = await client.post(
+            f"/api/v1/runs/{run_id}/reject", json={"reason": "second opinion, also no"}
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "run_not_awaiting_approval"
+
+    stored = await service.get(run_id)
+    assert stored is not None
+    assert stored.finished_reason == REASON
+
+
+async def test_a_run_with_no_checkpoint_is_still_rejectable() -> None:
+    """The one deliberate divergence from approve, which refuses a checkpoint-less run.
+
+    Approve needs a checkpoint because the approval is written INTO it. A rejection writes
+    nothing there, and a run parked having produced nothing is precisely what a reviewer
+    should be able to dismiss. A reviewer must always be able to say no.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    await service.await_approval(run.id)
+    assert (await service.get(run.id)) is not None
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/reject", json={"reason": REASON})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["state"] == "rejected"
+
+
+async def test_rejecting_leaves_the_checkpoint_readable() -> None:
+    """A refused draft is evidence of work the owner already paid for, so the review tabs
+    have to keep rendering it. Proven by projecting the review AFTER the rejection rather
+    than by inspecting the column: the projection is what the screen actually reads."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _reviewable_run(service)
+
+    async with _client(service) as client:
+        assert (
+            await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+        ).status_code == 200
+        review = await client.get(f"/api/v1/runs/{run_id}/review")
+
+    assert review.status_code == 200
+    body = review.json()
+    assert body["hasOutput"] is True
+    assert body["draft"]["title"] == "Notar in Koblenz"
+
+
+async def test_the_rejecter_is_not_recorded_anywhere() -> None:
+    """A difference from approve, not an oversight. `approved_by` exists because it
+    authorises an outward publish and lands on every `actions` row; a rejection authorises
+    nothing and sends nothing, and with one user per business a `rejected_by` would store
+    what `business_id` already implies."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+
+    assert set(response.json()) == {"runId", "state", "finishedReason"}
+
+    restored = await service.restore(run_id)
+    assert restored is not None
+    assert restored.get("approved_by") in (None, ""), "a rejection approves nothing"
+    assert not any("reject" in key for key in restored), (
+        f"nothing about the rejecter belongs in the checkpoint, found {sorted(restored)}"
+    )
+
+
+async def test_rejecting_never_reaches_the_executor() -> None:
+    """There is nothing to start and nothing to stop. Approve submits; reject must not."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+    executor = _RecordingExecutor()
+
+    async with _client_with_executor(service, executor) as client:
+        response = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+
+    assert response.status_code == 200, response.text
+    assert executor.submitted == []
+
+
+async def test_resuming_a_rejected_run_is_refused_and_never_reaches_the_executor() -> None:
+    """THE hole this task closes, and the reason the state had to join resume's set.
+
+    A rejected run is not `awaiting_approval` any more, and before `rejected` was added to
+    the finished set it was not "finished" either -- so it fell past BOTH of resume's
+    refusals and reached `executor.submit(..., resume=True)`, which continues the graph from
+    the checkpoint through EXPORT and PUBLISHES the draft a human had just refused.
+
+    The assertion that matters is the second one. A 409 with a submission behind it would
+    still have published.
+    """
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+    executor = _RecordingExecutor()
+
+    async with _client_with_executor(service, executor) as client:
+        rejected = await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+        resumed = await client.post(f"/api/v1/runs/{run_id}/resume")
+
+    assert rejected.status_code == 200, rejected.text
+    assert resumed.status_code == 409, resumed.text
+    assert resumed.json()["detail"]["code"] == "run_finished"
+    assert executor.submitted == [], (
+        "a rejected run reaching the executor republishes what a human refused"
+    )
+
+
+async def test_approving_a_rejected_run_is_refused_and_never_reaches_the_executor() -> None:
+    """Approve-after-reject is the existing 409 and needs no new vocabulary: rejection is
+    terminal and not reversible, and the recovery is a NEW run that re-derives from
+    current documents rather than republishing what was refused."""
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+    executor = _RecordingExecutor()
+
+    async with _client_with_executor(service, executor) as client:
+        assert (
+            await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+        ).status_code == 200
+        approved = await client.post(f"/api/v1/runs/{run_id}/approve")
+
+    assert approved.status_code == 409
+    assert approved.json()["detail"]["code"] == "run_not_awaiting_approval"
+    assert executor.submitted == []
+
+
+async def test_the_event_stream_ends_for_a_rejected_run() -> None:
+    """`rejected` is terminal, so nothing will ever move this run. Without it in
+    `TERMINAL` the stream holds the connection open for the full MAX_STREAM_SECONDS
+    waiting for events that cannot come -- fifteen minutes per reload."""
+    assert "rejected" in runs_api.TERMINAL
+
+    service = RunService(InMemoryRunStore())
+    run_id = await _parked_run(service)
+
+    async with _client(service) as client:
+        assert (
+            await client.post(f"/api/v1/runs/{run_id}/reject", json={"reason": REASON})
+        ).status_code == 200
+        async with client.stream("GET", f"/api/v1/runs/{run_id}/events") as response:
+            body = "".join([chunk async for chunk in response.aiter_text()])
+
+    assert "event: end" in body
+    assert '"state": "rejected"' in body
+    assert REASON in body
+
+
+async def test_another_businesss_run_cannot_be_rejected() -> None:
+    """404, not 403: whether a run exists is itself information."""
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=uuid4(), goal="not yours")
+    await service.await_approval(run.id)
+
+    async with _client(service) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/reject", json={"reason": REASON})
+
+    assert response.status_code == 404
+
+    untouched = await service.get(run.id)
+    assert untouched is not None
+    assert untouched.state == "awaiting_approval"
+
+
+async def test_rejection_needs_a_session() -> None:
+    """The rejecter is not RECORDED, which is not the same as not being AUTHENTICATED:
+    `current_business` resolves through the authenticated user, so an anonymous caller is
+    401 here as everywhere else."""
+    app = create_app()
+    app.dependency_overrides[runs_api.get_run_service] = lambda: RunService(InMemoryRunStore())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/v1/runs/{uuid4()}/reject", json={"reason": REASON})
+
+    assert response.status_code == 401

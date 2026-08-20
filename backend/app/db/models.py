@@ -249,9 +249,15 @@ class Run(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     )
     finished_reason: Mapped[str | None] = mapped_column(String(255))
 
+    # `rejected` is its own terminal value rather than a flavour of `partial`, and the
+    # reason is that they answer different questions. `partial` means a node fell short;
+    # `rejected` means a person refused the output. Collapsing them would make "how often
+    # do reviewers refuse what we produce" unanswerable in SQL and would blame the machine
+    # for a human decision. Nothing in the graph can produce it -- only the reject route.
     __table_args__ = (
         CheckConstraint(
-            "state in ('queued','running','awaiting_approval','done','failed','partial')",
+            "state in ('queued','running','awaiting_approval','done','failed','partial',"
+            "'rejected')",
             name="state_valid",
         ),
     )

@@ -16,7 +16,8 @@ Hermetic by construction: the actuator and its ledger are injected, so nothing h
 reaches a network, a provider or a database.
 """
 
-from typing import Any
+import json
+from typing import Any, Final
 from uuid import uuid4
 
 import pytest
@@ -30,9 +31,16 @@ from backend.app.actuators import (
     Outcome,
     OutcomeStatus,
 )
+from backend.app.actuators.email import LIST_UNSUBSCRIBE_HEADER, EmailMessage
+from backend.app.actuators.owner_notice import (
+    OwnerNoticeActuator,
+    OwnerNoticeIdentity,
+    parse_owner_notice_payload,
+)
 from backend.app.agents.nodes import (
     ANALYTICS_GAP,
     NO_ACTUATOR_NOTE,
+    NO_NOTICE_IDENTITY_NOTE,
     NOT_APPROVED_NOTE,
     NOTIFY_ACTION,
     PAGE_PUBLISH_ACTION,
@@ -123,6 +131,51 @@ def _satisfies_protocol(publisher: Publisher) -> Actuator:
     return publisher
 
 
+#: The AUTHENTICATED account holder's address, and the one a crawled homepage claims.
+#:
+#: Both exist in these tests on purpose. `_state()` keeps a contact address in `dna` --
+#: extracted from the business's own website by the crawler -- precisely so that every
+#: notify test can assert it is NOT the address our own operational mail goes to. A run
+#: whose notice followed the crawled one would let a page we do not control redirect us.
+ACCOUNT_EMAIL: Final = "owner@account.example"
+CRAWLED_EMAIL: Final = "chef@mueller.de"
+NOTICE_IDENTITY: Final = OwnerNoticeIdentity(
+    account_email=ACCOUNT_EMAIL, sender="SMA <notices@sma.example>"
+)
+
+
+class RecordingSender:
+    """The email seam, recording instead of sending. Below the actuator, not instead of it.
+
+    This is the ONLY double in the notify path, and that is the whole of A4b. The previous
+    tests used a generic `Publisher(NOTIFY_ACTION)` in place of the ACTUATOR, so they
+    asserted `notified is True` for a payload the real actuator refused every time -- no
+    sender, no body, and a bare address in `target`. A green test for a path the product
+    did not have, which is the same class of bug as the engine correcting hashtags in the
+    eval harness and not in the product.
+
+    Faking here instead means every notify test runs the REAL `OwnerNoticeActuator` and
+    therefore the REAL parser, so a double can no longer be more permissive than the thing
+    it stands in for: the only thing missing is the HTTP call, which is the one part with
+    no policy in it.
+    """
+
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.sent: list[EmailMessage] = []
+
+    async def send(self, message: EmailMessage) -> str:
+        self.sent.append(message)
+        return f"msg_{len(self.sent)}"
+
+
+def _notifier() -> tuple[OwnerNoticeActuator, RecordingSender]:
+    """The real `notify.owner` actuator, with only its transport faked."""
+    sender = RecordingSender()
+    return OwnerNoticeActuator(sender), sender
+
+
 def _deps(**over: Any) -> NodeDeps:
     base: dict[str, Any] = {"router": object(), "channels": ("linkedin", "facebook")}
     base.update(over)
@@ -140,7 +193,9 @@ def _state(**over: Any) -> AgentState:
     state = new_state(
         business_id=BUSINESS,
         goal="more local leads",
-        dna={"name": "Müller Sanitär GmbH", "city": "Koblenz", "email": "chef@mueller.de"},
+        # `email` is the CRAWLED contact address. Kept here so the notify tests can prove
+        # it is never used -- see `ACCOUNT_EMAIL` above.
+        dna={"name": "Müller Sanitär GmbH", "city": "Koblenz", "email": CRAWLED_EMAIL},
     )
     state.update(
         {
@@ -436,51 +491,157 @@ async def test_an_edited_post_is_a_different_effect_and_does_go_out() -> None:
 
 
 async def test_the_owner_is_told_what_went_live_and_what_did_not() -> None:
-    notifier = Publisher(NOTIFY_ACTION)
-    deps, ledger = _wired(Publisher(dead="facebook"), notifier)
+    """Driven through the REAL actuator and therefore the real parser.
+
+    The assertion that matters is not `notified is True` on its own -- the old version of
+    this test asserted exactly that, against a double the real actuator would have refused.
+    It is `notified is True` **and** a message the real parser accepted **and** a body
+    naming both outcomes.
+    """
+    notifier, sender = _notifier()
+    deps, _ = _wired(Publisher(dead="facebook"), notifier, owner_notice=NOTICE_IDENTITY)
 
     updates = await build_nodes(deps)["EXPORT"](_state(landing_page=None))
 
     assert updates["published"]["notified"] is True
-    message = next(a for a in ledger.claimed if a.action_type == NOTIFY_ACTION)
-    assert message.target == "chef@mueller.de"
-    assert message.payload["published"] == ["linkedin"]
-    assert message.payload["not_published"] == ["facebook"]
+    message = sender.sent[0]
+    assert message.recipient == ACCOUNT_EMAIL
+    assert message.subject == "Published 1 of 2"
+    body = "\n".join(message.body_parts)
+    assert "linkedin" in body
+    assert "facebook" in body
+
+
+async def test_the_notify_actuation_the_node_builds_passes_the_real_parser() -> None:
+    """A4b, stated as its own guard rather than as a side effect of another test.
+
+    The claimed actuation is re-validated by the actuator's own parser here, so this test
+    fails the moment the node's payload drifts from what `notify.owner` accepts -- which is
+    the failure mode that made owner notification a green test and a broken product.
+    """
+    notifier, _ = _notifier()
+    deps, ledger = _wired(Publisher(), notifier, owner_notice=NOTICE_IDENTITY)
+
+    await build_nodes(deps)["EXPORT"](_state(landing_page=None))
+
+    claimed = next(a for a in ledger.claimed if a.action_type == NOTIFY_ACTION)
+    # Does not raise: the payload the product builds is the payload the actuator accepts.
+    parse_owner_notice_payload(claimed)
+
+
+async def test_the_notice_target_is_a_handle_and_carries_no_address() -> None:
+    """Defect (i), at the layer where it actually leaked.
+
+    `_outcome_row` copies `target` into `runs.checkpoint` and the Delivery tab renders it,
+    so a bare address here reaches a screen and a log line. The node used to pass
+    `target=<address>`; now it cannot, because it does not build the actuation.
+    """
+    notifier, _ = _notifier()
+    deps, ledger = _wired(Publisher(), notifier, owner_notice=NOTICE_IDENTITY)
+
+    updates = await build_nodes(deps)["EXPORT"](_state(landing_page=None))
+
+    target = ledger.targets(NOTIFY_ACTION)[0]
+    assert "@" not in target
+    assert ACCOUNT_EMAIL not in target
+    row = updates["published"]["notify"]
+    assert "@" not in row["target"]
+    assert ACCOUNT_EMAIL not in row["summary"]
+
+
+async def test_the_crawled_contact_address_is_never_the_recipient() -> None:
+    """Defect (ii). The business profile HAS an email and it is still not used.
+
+    `state["dna"]["email"]` comes from a homepage the crawler read, so treating it as the
+    destination for our own operational mail would let a page we do not control redirect it.
+    The recipient comes from the authenticated account, injected on `NodeDeps`.
+    """
+    notifier, sender = _notifier()
+    deps, ledger = _wired(Publisher(), notifier, owner_notice=NOTICE_IDENTITY)
+
+    await build_nodes(deps)["EXPORT"](_state(landing_page=None))
+
+    assert _state()["dna"]["email"] == CRAWLED_EMAIL  # it is there to be picked up
+    assert sender.sent[0].recipient == ACCOUNT_EMAIL
+    claimed = next(a for a in ledger.claimed if a.action_type == NOTIFY_ACTION)
+    assert CRAWLED_EMAIL not in json.dumps(dict(claimed.payload))
+    assert claimed.payload["recipient_source"] == "account"
+
+
+async def test_no_account_address_is_named_rather_than_silently_skipped() -> None:
+    """Replaces "no email on record": the profile's address is no longer the question.
+
+    The reason is now a deployment fact -- no resolved account address, or no
+    `OWNER_NOTICE_FROM` sender -- and the note says so, including why the crawled address is
+    not used as a fallback. Nothing is claimed in the ledger, so nothing was attempted.
+    """
+    notifier, sender = _notifier()
+    deps, ledger = _wired(Publisher(), notifier, owner_notice=None)
+
+    updates = await build_nodes(deps)["EXPORT"](_state(landing_page=None))
+
+    assert updates["published"]["notified"] is False
+    assert updates["published"]["notify_note"] == NO_NOTICE_IDENTITY_NOTE
+    assert ledger.targets(NOTIFY_ACTION) == []
+    assert sender.sent == []
 
 
 async def test_the_owner_is_told_even_when_everything_failed() -> None:
     """Especially then. A notifier that only fires on success is how a silent failure
     stays silent."""
-    notifier = Publisher(NOTIFY_ACTION)
-    deps, ledger = _wired(Publisher(dead="linkedin"), notifier)
+    notifier, sender = _notifier()
+    deps, _ = _wired(Publisher(dead="linkedin"), notifier, owner_notice=NOTICE_IDENTITY)
 
-    await build_nodes(deps)["EXPORT"](
+    updates = await build_nodes(deps)["EXPORT"](
         _state(landing_page=None, renderings={"linkedin": "only channel"})
     )
 
-    message = next(a for a in ledger.claimed if a.action_type == NOTIFY_ACTION)
-    assert message.payload["published"] == []
+    assert updates["published"]["notified"] is True
+    body = "\n".join(sender.sent[0].body_parts)
+    assert "Published 0 of 1" in sender.sent[0].subject
+    assert "Not published:" in body
+    assert "linkedin" in body
 
 
-async def test_no_email_on_record_is_named_rather_than_silently_skipped() -> None:
-    deps, ledger = _wired(Publisher(), Publisher(NOTIFY_ACTION))
+async def test_the_notice_says_a_simulated_publish_was_simulated() -> None:
+    """The owner must not be told a post went live when nothing left the process.
 
-    updates = await build_nodes(deps)["EXPORT"](
-        _state(landing_page=None, dna={"name": "Müller Sanitär GmbH"})
-    )
+    The body opens with the run's own one-line note, which already carries the caveat --
+    one sentence to get right instead of two that can disagree.
+    """
+    notifier, sender = _notifier()
+    deps, _ = _wired(FakeActuator(SOCIAL_POST_ACTION), notifier, owner_notice=NOTICE_IDENTITY)
 
-    assert updates["published"]["notified"] is False
-    assert "no email address on record" in updates["published"]["notify_note"]
-    assert ledger.targets(NOTIFY_ACTION) == []
+    updates = await build_nodes(deps)["EXPORT"](_state(landing_page=None))
+
+    assert updates["published"]["simulated"] is True
+    assert "SIMULATED" in "\n".join(sender.sent[0].body_parts)
 
 
-async def test_one_message_per_run_and_not_one_per_channel() -> None:
-    notifier = Publisher(NOTIFY_ACTION)
-    deps, ledger = _wired(Publisher(), notifier)
+async def test_the_notice_carries_no_unsubscribe_header() -> None:
+    """The product reason this is its own action type.
+
+    An unsubscribe on an operational notice means a later run publishes and nobody is told.
+    Asserted on the headers the provider would actually receive, not on the intent.
+    """
+    notifier, sender = _notifier()
+    deps, _ = _wired(Publisher(), notifier, owner_notice=NOTICE_IDENTITY)
 
     await build_nodes(deps)["EXPORT"](_state(landing_page=None))
 
-    assert ledger.targets(NOTIFY_ACTION) == ["chef@mueller.de"]
+    headers = sender.sent[0].headers
+    assert LIST_UNSUBSCRIBE_HEADER not in headers
+    assert not any("unsubscribe" in key.lower() for key in headers)
+
+
+async def test_one_message_per_run_and_not_one_per_channel() -> None:
+    notifier, sender = _notifier()
+    deps, ledger = _wired(Publisher(), notifier, owner_notice=NOTICE_IDENTITY)
+
+    await build_nodes(deps)["EXPORT"](_state(landing_page=None))
+
+    assert len(ledger.targets(NOTIFY_ACTION)) == 1
+    assert len(sender.sent) == 1
 
 
 # --------------------------------------------------------------------------- #

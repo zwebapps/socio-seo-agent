@@ -172,6 +172,78 @@ describe("a run that stopped short", () => {
   });
 
   /**
+   * A rejected run needs a THIRD verb, because both existing ones lie about it: "waiting
+   * at REVIEW" says a decision is still pending when one has been made, and "stopped at
+   * REVIEW" says the machine gave up on a run that in fact finished its work and had its
+   * output refused by a person. Both are `string`-typed fall-throughs, so getting this
+   * wrong is silent.
+   */
+  it("gives a rejected run its own verb rather than borrowing either existing one", async () => {
+    listReplies = [
+      page([
+        run({ runId: "a", state: "rejected", currentNode: "REVIEW" }),
+        run({ runId: "b", state: "partial", currentNode: "OPPORTUNITY" }),
+      ]),
+    ];
+
+    render(<Harness />);
+    await settle();
+
+    expect(screen.getByText("rejected at REVIEW")).toBeInTheDocument();
+    // Not the review gate's pending verb, and not the machine's giving-up verb.
+    expect(screen.queryByText("waiting at REVIEW")).toBeNull();
+    expect(screen.queryByText("stopped at REVIEW")).toBeNull();
+    // And the caption for a genuine shortfall is untouched.
+    expect(screen.getByText("stopped at OPPORTUNITY")).toBeInTheDocument();
+  });
+
+  /**
+   * The register, which is the half of this that is easy to ship wrong.
+   *
+   * `finishedReason` on a `partial` run is the machine reporting a shortfall, and `warn` is
+   * right for it. On a `rejected` run the SAME field holds a person's own sentence about
+   * work they refused — and painting that in a warning colour reports their decision as a
+   * fault of the agent. Asserted as a comparison between the two rows rather than as an
+   * absolute, so it stays a statement about the DIFFERENCE and cannot pass by both rows
+   * happening to be muted.
+   */
+  it("does not present a rejected run's reason in the same register as a shortfall", async () => {
+    listReplies = [
+      page([
+        run({
+          runId: "a",
+          state: "rejected",
+          currentNode: "REVIEW",
+          finishedReason: "Two claims in the draft are ones we are not allowed to make.",
+        }),
+        run({
+          runId: "b",
+          state: "partial",
+          currentNode: "OPPORTUNITY",
+          finishedReason: "The configured credential cannot reach the mid tier.",
+        }),
+      ]),
+    ];
+
+    render(<Harness />);
+    await settle();
+
+    const refused = screen.getByText(
+      "Two claims in the draft are ones we are not allowed to make.",
+    );
+    const fellShort = screen.getByText("The configured credential cannot reach the mid tier.");
+
+    // The machine falling short keeps the warning colour...
+    expect(fellShort.getAttribute("style") ?? "").toContain("--warn");
+    // ...and a person's decision does not get it.
+    expect(refused.getAttribute("style") ?? "").not.toContain("--warn");
+    expect(refused.getAttribute("style") ?? "").not.toContain("--err");
+    // The reason itself is still shown: a rejection whose reason is hidden is a decision
+    // with no record on the one screen that lists runs.
+    expect(refused).toBeInTheDocument();
+  });
+
+  /**
    * The mirror of the test above, and it has to be written as "invents nothing" rather
    * than "the fixture's string is absent" — a fixture string that was never supplied is
    * absent no matter what the component does, which is a test that could not fail. What
@@ -205,7 +277,15 @@ describe("polling", () => {
    * the cost shows up as API load nobody can attribute.
    */
   it("never starts when every run is already terminal", async () => {
-    listReplies = [page([run({ state: "done" }), run({ runId: "r2", state: "partial" })])];
+    // `rejected` belongs in this list for the plainest reason: nothing will ever move a
+    // rejected run, so a list containing one must not arm a timer on its behalf.
+    listReplies = [
+      page([
+        run({ state: "done" }),
+        run({ runId: "r2", state: "partial" }),
+        run({ runId: "r3", state: "rejected" }),
+      ]),
+    ];
 
     render(<Harness />);
     await settle();

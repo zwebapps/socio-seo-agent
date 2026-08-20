@@ -20,8 +20,8 @@ import { Pill, SoftCard, SoftWell } from "../../components/soft";
 // Shared with the dashboard panel and the /runs list. Three private copies of "what colour
 // is `partial`" is three chances for the screens to disagree about whether a run that
 // produced nothing looks like a success.
-import { runStateLabel, runStateTone } from "../../lib/runs-api";
-import { ApproveGate, RunReviewTabs } from "./review";
+import { isTerminalState, runStateLabel, runStateTone } from "../../lib/runs-api";
+import { DecisionGate, RunReviewTabs } from "./review";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
@@ -65,7 +65,19 @@ const NODE_LABEL: Record<string, string> = {
   REVIEW: "Waiting for you",
 };
 
-const TERMINAL = new Set(["awaiting_approval", "done", "failed", "partial"]);
+/**
+ * The label for one node, given what the run went on to do.
+ *
+ * REVIEW is the only node whose label depends on the run's outcome, and it is the fourth
+ * place a rejection leaks. "Waiting for you" is right for a parked run and wrong for every
+ * decided one — on a rejected run it says a decision is still pending, on the very screen
+ * where the person made it. The rejection writes no `RunEvent` (a run's events are the
+ * graph's, and a person is not a node), so nothing else on the timeline can say this.
+ */
+function nodeLabel(node: string, runState?: string): string {
+  if (node === "REVIEW" && runState === "rejected") return "You rejected the output";
+  return NODE_LABEL[node] ?? node;
+}
 
 export default function RunPage({ params }: { params: Promise<{ runId: string }> }) {
   const [runId, setRunId] = useState<string | null>(null);
@@ -135,7 +147,12 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
     async function begin() {
       const first = await refresh();
       if (cancelled || !first) return;
-      if (TERMINAL.has(first.state)) return;
+      // "Nothing more is coming" is decided in `runs-api.ts`, not by a private set here.
+      // This screen and the runs list each used to keep their own copy, which is exactly
+      // how `rejected` would have been added to one of them and not the other -- and a
+      // terminal state missing from this one holds an event stream open for the full
+      // MAX_STREAM_SECONDS waiting for events that cannot come.
+      if (isTerminalState(first.state)) return;
 
       // Resume from where we already are, so a reconnect costs nothing.
       const url = `${API_URL}/api/v1/runs/${runId}/events?after=${lastSeq.current}`;
@@ -224,7 +241,7 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
               <Step
                 key={node}
                 node={node}
-                label={NODE_LABEL[node] ?? node}
+                label={nodeLabel(node, run?.state)}
                 status={status}
                 cost={cost}
                 active={run?.currentNode === node}
@@ -233,10 +250,23 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
           })}
         </ol>
 
+        {/*
+          `finishedReason` says why a run ended -- but "why it stopped", in `warn`, is only
+          true when the MACHINE ended it. On a rejected run the same field holds a person's
+          own sentence about work they refused, and heading it "why it stopped" in a warning
+          colour would report their decision as a shortfall the agent is to blame for. So
+          the heading names the human decision and the colour drops to muted; every other
+          state keeps the wording and the tone it had.
+        */}
         {run?.finishedReason && (
           <SoftWell className="mt-5 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--warn)" }}>
-              Why it stopped
+            <p
+              className="text-xs font-semibold uppercase tracking-wider"
+              style={{
+                color: run.state === "rejected" ? "var(--text-muted)" : "var(--warn)",
+              }}
+            >
+              {run.state === "rejected" ? "Why you rejected it" : "Why it stopped"}
             </p>
             <p className="mt-1.5 text-sm">{run.finishedReason}</p>
           </SoftWell>
@@ -258,17 +288,20 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
       {/* The human decision. Above the review surface deliberately: it is the reason this
           screen exists, and a reviewer should not have to find it under seven tabs. It
           renders nothing at all unless the run is parked at the gate, so on every other
-          run this costs the page nothing. Approving re-reads the run and re-opens the
-          event stream, so the state pill and the timeline stop showing a gate that has
-          already been passed. */}
+          run this costs the page nothing. Either decision re-reads the run, so the state
+          pill and the timeline stop showing a gate that has already been passed. */}
       {runId && run && (
-        <ApproveGate
+        <DecisionGate
           runId={runId}
           runState={run.state}
           onApproved={() => {
             void refresh();
             setStreamEpoch((n) => n + 1);
           }}
+          /* Re-read, but deliberately NO stream epoch bump: a rejected run is terminal, so
+             there is nothing to listen for and re-opening a source would be a connection
+             held open for events that cannot come. */
+          onRejected={() => void refresh()}
         />
       )}
 
@@ -276,7 +309,10 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
           run's state so it re-reads as the graph advances — output appears node by node,
           and a review fetched at HARVEST would otherwise stay empty for the whole run.
           It is NOT gated on a terminal state: a partial run has partial output, and
-          hiding it until the end would withhold work the owner has already paid for. */}
+          hiding it until the end would withhold work the owner has already paid for. That
+          includes a REJECTED run — the reject route leaves `runs.checkpoint` intact
+          precisely so the refused draft stays readable, and a rejection is a judgement
+          about output the owner should still be able to look at. */}
       {runId && run && <RunReviewTabs runId={runId} runState={run.state} />}
     </Shell>
   );

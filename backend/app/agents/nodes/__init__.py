@@ -54,6 +54,13 @@ from backend.app.actuators import (
 from backend.app.actuators import (
     Outcome as ActuationOutcome,
 )
+from backend.app.actuators.owner_notice import (
+    ACTION_TYPE as OWNER_NOTICE_ACTION,
+)
+from backend.app.actuators.owner_notice import (
+    OwnerNoticeIdentity,
+    build_owner_notice_actuation,
+)
 from backend.app.agents.nodes.prompts import (
     GENERATE_TOOL,
     LANDING_TOOL,
@@ -204,13 +211,28 @@ SOCIAL_POST_ACTION: Final = "social.post"
 #: The landing page the tracked links point at.
 PAGE_PUBLISH_ACTION: Final = "publish.page"
 #: The one message EXPORT sends the owner: what went live and what did not.
-NOTIFY_ACTION: Final = "notify.email"
+#:
+#: `notify.owner`, NOT `notify.email`, and the distinction is the whole of A4. The email
+#: actuator refused this message on purpose and every time -- no sender, no body, no
+#: unsubscribe link, no consent basis -- so owner notification has never once worked. The
+#: fix is a transactional action type (`actuators/owner_notice.py`), not a widened
+#: `CONSENT_BASES`: an operational notice must not offer to unsubscribe you from "your run
+#: published 3 of 4", and `existing_customer` is a soft-opt-in MARKETING basis, so
+#: borrowing it would record a marketing claim about a message that is not marketing.
+#:
+#: Changing this string re-keys the action, which the header above warns about. That is
+#: intended here rather than risky: no `notify.email` from this node has ever SUCCEEDED, so
+#: there is no prior effect for a new key to duplicate.
+NOTIFY_ACTION: Final = OWNER_NOTICE_ACTION
 
 #: What `publish` may actuate, and what `notify` may. Two grants in the allowlist mean
 #: two capabilities, so they cannot share one implementation: a node holding `notify`
 #: and not `publish` must not be able to post, and the check has to live somewhere that
 #: the grant name reaches.
 PUBLISHABLE_ACTIONS: Final[frozenset[str]] = frozenset({SOCIAL_POST_ACTION, PAGE_PUBLISH_ACTION})
+#: Deliberately just the one, and `notify.email` is deliberately NOT in it. No node sends
+#: marketing email, so granting the capability here would widen what an induced tool call
+#: could reach for nothing in return.
 NOTIFIABLE_ACTIONS: Final[frozenset[str]] = frozenset({NOTIFY_ACTION})
 
 #: The landing page's destination within the publishing integration.
@@ -325,6 +347,22 @@ class NodeDeps:
     #: database-free, so every node test is hermetic. `actuate()` needs both this and
     #: an actuator, and EXPORT treats either one missing as "not wired".
     actuator_store: ActuatorStore | None = None
+    #: Who EXPORT's owner notice goes to, and who it comes from.
+    #:
+    #: Injected for the same reason `actuator_store` is: resolving it needs a database read
+    #: (`businesses.owner_id -> users.email`) and the nodes must stay database-free, so
+    #: every node test stays hermetic.
+    #:
+    #: **It must never be derived from `state["dna"]`.** That address is extracted from a
+    #: crawled homepage -- data we do not control -- and our own operational mail has to go
+    #: to the AUTHENTICATED account, or a page we crawled could redirect it. The node reads
+    #: this and nothing else; `actuators/owner_notice.py` refuses a payload that declares a
+    #: crawled provenance, so the rule is enforced at the boundary as well as observed here.
+    #:
+    #: `None` means no owner notice is possible on this deployment -- no account address
+    #: resolved, or no `OWNER_NOTICE_FROM` sender identity -- and EXPORT reports that in a
+    #: named note rather than skipping silently.
+    owner_notice: OwnerNoticeIdentity | None = None
     channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
     #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
     #:
@@ -1343,11 +1381,12 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         report.update(
             await _notify_owner(
                 box,
-                state,
                 business=business,
                 approver=approver,
+                identity=deps.owner_notice,
                 published=published,
                 not_published=not_published,
+                note=str(report["note"]),
             )
         )
 
@@ -1534,13 +1573,28 @@ async def _actuate(
     is a wiring fault or an attack, and it must be loud rather than degraded into a
     channel that quietly did not publish.
     """
-    actuation = Actuation(
-        business_id=business,
-        action_type=action_type,
-        target=target,
-        payload=dict(payload),
-        approved_by=approver,
+    return await _perform(
+        box,
+        tool,
+        Actuation(
+            business_id=business,
+            action_type=action_type,
+            target=target,
+            payload=dict(payload),
+            approved_by=approver,
+        ),
     )
+
+
+async def _perform(box: NodeToolbox, tool: str, actuation: Actuation) -> ActuationOutcome:
+    """The half of `_actuate` that does not build the actuation.
+
+    Split out for one caller that must NOT build its own: an owner notice is built by
+    `build_owner_notice_actuation`, because that helper is what derives the target handle
+    and stamps the recipient provenance. A node assembling that `Actuation` by hand is
+    exactly how an address ended up in `target` in the first place.
+    """
+    action_type, target = actuation.action_type, actuation.target
     try:
         outcome = await box.call(tool, actuation)
     except ToolNotAllowedError:
@@ -1593,51 +1647,99 @@ def _outcome_row(outcome: ActuationOutcome) -> dict[str, Any]:
     }
 
 
+#: Why nobody was told, per reason. Two causes, and they are fixed by different people:
+#: one is a deployment that has not been given a sending identity, the other is an account
+#: whose owner cannot be resolved.
+NO_NOTICE_IDENTITY_NOTE: Final = (
+    "Nobody was told: this deployment cannot send an owner notice. It needs both the "
+    "account holder's address, resolved from the authenticated account, and a sending "
+    "identity in OWNER_NOTICE_FROM. The published work is unaffected -- this is the notice "
+    "about it, not the work. Deliberately NOT read from the business profile's contact "
+    "address: that one comes from a crawled homepage, and a page we crawled must never be "
+    "able to redirect our own operational mail."
+)
+NO_NOTIFIER_NOTE: Final = (
+    "Nobody was told: no notification integration is configured on this deployment."
+)
+
+#: Why an owner notice carries no unsubscribe link, said in the message itself.
+#:
+#: In the body rather than only in a docstring because the recipient is the person who
+#: would otherwise wonder. `notify.owner` is transactional -- it reports what their own run
+#: did -- so an unsubscribe link would offer to switch off the product, and the actuator
+#: refuses one by name.
+NOTICE_FOOTER: Final = (
+    "You are getting this because this run belongs to your account. It is an operational "
+    "notice about work you asked for, not marketing, so there is nothing to unsubscribe "
+    "from -- switching it off would mean a run publishing and nobody being told."
+)
+
+
 async def _notify_owner(
     box: NodeToolbox,
-    state: AgentState,
     *,
     business: UUID,
     approver: str,
+    identity: OwnerNoticeIdentity | None,
     published: Sequence[str],
     not_published: Sequence[str],
+    note: str,
 ) -> dict[str, Any]:
     """Tell the owner what went live and what did not. One message, never per channel.
 
-    Sent even when everything failed -- especially then. "Nothing was published, and
-    here is which platform refused it" is the message with the most value in it, and a
-    notifier that only fires on success is how a silent failure stays silent.
-    """
-    address = str(state["dna"].get("email") or "").strip()
-    if not address:
-        return {
-            "notified": False,
-            "notify_note": (
-                "Nobody was told: this business profile has no email address on record."
-            ),
-        }
-    if not box.available(NOTIFY):
-        return {
-            "notified": False,
-            "notify_note": (
-                "Nobody was told: no notification integration is configured on this deployment."
-            ),
-        }
+    Sent even when everything failed -- especially then. "Nothing was published, and here
+    is which platform refused it" is the message with the most value in it, and a notifier
+    that only fires on success is how a silent failure stays silent.
 
-    outcome = await _actuate(
+    Three things about the message are load-bearing rather than incidental:
+
+    * **The recipient is the AUTHENTICATED account holder**, injected as `identity`. It
+      used to be `state["dna"]["email"]` -- a contact address scraped off the business's own
+      homepage -- so a crawled page could have redirected our operational mail. The node
+      never sees the database, and it never sees `dna` here either.
+    * **`build_owner_notice_actuation` builds the actuation**, so `target` is a derived
+      handle and not the address. The address used to travel in `target`, which
+      `actuate()` logs, `Outcome.summary()` renders and `_outcome_row` copies into
+      `runs.checkpoint` -- three routes to the Delivery tab and a log file at once.
+    * **`note` opens the body**, and it is the same sentence the run reports. It already
+      carries the SIMULATED caveat, so the owner cannot be told a post went live when
+      nothing left the process -- and there is one sentence to get right instead of two.
+    """
+    if identity is None:
+        return {"notified": False, "notify_note": NO_NOTICE_IDENTITY_NOTE}
+    if not box.available(NOTIFY):
+        return {"notified": False, "notify_note": NO_NOTIFIER_NOTE}
+
+    total = len(published) + len(not_published)
+    outcome = await _perform(
         box,
         NOTIFY,
-        business=business,
-        approver=approver,
-        action_type=NOTIFY_ACTION,
-        target=address,
-        payload={
-            "subject": f"Published {len(published)} of {len(published) + len(not_published)}",
-            "published": list(published),
-            "not_published": list(not_published),
-        },
+        build_owner_notice_actuation(
+            business_id=business,
+            identity=identity,
+            subject=f"Published {len(published)} of {total}",
+            approved_by=approver,
+            text=_notice_body(note, published, not_published),
+        ),
     )
     return {"notified": outcome.succeeded, "notify": _outcome_row(outcome)}
+
+
+def _notice_body(note: str, published: Sequence[str], not_published: Sequence[str]) -> str:
+    """The notice, in plain text.
+
+    Plain text and no HTML: this is a four-line operational message, and a second body part
+    is a second place for the truth to drift. Built entirely from the run's own outcome --
+    no crawled site text reaches it, so nothing a page we fetched said can end up in a
+    message our sending domain is answering for.
+    """
+    lines = [note, ""]
+    if published:
+        lines += ["Live:", *(f"  - {target}" for target in published), ""]
+    if not_published:
+        lines += ["Not published:", *(f"  - {target}" for target in not_published), ""]
+    lines.append(NOTICE_FOOTER)
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -2190,13 +2292,17 @@ __all__ = [
     "DEFAULT_CHANNELS",
     "LANDING_TARGET",
     "NOTHING_TO_PUBLISH_NOTE",
+    "NOTICE_FOOTER",
     "NOTIFY_ACTION",
     "NOT_APPROVED_NOTE",
     "NO_ACTUATOR_NOTE",
+    "NO_NOTICE_IDENTITY_NOTE",
+    "NO_NOTIFIER_NOTE",
     "PAGE_PUBLISH_ACTION",
     "PUBLISH_REVOKED_NOTE",
     "SOCIAL_POST_ACTION",
     "Node",
     "NodeDeps",
+    "OwnerNoticeIdentity",
     "build_nodes",
 ]

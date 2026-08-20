@@ -17,7 +17,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RetrievalTrace, RunReview } from "@/app/lib/review-api";
-import { ApproveGate, RunReviewTabs } from "@/app/runs/[runId]/review";
+import { DecisionGate, RunReviewTabs } from "@/app/runs/[runId]/review";
 
 /** The notes the API actually sends, each naming the node responsible. */
 const NOTES = {
@@ -621,7 +621,7 @@ describe("retrieval trace panel", () => {
  * where it can work, that its copy does not promise a post the machine will refuse, that
  * the two refusals stay two different sentences, and that success reads as work STARTED.
  */
-describe("the approve gate", () => {
+describe("the decision card: approve", () => {
   const APPROVABLE = "awaiting_approval";
 
   /** One fetch answer, shaped the way the API shapes it. */
@@ -644,7 +644,7 @@ describe("the approve gate", () => {
   }
 
   function gate(state: string, onApproved?: () => void) {
-    render(<ApproveGate runId="r1" runState={state} onApproved={onApproved} />);
+    render(<DecisionGate runId="r1" runState={state} onApproved={onApproved} />);
   }
 
   function approveButton(): HTMLElement {
@@ -658,7 +658,7 @@ describe("the approve gate", () => {
    */
   it("renders no approve control in any state other than awaiting_approval", () => {
     for (const state of ["queued", "running", "done", "failed", "partial"]) {
-      const { unmount } = render(<ApproveGate runId="r1" runState={state} />);
+      const { unmount } = render(<DecisionGate runId="r1" runState={state} />);
       expect(screen.queryByRole("button", { name: /approve/i })).toBeNull();
       unmount();
     }
@@ -671,7 +671,7 @@ describe("the approve gate", () => {
    * tab's own docstring already refuses for Publish.
    */
   it("does not offer a disabled approve control instead of hiding it", () => {
-    const { container } = render(<ApproveGate runId="r1" runState="done" />);
+    const { container } = render(<DecisionGate runId="r1" runState="done" />);
 
     expect(container.querySelectorAll("button")).toHaveLength(0);
     expect(container.textContent?.toLowerCase() ?? "").not.toContain("approve");
@@ -691,7 +691,7 @@ describe("the approve gate", () => {
    * one screen where a person is deciding whether to let it happen.
    */
   it("says what approving does per destination, and does not promise a post that will refuse", () => {
-    const { container } = render(<ApproveGate runId="r1" runState={APPROVABLE} />);
+    const { container } = render(<DecisionGate runId="r1" runState={APPROVABLE} />);
     const text = container.textContent ?? "";
 
     // It names the thing approval unlocks, in the machine's own terms.
@@ -717,7 +717,7 @@ describe("the approve gate", () => {
 
   /** The approver is the session's, so the screen must not imply it is choosing one. */
   it("states that the approver comes from the session rather than from this screen", () => {
-    const { container } = render(<ApproveGate runId="r1" runState={APPROVABLE} />);
+    const { container } = render(<DecisionGate runId="r1" runState={APPROVABLE} />);
 
     expect(container.textContent ?? "").toMatch(/taken from your session/i);
   });
@@ -819,7 +819,7 @@ describe("the approve gate", () => {
       const user = userEvent.setup();
       stubApprove(refused(code, message));
       const { container, unmount } = render(
-        <ApproveGate runId="r1" runState={APPROVABLE} />,
+        <DecisionGate runId="r1" runState={APPROVABLE} />,
       );
       await user.click(screen.getByRole("button", { name: /approve/i }));
       await settle();
@@ -842,14 +842,364 @@ describe("the approve gate", () => {
   });
 
   /**
-   * Reject is deliberately absent — it needs a terminal state `runs.state`'s CHECK
-   * constraint does not have, so it is a schema change and an open decision, not a control
-   * somebody forgot. A disabled one would announce it as nearly here.
+   * Reject lives in this card too — a decision surface with one option is a prompt, not a
+   * decision. What is asserted here is only that it is SECONDARY and quiet: approve is the
+   * intended path, and the reject control must not be the filled primary button, must not
+   * be painted in the error colour, and must not be the thing a reviewer's eye lands on
+   * first. Its behaviour is covered in "the decision card: reject" below.
    */
-  it("offers no reject control, disabled or otherwise", () => {
-    const { container } = render(<ApproveGate runId="r1" runState={APPROVABLE} />);
+  it("offers reject beside approve, secondary to it and not in an alarm colour", () => {
+    render(<DecisionGate runId="r1" runState={APPROVABLE} />);
 
-    expect(screen.queryByRole("button", { name: /reject|decline|deny/i })).toBeNull();
+    const approve = screen.getByRole("button", { name: /approve/i });
+    const reject = screen.getByRole("button", { name: /reject/i });
+
+    // Approve is the filled primary; reject is not filled at all.
+    expect(approve.getAttribute("style") ?? "").toContain("--primary");
+    expect(reject.getAttribute("style") ?? "").not.toContain("--primary");
+    // And rejecting is a decision, not a fault, so it is not painted like one.
+    expect(reject.getAttribute("style") ?? "").not.toContain("--err");
+    expect(reject.getAttribute("style") ?? "").not.toContain("--warn");
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* The decision card: reject                                                  */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The other half of the gate, and the half that is easy to get wrong in a way nobody
+ * notices for months.
+ *
+ * A rejection is terminal, irreversible, and the reason a reviewer types is the ENTIRE
+ * record of it — nothing is written to `feedback`, because no run has a content piece at
+ * review. So these tests are about four claims: that the control exists only where the API
+ * accepts it, that a reason short enough to be refused never leaves the browser, that what
+ * is shown afterwards is the STORED reason rather than the typed one, and that the whole
+ * thing reads as a decision a person made instead of a failure the machine had.
+ */
+describe("the decision card: reject", () => {
+  const APPROVABLE = "awaiting_approval";
+
+  /** One fetch answer, shaped the way the API shapes it. */
+  function stub(outcome: { ok: boolean; status: number; body: unknown }) {
+    const mock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: outcome.ok,
+        status: outcome.status,
+        json: () => Promise.resolve(outcome.body),
+      } as unknown as Response),
+    );
+    vi.stubGlobal("fetch", mock);
+    return mock;
+  }
+
+  /** 200 with the STORED reason, which is what the route reads back after writing. */
+  function stored(finishedReason: string | null) {
+    return {
+      ok: true,
+      status: 200,
+      body: { runId: "r1", state: "rejected", finishedReason },
+    };
+  }
+
+  function rejectButton(): HTMLElement {
+    return screen.getByRole("button", { name: /^reject this run instead$/i });
+  }
+
+  function confirmButton(): HTMLElement {
+    return screen.getByRole("button", { name: /^reject this run permanently$/i });
+  }
+
+  function reasonField(): HTMLElement {
+    return screen.getByLabelText(/why are you rejecting it/i);
+  }
+
+  /** Open the second step and type a reason into it. */
+  async function openAndType(user: ReturnType<typeof userEvent.setup>, reason: string) {
+    await user.click(rejectButton());
+    if (reason) await user.type(reasonField(), reason);
+  }
+
+  /**
+   * The same rule as approve's, and it has to be asserted separately because the states are
+   * not the same list: `rejected` is now one of them, so a second reject would be a 409 and
+   * a control offering it would be a control whose only outcome is a refusal.
+   */
+  it("renders no reject control in any state other than awaiting_approval", () => {
+    for (const state of ["queued", "running", "done", "failed", "partial", "rejected"]) {
+      const { unmount } = render(<DecisionGate runId="r1" runState={state} />);
+      expect(screen.queryByRole("button", { name: /reject/i })).toBeNull();
+      unmount();
+    }
+  });
+
+  /**
+   * "Absent" and "present but disabled" pass a careless query identically. A greyed-out
+   * Reject on a rejected run announces a decision that has already been made as one still
+   * available.
+   */
+  it("does not offer a disabled reject control instead of hiding it", () => {
+    const { container } = render(<DecisionGate runId="r1" runState="rejected" />);
+
+    expect(container.querySelectorAll("button")).toHaveLength(0);
     expect(container.textContent?.toLowerCase() ?? "").not.toContain("reject");
+  });
+
+  /**
+   * Two steps, and the first one sends nothing. A single click that ends a run for good is
+   * the failure this shape exists to prevent — and the reason field must not be standing in
+   * front of the approve path for the many reviewers who were never going to reject.
+   */
+  it("asks for a reason before it will send anything", async () => {
+    const user = userEvent.setup();
+    const fetchMock = stub(stored("anything"));
+    render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    // Step one is not even rendered yet.
+    expect(screen.queryByLabelText(/why are you rejecting it/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /permanently/i })).toBeNull();
+
+    await user.click(rejectButton());
+
+    expect(reasonField()).toBeInTheDocument();
+    expect(confirmButton()).toBeInTheDocument();
+    // Opening the field is not a decision.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Requirement 3: the cost is stated BEFORE the click. A confirmation that says "this
+   * could not be undone" afterwards is an apology, not a warning — and there is no route
+   * anywhere that reverses a rejection, so this sentence is load-bearing rather than
+   * decorative.
+   */
+  it("says rejecting is final, and how to recover, before the button that does it", async () => {
+    const user = userEvent.setup();
+    stub(stored("anything"));
+    const { container } = render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    await user.click(rejectButton());
+    const text = container.textContent ?? "";
+
+    expect(text).toMatch(/cannot be undone/i);
+    expect(text).toMatch(/new run/i);
+    // And the reason is described as the whole record, because it is: nothing else about a
+    // rejection is stored anywhere.
+    expect(text).toMatch(/whole record/i);
+  });
+
+  /**
+   * The client mirrors the API's bounds so a nine-character reason is refused HERE, in its
+   * own sentence, rather than round-tripping into a 422 whose wording is a validation
+   * string about string length.
+   */
+  it("refuses a too-short reason in its own sentence and never sends it", async () => {
+    const user = userEvent.setup();
+    const fetchMock = stub(stored("never used"));
+    render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    await openAndType(user, "too short");
+    await user.click(confirmButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/at least 10 characters/i);
+    // The assertion the whole client-side mirror exists for.
+    expect(fetchMock).not.toHaveBeenCalled();
+    // And the field is still there to fix, rather than the card having moved on.
+    expect(reasonField()).toBeInTheDocument();
+  });
+
+  /**
+   * The API collapses whitespace BEFORE applying the bounds, so a field full of spaces is
+   * not a reason. A client measuring `raw.length` would send it and be refused by a 422 it
+   * had just told the person could not happen.
+   */
+  it("measures the reason the way the API does, so whitespace is not a reason", async () => {
+    const user = userEvent.setup();
+    const fetchMock = stub(stored("never used"));
+    render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    await openAndType(user, "  a       b  ");
+    await user.click(confirmButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/at least 10 characters/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The wire shape, and then the part that matters more: the card renders the reason the
+   * API READ BACK, not the one it sent. They differ — the API collapses whitespace before
+   * storing — and the response carries the stored one precisely so the screen shows what is
+   * on the record.
+   */
+  it("sends only a reason and shows the STORED one back", async () => {
+    const user = userEvent.setup();
+    const fetchMock = stub(stored("The draft claims we are the cheapest, which we cannot say."));
+    const onRejected = vi.fn();
+    render(<DecisionGate runId="r1" runState={APPROVABLE} onRejected={onRejected} />);
+
+    await openAndType(user, "The  draft   claims  we are the cheapest");
+    await user.click(confirmButton());
+    await settle();
+
+    const call = fetchMock.mock.calls[0];
+    expect(String(call?.[0])).toContain("/api/v1/runs/r1/reject");
+    expect(call?.[1]?.method).toBe("POST");
+    // Whitespace collapsed, so what was validated is what was sent.
+    expect(call?.[1]?.body).toBe(
+      JSON.stringify({ reason: "The draft claims we are the cheapest" }),
+    );
+    // A rejection authorises nothing and sends nothing, so no rejecter is recorded and
+    // none may be offered from here.
+    const sent = JSON.stringify(call?.[1] ?? {});
+    expect(sent).not.toContain("rejecter");
+    expect(sent).not.toContain("rejectedBy");
+    expect(sent).not.toContain("approver");
+
+    // The STORED reason, which is deliberately NOT the string typed above.
+    expect(
+      screen.getByText("The draft claims we are the cheapest, which we cannot say."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("The draft claims we are the cheapest")).toBeNull();
+
+    // The screen around the card is told, so the state pill stops saying "awaiting
+    // approval" for a run that is over.
+    expect(onRejected).toHaveBeenCalled();
+  });
+
+  /**
+   * THE test for this task. A rejected run is a decision, and every word and colour here
+   * has to say so: the person is named as the actor, nothing is described as a failure or
+   * an error, and no alarm token appears. The failure this catches is the easy one to ship
+   * — reusing the failure register because a rejection is also "the run did not publish".
+   */
+  it("reads as a decision the reviewer made, not as a fault the machine had", async () => {
+    const user = userEvent.setup();
+    stub(stored("Tone is wrong for our customers, and two claims are unsupported."));
+    const { container } = render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    await openAndType(user, "Tone is wrong for our customers");
+    await user.click(confirmButton());
+    await settle();
+
+    const text = container.textContent ?? "";
+    // The person is the actor.
+    expect(text).toMatch(/you rejected this run/i);
+    // It says plainly that the machine did the work and the human refused the output.
+    expect(text).toMatch(/not on a fault/i);
+    // Nothing was published, stated rather than implied.
+    expect(text).toMatch(/nothing was published/i);
+    // And it is honest about there being no way back except a new run.
+    expect(text).toMatch(/cannot be undone/i);
+
+    // The failure vocabulary, asserted as explicit negatives: the mistake here is a word
+    // borrowed from the failed path, not a missing one.
+    expect(text).not.toMatch(/failed/i);
+    expect(text).not.toMatch(/error/i);
+    expect(text).not.toMatch(/something went wrong/i);
+    expect(text).not.toMatch(/sorry/i);
+
+    // No alarm token anywhere in the confirmation, which is the colour half of the same
+    // claim -- `--err` is the failed register and `--warn` is the shortfall one.
+    expect(container.innerHTML).not.toContain("--err");
+    expect(container.innerHTML).not.toContain("--warn");
+  });
+
+  /**
+   * The 409 is the same CODE as approve's, deliberately — it is the same condition. The
+   * guidance is not, and must not be: somebody whose rejection was refused needs to know
+   * the run may already be approved and publishing, which is the one case where what they
+   * do next matters.
+   */
+  it("renders the 409's own sentence and reject's own guidance, not approve's", async () => {
+    const user = userEvent.setup();
+    stub({
+      ok: false,
+      status: 409,
+      body: {
+        detail: {
+          code: "run_not_awaiting_approval",
+          message:
+            "This run is running, not waiting for approval. Only a run parked at the review gate can be rejected.",
+        },
+      },
+    });
+    const onRejected = vi.fn();
+    render(<DecisionGate runId="r1" runState={APPROVABLE} onRejected={onRejected} />);
+
+    await openAndType(user, "Tone is wrong for our customers");
+    await user.click(confirmButton());
+    await settle();
+
+    // The server's own sentence, which names the actual state and says "rejected".
+    expect(screen.getByRole("alert")).toHaveTextContent(/can be rejected/);
+    const text = document.body.textContent ?? "";
+    expect(text).toMatch(/may already have been rejected/i);
+    // Approve's guidance, which would send them to check the wrong thing.
+    expect(text).not.toMatch(/approved this run already/i);
+    expect(text).not.toMatch(/nothing to publish/i);
+    // The refusal means this screen was out of date, so it re-reads.
+    expect(onRejected).toHaveBeenCalled();
+  });
+
+  /**
+   * The client refuses a short reason before it can be sent, so a 422 should be
+   * unreachable. "Unreachable" and "cannot happen" are different — if the API's bounds ever
+   * move, its refusal has to be rendered honestly rather than swallowed or relabelled.
+   */
+  it("renders the server's 422 verbatim if one arrives anyway", async () => {
+    const user = userEvent.setup();
+    stub({
+      ok: false,
+      status: 422,
+      body: { detail: [{ msg: "String should have at least 12 characters" }] },
+    });
+    render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    await openAndType(user, "Tone is wrong for our customers");
+    await user.click(confirmButton());
+    await settle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent(/at least 12 characters/);
+    // And the bounds are named, rather than leaving a bare validation string as the whole
+    // explanation.
+    expect(document.body.textContent ?? "").toMatch(/between 10 and 240 characters/i);
+  });
+
+  /** Backing out is a real option, and it must not send anything either. */
+  it("lets the reviewer back out without deciding", async () => {
+    const user = userEvent.setup();
+    const fetchMock = stub(stored("never used"));
+    render(<DecisionGate runId="r1" runState={APPROVABLE} />);
+
+    await user.click(rejectButton());
+    await user.click(screen.getByRole("button", { name: /keep it parked/i }));
+
+    expect(screen.queryByLabelText(/why are you rejecting it/i)).toBeNull();
+    expect(rejectButton()).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /approve/i })).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* What survives a rejection                                                  */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The reject route leaves `runs.checkpoint` INTACT, and this is the screen that makes that
+ * decision worth anything: a refused draft is still evidence of work the owner paid for,
+ * and a reviewer has to be able to see what they refused after refusing it.
+ */
+describe("the review tabs after a rejection", () => {
+  it("still render every tab for a rejected run", async () => {
+    render(<RunReviewTabs runId="r1" runState="rejected" />);
+    await settle();
+
+    for (const label of [/Draft/, /SEO findings/, /Social/, /AI blocks/, /Retrieval/, /Delivery/]) {
+      expect(screen.getByRole("tab", { name: label })).toBeInTheDocument();
+    }
   });
 });

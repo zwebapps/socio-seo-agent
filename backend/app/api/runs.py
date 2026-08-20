@@ -25,7 +25,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,7 +60,22 @@ POLL_INTERVAL_S = 0.4
 MAX_STREAM_SECONDS = 15 * 60
 
 #: States that mean "no further events are coming".
-TERMINAL = frozenset({"awaiting_approval", "done", "failed", "partial"})
+#:
+#: `rejected` belongs here for the plainest reason: nothing will ever move a rejected run,
+#: so without it the stream would sit out the full `MAX_STREAM_SECONDS` waiting for events
+#: that cannot come -- fifteen minutes of held connection per reload of a finished screen.
+TERMINAL = frozenset({"awaiting_approval", "done", "failed", "partial", "rejected"})
+
+#: How long a rejection reason may be. The floor exists because a reasonless rejection is
+#: the one input this product can do nothing with, and the reviewer is the only person who
+#: will ever know why; ten characters costs a real sentence nothing and stops `no`/`bad`.
+#:
+#: The ceiling is 240 and NOT 255, which is the width of `runs.finished_reason`, because
+#: `clamp_reason` truncates SILENTLY. Shortening a provider stack trace is cosmetic;
+#: shortening a person's stated reason is not. So the 422 here is the only length refusal a
+#: human can ever meet, and the clamp stays a backstop for machine-authored reasons.
+REJECT_REASON_MIN = 10
+REJECT_REASON_MAX = 240
 
 
 async def business_for_user(user_id: UUID, *, session: AsyncSession) -> UUID | None:
@@ -163,6 +178,36 @@ class StartRunRequest(BaseModel):
 class StartRunResponse(CamelModel):
     run_id: UUID
     state: str
+
+
+class RejectRunRequest(BaseModel):
+    """A reviewer's refusal. The reason is REQUIRED, and bounded at both ends.
+
+    Whitespace is collapsed BEFORE the bounds are applied, so 400 spaces is not a reason
+    and neither is `"          "`. A `mode="before"` validator runs ahead of the string
+    constraints, which is what makes the collapse count rather than merely tidy up
+    something already accepted.
+    """
+
+    reason: str = Field(min_length=REJECT_REASON_MIN, max_length=REJECT_REASON_MAX)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _collapse_whitespace(cls, value: object) -> object:
+        return " ".join(value.split()) if isinstance(value, str) else value
+
+
+class RunDecisionResponse(CamelModel):
+    """What a completed human decision looks like coming back.
+
+    Its own model rather than `StartRunResponse`, and `finished_reason` is the point: the
+    response echoes the STORED reason, so the screen renders what was persisted rather than
+    what it happened to send.
+    """
+
+    run_id: UUID
+    state: str
+    finished_reason: str | None
 
 
 class EventOut(CamelModel):
@@ -497,7 +542,12 @@ async def resume_run(
     """
     run = await _require_own_run(run_id, business_id, service)
 
-    if run.state in {"done", "failed", "partial"}:
+    # `rejected` is in this set because leaving it out is not a cosmetic omission: a
+    # rejected run is not `awaiting_approval` any more either, so it would fall past BOTH
+    # refusals and reach `executor.submit(..., resume=True)` -- which continues the graph
+    # from the checkpoint straight through EXPORT and PUBLISHES the very draft a human just
+    # refused. The review gate would be bypassable by pressing the button next to it.
+    if run.state in {"done", "failed", "partial", "rejected"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -601,6 +651,88 @@ async def approve_run(
 
     executor.submit(run.id, business_id, run.goal, resume=True)
     return StartRunResponse(run_id=run.id, state="running")
+
+
+@router.post(
+    "/{run_id}/reject",
+    response_model=RunDecisionResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_200_OK,
+    summary="Refuse a parked run's output, terminally",
+)
+async def reject_run(
+    run_id: UUID,
+    payload: RejectRunRequest,
+    business_id: Annotated[UUID, Depends(current_business)],
+    service: Annotated[RunService, Depends(get_run_service)],
+) -> RunDecisionResponse:
+    """The other half of the review gate: a reviewer says no, and it sticks.
+
+    **200, not 202.** Approve is 202 because it starts minutes of work. Rejecting starts
+    none — one UPDATE and the run is over — so the work IS complete when this returns, and
+    202 would be a claim that something is still happening.
+
+    **Terminal and not reversible.** The recovery from a rejection is a NEW run, which
+    re-derives from current documents instead of republishing what was refused. So a second
+    reject, and an approve-after-reject, are both the existing 409
+    `run_not_awaiting_approval` — no new vocabulary, and never a silent no-op: the caller
+    believes they are deciding something, and the honest answer is that it is already
+    decided.
+
+    **The rejecter is deliberately NOT recorded, and this route takes no `CurrentUser` for
+    exactly that reason.** `approved_by` exists because an approval authorises an outward
+    publish and lands on every `actions` row; a rejection authorises nothing and sends
+    nothing. There is one user per business today, so a `rejected_by` column would store
+    what `business_id` already implies. A session is still required — `current_business`
+    resolves through the authenticated user, so an anonymous caller is 401 here as
+    everywhere else.
+
+    **Nothing is written to `feedback`.** `Feedback.content_piece_id` is NOT NULL, and the
+    only thing that ever creates a `content_pieces` row is the `publish.page` actuator at
+    EXPORT — which is AFTER this gate. So no run has a content piece at review, approved or
+    rejected, and hanging a rejection on one would mean inventing the row to hang it on.
+    The rejection is recorded on the run itself: `state` plus `finished_reason`, and that is
+    the whole record.
+
+    **`runs.checkpoint` is left INTACT.** The review tabs are projected from it, and a
+    refused draft is still evidence of work the owner paid for — clearing it would make the
+    screen unable to show what was refused. This route also never touches the executor:
+    there is nothing to start, and nothing to stop.
+
+    **No `no_checkpoint` refusal**, the one deliberate divergence from approve. Approve
+    needs a checkpoint because the approval is written INTO it; a rejection writes nothing
+    there, and a run parked having produced nothing is precisely what a reviewer should be
+    able to dismiss. A reviewer must always be able to say no.
+
+    **No `run_already_executing` guard either.** After `await_approval` the executor's task
+    returns and makes no further write, so the only window in which a parked run is still
+    live is one where nothing can overwrite the rejection. Guarding it would refuse a
+    legitimately parked run for a race that cannot happen.
+    """
+    run = await _require_own_run(run_id, business_id, service)
+
+    if run.state != "awaiting_approval":
+        # The SAME code as approve, because it is the same condition -- which lets one
+        # client handler serve both buttons. Only the sentence differs.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_not_awaiting_approval",
+                "message": (
+                    f"This run is {run.state}, not waiting for approval. "
+                    "Only a run parked at the review gate can be rejected."
+                ),
+            },
+        )
+
+    await service.finish(run_id, outcome="rejected", reason=payload.reason)
+
+    # Read back rather than echo the request: the response's job is to report what was
+    # PERSISTED, so the screen renders the stored reason and not the one it typed.
+    stored = await _require_own_run(run_id, business_id, service)
+    return RunDecisionResponse(
+        run_id=stored.id, state=stored.state, finished_reason=stored.finished_reason
+    )
 
 
 @router.get("/{run_id}/events")

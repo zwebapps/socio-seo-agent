@@ -370,3 +370,54 @@ async def test_a_cursor_page_misses_nothing_across_a_walk(
 
     assert len(walked) == len(set(walked)), "a run must not appear on two pages"
     assert set(walked) == {run.id for run in created}, "no run may be skipped"
+
+
+# --------------------------------------------------------------------------- #
+# The rejected state, against the constraint that can actually refuse it
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_rejected_run_persists_through_the_real_check_constraint(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """`InMemoryRunStore` is a dict and would accept `state="banana"`.
+
+    The only thing that can prove the seventh value is actually permitted is
+    `ck_runs_state_valid` itself -- so this test fails, with a `CheckViolationError`, on any
+    database where migration `e6a1c3f5b28d` has not been applied. That is the point: a
+    literal widened in Python and not in the schema passes every unit test in the suite and
+    then raises on the first real rejection.
+    """
+    from backend.app.services.run_service import RunService
+
+    store = PostgresRunStore(business_a)
+    service = RunService(store)
+    run = await store.create(_run(business_a))
+
+    await service.finish(run.id, outcome="rejected", reason="Tone is wrong for this client")
+
+    rejected = await store.get(run.id)
+    assert rejected is not None
+    assert rejected.state == "rejected", "the constraint must permit the human decision"
+    assert rejected.finished_reason == "Tone is wrong for this client"
+
+
+async def test_rejecting_does_not_disturb_the_checkpoint(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The review tabs are projected from `runs.checkpoint`, and a refused draft is still
+    evidence of work the owner paid for. Asserted against real JSONB because that is where
+    a stray `UPDATE ... SET checkpoint = '{}'` would show up."""
+    from backend.app.services.run_service import RunService
+
+    store = PostgresRunStore(business_a)
+    service = RunService(store)
+    run = await store.create(_run(business_a))
+    run.checkpoint = {"draft_html": "<h1>Notar in Koblenz</h1>", "outcome": "awaiting_approval"}
+    await store.update(run)
+
+    await service.finish(run.id, outcome="rejected", reason="Tone is wrong for this client")
+
+    after = await store.get(run.id)
+    assert after is not None
+    assert after.checkpoint["draft_html"] == "<h1>Notar in Koblenz</h1>"

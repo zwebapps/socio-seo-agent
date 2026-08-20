@@ -36,7 +36,7 @@
  * that the retry loop is real.
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useState, type ReactNode } from "react";
 import { Pill, SoftButton, SoftCard, SoftWell } from "../../components/soft";
 import { SoftTabs, type TabSpec } from "../../components/tabs";
 import { SafeHtml } from "../../components/safe-html";
@@ -58,10 +58,19 @@ import {
   type SeoReport,
   type SocialPost,
 } from "../../lib/review-api";
-// The approve gate's only mutation, and the predicate that decides whether the gate
-// renders a control at all. Both live with the other run mutations rather than here, so
-// "which states does the API accept" has one home.
-import { approveRun, canApprove } from "../../lib/runs-api";
+// The decision card's two mutations, the predicates that decide whether it renders a
+// control at all, and the bounds on a rejection reason. All of them live with the other
+// run mutations rather than here, so "which states does the API accept, and what does it
+// accept as a reason" has one home.
+import {
+  approveRun,
+  canApprove,
+  canReject,
+  cleanRejectReason,
+  REJECT_REASON_MAX,
+  REJECT_REASON_MIN,
+  rejectRun,
+} from "../../lib/runs-api";
 import { CopyButton } from "./copy-button";
 import { ExportPanel } from "./export";
 
@@ -214,37 +223,78 @@ const APPROVE_REFUSAL: Record<string, string> = {
 };
 
 /**
- * The approve gate: the one control that lets a reviewed run publish.
+ * What a reject refusal means for the person reading it, keyed on the API's own `code`.
  *
- * The route has existed, tested, with nothing calling it — so a reviewer could read every
- * tab on this screen and had no way to say yes. The only button here was Resume, which
- * deliberately refuses a parked run ("waiting for a human decision, not stalled"), i.e.
- * the reviewer's only available control was the one that could not help them.
+ * Deliberately its own map and not a shared one with `APPROVE_REFUSAL`, even though the
+ * API answers `run_not_awaiting_approval` from both routes with the same code: the guidance
+ * differs because the intent did. Somebody whose approval was refused should be told the
+ * run may already be going; somebody whose REJECTION was refused should be told it may
+ * already be rejected, or already approved and publishing — which is the one case here
+ * where the next thing they do matters. One map serving both buttons would send half of
+ * them to check the wrong thing.
  *
- * Three rules this component follows, each because the alternative misleads:
+ * `invalid` is the 422 the length bounds produce. The field below refuses a short reason
+ * before it can be sent, so this should be unreachable — it is here because "unreachable"
+ * and "cannot happen" are different, and the honest answer to a bound that has drifted is
+ * to name the bound rather than to show a bare validation string.
  *
- * - **It renders no control outside `awaiting_approval`.** Not a disabled one: a
+ * An unrecognised code falls through to the server's sentence alone, for the same reason
+ * `APPROVE_REFUSAL` does: the server owns this vocabulary and a browser tab is older than
+ * the API it is talking to.
+ */
+const REJECT_REFUSAL: Record<string, string> = {
+  run_not_awaiting_approval:
+    "The state shown here was out of date, and has just been re-read. This run may " +
+    "already have been rejected, or it may have been approved and be publishing now — " +
+    "the state above says which.",
+  invalid:
+    `A reason has to be between ${REJECT_REASON_MIN} and ${REJECT_REASON_MAX} characters ` +
+    "once repeated spaces and line breaks are collapsed.",
+};
+
+/**
+ * The decision card: the two things a reviewer can do with a parked run.
+ *
+ * Both live here, in ONE card, because a decision surface with a single option is not a
+ * decision — it is a prompt with a button. For most of this project's life the route to
+ * approve existed, tested, with nothing calling it, and there was no route to refuse at
+ * all: a reviewer could read every tab on this screen and the only control offered was
+ * Resume, which deliberately refuses a parked run.
+ *
+ * Rules this component follows, each because the alternative misleads:
+ *
+ * - **Neither control renders outside `awaiting_approval`.** Not a disabled one: a
  *   greyed-out "Approve" on a queued run announces a decision that is not theirs to make
  *   yet, and on a finished run implies one that can still be made. Same reasoning as the
  *   export tab's refusal to show a disabled "Publish".
+ * - **Approve is the primary action and reject is not.** Approving is the intended path —
+ *   the run exists to publish something — so reject is visually quiet, and pointedly NOT
+ *   red: nothing is broken when a person decides against work they asked for, and an
+ *   alarm colour would tell them something went wrong.
+ * - **Rejecting takes two steps.** Choosing it reveals the reason field rather than
+ *   sending anything, so "no" is never one careless click on a terminal, irreversible
+ *   action — and the required field is not left standing in front of the approve path for
+ *   everyone who was never going to use it.
+ * - **The cost of rejecting is stated BEFORE the click, not after.** It cannot be undone
+ *   from here or anywhere else; the recovery is a new run. A confirmation that says so
+ *   afterwards is an apology, not a warning.
  * - **It says what approving DOES before it is clicked, per destination, without
  *   overstating it.** EXPORT and MEASURE sit after REVIEW and are unreachable without
  *   this, so approving is genuinely what lets the run publish — but on this deployment the
  *   landing page is the only destination that publishes for real, social refuses without a
  *   connected account, and email needs a key. Promising "your posts go live" would be a
  *   claim the machine then refuses, on the one screen where the owner is deciding.
- * - **Success reports work STARTED, never finished.** The API answers 202 with state
- *   `running`: EXPORT and MEASURE take minutes. A confirmation reading "published" would
- *   be a finished-sounding word for a thing still in progress.
- *
- * There is no reject button, and deliberately not a disabled one. Rejecting needs a
- * terminal state `runs.state`'s CHECK constraint does not have, so it is a schema change
- * and an open decision (BACKLOG A10b) rather than a control someone forgot to wire up.
+ * - **Success reports what actually happened.** Approve answers 202 with state `running`:
+ *   EXPORT and MEASURE take minutes, so it reports work STARTED, never "published".
+ *   Reject answers 200 and the run is over, so it reports a DECISION — and it renders the
+ *   reason the API read back rather than the string this screen sent, because the API
+ *   collapses whitespace before storing and what was persisted is the record.
  */
-export function ApproveGate({
+export function DecisionGate({
   runId,
   runState,
   onApproved,
+  onRejected,
 }: {
   runId: string;
   runState: string;
@@ -255,10 +305,33 @@ export function ApproveGate({
    * treats as a bug rather than a rough edge.
    */
   onApproved?: () => void;
+  /**
+   * Told that the run is over. Separate from `onApproved` on purpose: approving restarts
+   * an event stream because minutes of work follow it, and rejecting must not — a rejected
+   * run is terminal, and re-opening a stream for it would hold a connection waiting for
+   * events that cannot come.
+   */
+  onRejected?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [started, setStarted] = useState(false);
   const [refusal, setRefusal] = useState<{ code: string; message: string } | null>(null);
+  /**
+   * Whether the reject step has been opened, and what has been typed into it.
+   *
+   * `intent` is what makes rejecting two steps. It is not "show a modal": the field
+   * appears in place, under the card's own copy about what rejecting costs, so the warning
+   * and the control that acts on it are read together.
+   */
+  const [intent, setIntent] = useState<"none" | "reject">("none");
+  const [reason, setReason] = useState("");
+  /** The client's own refusal of a too-short reason, kept apart from the server's. */
+  const [reasonError, setReasonError] = useState<string | null>(null);
+  /** What the API stored, once it has. Rendered instead of what was typed. */
+  const [rejected, setRejected] = useState<{ finishedReason: string | null } | null>(null);
+
+  const reasonId = useId();
+  const reasonHintId = useId();
 
   async function approve() {
     setBusy(true);
@@ -284,6 +357,41 @@ export function ApproveGate({
     }
   }
 
+  async function reject() {
+    // Measured the API's way -- whitespace collapsed first -- so what this checks is the
+    // same string the API will bound. A `reason.length` check here would pass forty
+    // newlines and then be refused by a 422 this screen had promised could not happen.
+    const cleaned = cleanRejectReason(reason);
+    if (cleaned.length < REJECT_REASON_MIN) {
+      setReasonError(
+        `Give a reason of at least ${REJECT_REASON_MIN} characters. It is the only record ` +
+          "of why this run was refused — nothing else about a rejection is stored.",
+      );
+      return;
+    }
+
+    setBusy(true);
+    setRefusal(null);
+    setReasonError(null);
+    try {
+      const decision = await rejectRun(runId, cleaned);
+      // The STORED reason, read back by the API after it wrote. Not `cleaned`: the point
+      // of the response carrying it is that the screen shows what is on the record.
+      setRejected({ finishedReason: decision.finishedReason });
+      onRejected?.();
+    } catch (exc) {
+      if (exc instanceof ApiError) {
+        setRefusal({ code: exc.code, message: exc.message });
+        // Same reasoning as approve's: this refusal means the screen was out of date.
+        if (exc.code === "run_not_awaiting_approval") onRejected?.();
+      } else {
+        setRefusal({ code: "unknown", message: "The rejection could not be sent." });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (started) {
     return (
       <SoftCard className="mt-6 p-5" size="md" as="div">
@@ -302,8 +410,53 @@ export function ApproveGate({
     );
   }
 
-  // No control in any other state, rather than a disabled one. See the docstring.
-  if (!canApprove(runState)) return null;
+  /*
+   * The confirmation for a rejection, and the reason it is written in this register.
+   *
+   * A rejected run is a DECISION, not a fault. So: no `--err`, no `--warn`, no "failed",
+   * no apology — the heading names the person as the actor, the copy says plainly that the
+   * machine did its work and a human refused the output, and the reason is shown as a
+   * record rather than as an error message. The same rule is why `runStateTone("rejected")`
+   * is `muted`: paint this like a crash and the owner reads it as one.
+   */
+  if (rejected) {
+    return (
+      <SoftCard className="mt-6 p-5" size="md" as="div">
+        <div className="flex flex-wrap items-baseline justify-between gap-3">
+          <h2 className="text-sm font-semibold">You rejected this run</h2>
+          <Pill tone="muted">your decision</Pill>
+        </div>
+        <p className="mt-1.5 text-sm" style={{ color: "var(--text-muted)" }} aria-live="polite">
+          Nothing was published and nothing was measured — EXPORT and MEASURE never ran.
+          The run is closed on your decision, not on a fault: it did the work and you
+          refused the output.
+        </p>
+
+        {rejected.finishedReason && (
+          <SoftWell className="mt-4 p-4">
+            <p
+              className="text-xs font-semibold uppercase tracking-wider"
+              style={{ color: "var(--text-muted)" }}
+            >
+              Your reason, as recorded
+            </p>
+            <p className="mt-1.5 text-sm">{rejected.finishedReason}</p>
+          </SoftWell>
+        )}
+
+        <p className="mt-4 text-sm" style={{ color: "var(--text-muted)" }}>
+          This cannot be undone. When you want another attempt, start a new run — it works
+          from the current documents rather than republishing what was refused. The draft
+          and everything else this run produced stays readable below.
+        </p>
+      </SoftCard>
+    );
+  }
+
+  // No control in any state either endpoint would refuse, rather than a disabled one. See
+  // the docstring. Both predicates are checked because they are two predicates: they agree
+  // today, and the day they stop agreeing this card must offer whichever still applies.
+  if (!canApprove(runState) && !canReject(runState)) return null;
 
   return (
     <SoftCard className="mt-6 p-6" size="md" as="div">
@@ -315,7 +468,8 @@ export function ApproveGate({
       <p className="mt-2 text-sm" style={{ color: "var(--text-muted)" }}>
         This run is parked at the review gate. EXPORT and MEASURE come after it and cannot
         run until you approve, so nothing has been published and nothing has been measured
-        yet. Approving is the step that lets this run publish.
+        yet. Approving is the step that lets this run publish; rejecting closes the run for
+        good without publishing any of it.
       </p>
 
       <h3
@@ -357,24 +511,136 @@ export function ApproveGate({
       </p>
 
       <div className="mt-5 flex flex-wrap items-center gap-3">
-        <SoftButton variant="primary" onClick={() => void approve()} disabled={busy}>
-          {busy ? "Approving…" : "Approve and let this run publish"}
-        </SoftButton>
-        <span className="text-xs" style={{ color: "var(--text-faint)" }}>
-          Starts work that takes a few minutes.
-        </span>
+        {canApprove(runState) && (
+          <>
+            <SoftButton variant="primary" onClick={() => void approve()} disabled={busy}>
+              {busy ? "Approving…" : "Approve and let this run publish"}
+            </SoftButton>
+            <span className="text-xs" style={{ color: "var(--text-faint)" }}>
+              Starts work that takes a few minutes.
+            </span>
+          </>
+        )}
       </div>
+
+      {/* Reject: in the same card, on its own row BELOW approve, and `quiet` rather than
+          filled or red. Secondary because approve is the intended path; not red because a
+          person deciding against the output is not an error state. */}
+      {canReject(runState) && intent === "none" && (
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <SoftButton
+            variant="quiet"
+            onClick={() => {
+              setIntent("reject");
+              setRefusal(null);
+            }}
+            disabled={busy}
+          >
+            Reject this run instead
+          </SoftButton>
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            Ends the run for good. You will be asked why first.
+          </span>
+        </div>
+      )}
+
+      {canReject(runState) && intent === "reject" && (
+        <SoftWell className="mt-4 p-4">
+          <h3 className="text-sm font-semibold">Rejecting is final</h3>
+          {/* The whole point of the two-step: this is read BEFORE the button that does it,
+              not after. "Cannot be undone" is not a formality here — there is no route
+              that reverses it and no state a rejected run can leave. */}
+          <p className="mt-1.5 text-sm" style={{ color: "var(--text-muted)" }}>
+            This closes the run for good. Nothing is published, and it cannot be undone —
+            not from this screen and not anywhere else. If you want this work after all,
+            the way back is a new run, which starts from the current documents rather than
+            republishing what was refused. Everything this run produced stays readable
+            below either way.
+          </p>
+
+          <label
+            htmlFor={reasonId}
+            className="mt-4 block text-[11px] font-semibold uppercase tracking-wider"
+            style={{ color: "var(--text-muted)" }}
+          >
+            Why are you rejecting it? Required.
+          </label>
+          {/*
+            A `textarea`, not a single-line input: this is a sentence about what was wrong
+            with the output, and a 240-character field that scrolls sideways invites the
+            shortest thing that clears the floor. `soft-sunken soft-edge` matches
+            `SoftInput` — the hairline is what satisfies WCAG 1.4.11, since a neumorphic
+            shadow alone measures about 1.2:1.
+          */}
+          <textarea
+            id={reasonId}
+            aria-describedby={reasonHintId}
+            // The field APPEARED because they clicked for it, so focus follows it — the
+            // same contract, and the same reason, as `SoftInput.autoFocus`: a keyboard
+            // user left standing at the button has to hunt for the thing they just asked
+            // for. This is a deliberate, user-initiated reveal, not a page-load grab.
+            // eslint-disable-next-line jsx-a11y/no-autofocus -- see the comment above
+            autoFocus
+            value={reason}
+            onChange={(event) => {
+              setReason(event.target.value);
+              // Clear a stale refusal as soon as they start fixing it, rather than leaving
+              // an error under a field they have already changed.
+              if (reasonError) setReasonError(null);
+            }}
+            rows={3}
+            // The API's own ceiling, so nobody types 300 characters that were never going
+            // to be accepted. The floor cannot be enforced this way and is checked on
+            // submit instead.
+            maxLength={REJECT_REASON_MAX}
+            placeholder="The draft claims we are the cheapest in the city, which we cannot say."
+            className="soft-sunken soft-edge mt-2 block w-full px-3 py-2 text-sm"
+            style={{ borderRadius: "var(--r-sm)", color: "var(--text)" }}
+          />
+          <p id={reasonHintId} className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+            At least {REJECT_REASON_MIN} characters, up to {REJECT_REASON_MAX}. This is the
+            whole record of the decision — a rejection stores nothing else — so write it
+            for whoever reads this run next, including you.
+          </p>
+
+          {/* `role="alert"` so a refusal is announced the moment it arrives: somebody who
+              submits and hears nothing has no way to know the field refused them. */}
+          {reasonError && (
+            <p role="alert" className="mt-2 text-sm font-medium" style={{ color: "var(--err)" }}>
+              {reasonError}
+            </p>
+          )}
+
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <SoftButton onClick={() => void reject()} disabled={busy}>
+              {busy ? "Rejecting…" : "Reject this run permanently"}
+            </SoftButton>
+            <SoftButton
+              variant="quiet"
+              onClick={() => {
+                setIntent("none");
+                setReasonError(null);
+              }}
+              disabled={busy}
+            >
+              Keep it parked
+            </SoftButton>
+          </div>
+        </SoftWell>
+      )}
 
       {refusal && (
         <SoftWell className="mt-4 p-4">
           {/* The server's own sentence first — for `run_not_awaiting_approval` it names the
-              state this screen got wrong, which no client-side copy could. */}
+              state this screen got wrong, which no client-side copy could. The guidance
+              under it comes from the map for the button that was actually pressed, so the
+              two decisions never borrow each other's next step. */}
           <p className="text-sm font-semibold" style={{ color: "var(--warn)" }} role="alert">
             {refusal.message}
           </p>
-          {APPROVE_REFUSAL[refusal.code] && (
+          {(intent === "reject" ? REJECT_REFUSAL : APPROVE_REFUSAL)[refusal.code] && (
             <p className="mt-1.5 text-sm" style={{ color: "var(--text-muted)" }}>
-              {APPROVE_REFUSAL[refusal.code]}
+              {(intent === "reject" ? REJECT_REFUSAL : APPROVE_REFUSAL)[refusal.code]}
             </p>
           )}
         </SoftWell>

@@ -13,9 +13,15 @@ import {
   ALL_RUNS,
   approveRun,
   canApprove,
+  canReject,
   canResume,
+  cleanRejectReason,
   fetchRuns,
   isLive,
+  isTerminalState,
+  REJECT_REASON_MAX,
+  REJECT_REASON_MIN,
+  rejectRun,
   resumeRun,
   runStateLabel,
   runStateTone,
@@ -59,6 +65,27 @@ describe("runStateTone", () => {
   });
 
   /**
+   * `partial`'s rule pointed the other way, and the reason `rejected` is a branch rather
+   * than a fall-through.
+   *
+   * A person deciding "no" is neither a fault nor a shortfall. `err` would tell the owner
+   * the machine broke; `warn` would tell them it fell short. Both blame the agent for a
+   * call a human made — which is the exact misattribution `partial`'s colour exists to
+   * avoid, and it is the whole reason `rejected` is its own state rather than `partial`.
+   *
+   * Written as four assertions on purpose. The `muted` one alone would keep passing if the
+   * branch were deleted, because the default is also `muted` — so it would be a test that
+   * cannot fail, and the negatives are what make it intent rather than accident.
+   */
+  it("paints a rejected run muted, and never in a fault or shortfall colour", () => {
+    expect(runStateTone("rejected")).toBe("muted");
+    expect(runStateTone("rejected")).not.toBe("err");
+    expect(runStateTone("rejected")).not.toBe("warn");
+    // Nor the review gate's colour: it is not waiting for anybody any more.
+    expect(runStateTone("rejected")).not.toBe("accent");
+  });
+
+  /**
    * `state` is a `string` because the server owns the vocabulary. So the day the API adds
    * one, this function has to render it quietly rather than throw inside a `.map()` and
    * blank the list.
@@ -91,6 +118,17 @@ describe("isLive", () => {
     for (const state of ["done", "failed", "partial"]) {
       expect(isLive(run({ state }))).toBe(false);
     }
+  });
+
+  /**
+   * `rejected` is terminal in the plainest sense: no route moves a rejected run, and the
+   * recovery from a rejection is a NEW run. Left out, a list would poll it forever and the
+   * run timeline would hold an event stream open for the full MAX_STREAM_SECONDS waiting
+   * for events that cannot come.
+   */
+  it("treats a rejected run as finished, so nothing polls or streams it", () => {
+    expect(isLive(run({ state: "rejected" }))).toBe(false);
+    expect(isTerminalState("rejected")).toBe(true);
   });
 
   /**
@@ -229,6 +267,123 @@ describe("canApprove", () => {
     // The server owns this vocabulary. Guessing "unknown means fine" would offer the
     // decision on a run whose state we cannot reason about at all.
     expect(canApprove("rejected")).toBe(false);
+  });
+});
+
+describe("canReject", () => {
+  /**
+   * The same one state as `canApprove` today, and a separate function on purpose: the two
+   * endpoints already differ (reject has no `no_checkpoint` refusal), so the seam is where
+   * it needs to be before it is needed.
+   */
+  it("accepts awaiting_approval and nothing else", () => {
+    expect(canReject("awaiting_approval")).toBe(true);
+    for (const state of ["queued", "running", "done", "failed", "partial"]) {
+      expect(canReject(state)).toBe(false);
+    }
+  });
+
+  /**
+   * A second reject is a 409, not a silent no-op — so a rejected run must not be offered
+   * the control again. This is the assertion that stops the new state being the one case
+   * the predicate quietly says yes to.
+   */
+  it("refuses a run that has already been rejected", () => {
+    expect(canReject("rejected")).toBe(false);
+  });
+});
+
+describe("the rejection reason bounds", () => {
+  /**
+   * Mirrored from `REJECT_REASON_MIN`/`REJECT_REASON_MAX` in `backend/app/api/runs.py`. If
+   * these drift the client promises a person something the API then refuses with a 422 —
+   * the exact round trip mirroring them exists to prevent.
+   */
+  it("matches the API's own numbers", () => {
+    expect(REJECT_REASON_MIN).toBe(10);
+    // 240 and not the column's 255, because `clamp_reason` truncates: silently shortening
+    // a person's stated reason is not a cosmetic loss.
+    expect(REJECT_REASON_MAX).toBe(240);
+  });
+
+  /**
+   * The API collapses whitespace BEFORE applying the bounds. A client that measured the raw
+   * string would accept a field full of spaces as a ten-character reason.
+   */
+  it("collapses whitespace the way the API does", () => {
+    expect(cleanRejectReason("  the   draft \n\n claims  too much  ")).toBe(
+      "the draft claims too much",
+    );
+    expect(cleanRejectReason("   ")).toBe("");
+    expect(cleanRejectReason("\n\t ")).toBe("");
+    // Ten spaces are not a ten-character reason.
+    expect(cleanRejectReason("          ".repeat(3)).length).toBe(0);
+  });
+});
+
+describe("rejectRun", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubStored(finishedReason: string | null) {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () =>
+          Promise.resolve({ runId: "r1", state: "rejected", finishedReason }),
+      } as unknown as Response),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  /**
+   * The mirror of `approveRun`'s "no approver" assertion. A rejection authorises nothing
+   * and sends nothing, so no rejecter is recorded — and a body carrying one would be the
+   * client inventing an actor the API has deliberately no column for.
+   */
+  it("sends a reason and nothing else", async () => {
+    const fetchMock = stubStored("The tone is wrong for our customers.");
+
+    await rejectRun("r1", "The  tone is   wrong for our customers");
+
+    const call = fetchMock.mock.calls[0];
+    expect(call).toBeDefined();
+    expect(call?.[1]?.method).toBe("POST");
+    // Whitespace collapsed, so the string that was measured is the string that is sent.
+    expect(call?.[1]?.body).toBe(
+      JSON.stringify({ reason: "The tone is wrong for our customers" }),
+    );
+    const sent = JSON.stringify(call?.[1] ?? {});
+    expect(sent).not.toContain("rejecter");
+    expect(sent).not.toContain("rejectedBy");
+    expect(sent).not.toContain("approver");
+  });
+
+  /** Same trap as approve and resume: an unencoded id addresses a different route. */
+  it("encodes the run id into the path", async () => {
+    const fetchMock = stubStored("A reason long enough to be accepted.");
+
+    await rejectRun("a/b", "A reason long enough to be accepted");
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/api/v1/runs/a%2Fb/reject");
+  });
+
+  /**
+   * 200, state `rejected`, and the STORED reason. The third field is the point of the
+   * response having its own model: the screen renders what was persisted rather than what
+   * it typed, and those differ.
+   */
+  it("passes back the stored reason rather than the one it sent", async () => {
+    stubStored("Collapsed and stored by the API.");
+
+    expect(await rejectRun("r1", "Collapsed   and stored by the API")).toEqual({
+      runId: "r1",
+      state: "rejected",
+      finishedReason: "Collapsed and stored by the API.",
+    });
   });
 });
 

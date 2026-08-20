@@ -45,13 +45,21 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 from uuid import UUID
 
+from sqlalchemy import text
+
 from backend.app.actuators import Actuator
+from backend.app.actuators.owner_notice import (
+    SENDER_ENV,
+    OwnerNoticeIdentity,
+    owner_notice_sender,
+)
 from backend.app.agents.graph import GraphResult, run_graph
 from backend.app.agents.nodes import NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
 from backend.app.agents.state_graph import run_state_graph
 from backend.app.core.config import get_settings
 from backend.app.db.adapters.action_store import PostgresActionStore
+from backend.app.db.session import session
 from backend.app.engines.nap import extract_nap_listings
 from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
@@ -245,6 +253,7 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         geo_probe=_build_geo_probe(business_id, router),
         actuator_for=_build_actuator_resolver(),
         actuator_store=PostgresActionStore(),
+        owner_notice=await _resolve_owner_notice(business_id),
         # Same rule as `serp_search` and for the same reason: a FAKE search result
         # reaching a draft is worse than no search at all, because afterwards nothing
         # can tell it apart from a real one. GENERATE then reports that the search did
@@ -262,9 +271,10 @@ def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
     one run can legitimately have a real emailer and a simulated publisher, and EXPORT
     has to be able to say which was which.
 
-    **Nothing here silently becomes a no-op.** `notify.email` is built by the email
-    actuator's own credential check, which returns a FAKE that names the missing variable
-    when there is no key; `social.post` simulates when no `SocialPublisher` is configured,
+    **Nothing here silently becomes a no-op.** `notify.owner` -- the transactional type
+    EXPORT actually uses -- and `notify.email` are each built by their own credential check,
+    which returns a FAKE that names the missing variable when there is no key;
+    `social.post` simulates when no `SocialPublisher` is configured,
     and its `Outcome.fake` reaches `published.simulated` and the timeline sentence, so a
     surface cannot report "Published 3 of 3" about three posts that never left the
     process. An unknown action type gets `None`, which EXPORT records as unwired rather
@@ -278,12 +288,20 @@ def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
     """
     from backend.app.actuators.email import build_email_actuator
     from backend.app.actuators.landing import LandingPageActuator
+    from backend.app.actuators.owner_notice import ACTION_TYPE as OWNER_NOTICE_ACTION
+    from backend.app.actuators.owner_notice import build_owner_notice_actuator
     from backend.app.actuators.social import SocialPostActuator
     from backend.app.db.adapters.connection_store import PostgresConnectionStore
     from backend.app.db.adapters.content_store import PostgresContentStore
     from backend.app.db.adapters.lead_store import PostgresLeadStore
 
     def resolve(action_type: str) -> Actuator | None:
+        if action_type == OWNER_NOTICE_ACTION:
+            # The TRANSACTIONAL type, and the only one EXPORT asks for. `notify.email` is
+            # the marketing type: it demands a consent basis and an in-body unsubscribe
+            # link, which is why it refused every owner notice this node ever built, and
+            # why widening its `CONSENT_BASES` was the wrong fix.
+            return build_owner_notice_actuator()
         if action_type == "notify.email":
             return build_email_actuator()
         if action_type == "social.post":
@@ -312,6 +330,60 @@ def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
         return None
 
     return resolve
+
+
+#: The authenticated account holder's address for one business.
+#:
+#: `users`/`businesses` carry no `business_id` and no RLS policy -- `businesses` IS the
+#: tenant table -- so this is read on the unscoped session, the same reasoning
+#: `lead_store.business_for_owner` documents. Inactive owners are excluded: a deactivated
+#: account is not somebody we mail.
+_ACCOUNT_EMAIL = text(
+    """
+    SELECT u.email
+    FROM businesses AS b
+    JOIN users AS u ON u.id = b.owner_id
+    WHERE b.id = :business_id AND u.is_active
+    """
+)
+
+
+async def _resolve_owner_notice(
+    business_id: UUID, env: Mapping[str, str] | None = None
+) -> OwnerNoticeIdentity | None:
+    """Who EXPORT's owner notice goes to, and who it comes from -- or None.
+
+    **This is the security half of the owner-notice fix.** The node used to take the
+    recipient from `state["dna"]["email"]`, which is a contact address extracted from the
+    business's own homepage by the crawler. That makes a page we do not control the
+    authority over where our operational mail goes: change the address in an Impressum and
+    the next run's notice follows it. Our own transactional mail must go to the
+    AUTHENTICATED account, so it is resolved here, from `businesses.owner_id -> users.email`,
+    and injected -- which also keeps the node database-free and its tests hermetic.
+
+    `None` is returned when either half is missing, and EXPORT then reports a named note
+    rather than skipping. Both halves, because a sender with no recipient (or the reverse)
+    is not half a notifier: it is one the actuator would refuse. The refusal would be
+    correct and the run would carry a confusing failure instead of an honest "not
+    configured", which is the distinction `NO_ACTUATOR_NOTE` already exists to preserve.
+    """
+    sender = owner_notice_sender(env)
+    if sender is None:
+        logger.info("%s is not set, so no owner notice can be sent; EXPORT will say so", SENDER_ENV)
+        return None
+    try:
+        async with session() as db:
+            row = (await db.execute(_ACCOUNT_EMAIL, {"business_id": str(business_id)})).first()
+    except Exception:
+        # Not fatal, and the direction matters: a failed read means NO notice, never a
+        # guess. The alternative -- falling back to whatever address the crawler found --
+        # is the defect this function exists to remove.
+        logger.exception("could not resolve the account address for business %s", business_id)
+        return None
+    if row is None:
+        logger.warning("business %s has no active owner, so nobody can be told", business_id)
+        return None
+    return OwnerNoticeIdentity(account_email=str(row[0]), sender=sender)
 
 
 def _build_geo_probe(business_id: UUID, router: ModelRouter) -> Callable[..., Awaitable[Any]]:
@@ -641,7 +713,15 @@ class RunExecutor:
                     # this deployment has no integration looks, afterwards, exactly
                     # like a run whose posts were rejected.
                     "publish": deps.actuator_for is not None and deps.actuator_store is not None,
-                    "notify": deps.actuator_for is not None and deps.actuator_store is not None,
+                    # Notification needs a THIRD thing the publish path does not: the
+                    # account holder's address plus a sending identity. Reported
+                    # separately because "no notifier" and "no address to notify" send
+                    # somebody to fix different files.
+                    "notify": (
+                        deps.actuator_for is not None
+                        and deps.actuator_store is not None
+                        and deps.owner_notice is not None
+                    ),
                 }.items()
                 if is_wired
             )

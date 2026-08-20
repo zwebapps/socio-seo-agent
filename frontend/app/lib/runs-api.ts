@@ -149,6 +149,91 @@ export function canApprove(state: string): boolean {
 }
 
 /**
+ * What `POST /api/v1/runs/{id}/reject` answers with.
+ *
+ * Its own type rather than `StartedRun`, and the third field is the reason it exists: the
+ * API reads the run back after writing and reports the STORED reason, so a screen renders
+ * what was persisted rather than what it typed. Those differ — the API collapses
+ * whitespace before it stores — and the difference is exactly the kind of thing a screen
+ * should not be guessing at.
+ */
+export type RunDecision = { runId: string; state: string; finishedReason: string | null };
+
+/**
+ * The API's own bounds on a rejection reason, so the field can refuse early and say why.
+ *
+ * Mirrored from `REJECT_REASON_MIN`/`REJECT_REASON_MAX` in `backend/app/api/runs.py`, the
+ * same way `GOAL_MIN`/`GOAL_MAX` are — imported at the call site rather than retyped, so
+ * the client and the API cannot drift into disagreeing about what a valid reason is.
+ *
+ * `MAX` is 240 and not the column's 255 because `clamp_reason` TRUNCATES: silently
+ * shortening a machine-authored stack trace is cosmetic, silently shortening a person's
+ * stated reason is not. So the API's 422 is the only length refusal a human can meet, and
+ * this is what stops them meeting it.
+ */
+export const REJECT_REASON_MIN = 10;
+export const REJECT_REASON_MAX = 240;
+
+/**
+ * The reason, measured the way the API measures it.
+ *
+ * `RejectRunRequest` collapses whitespace in a `mode="before"` validator and THEN applies
+ * the bounds, so `"          "` is not a ten-character reason and neither is a newline
+ * pressed forty times. A client that checked `raw.length` would pass those and be refused
+ * by a 422 it had told the person could not happen — so the client measures the same
+ * string, and sends the same string it measured.
+ */
+export function cleanRejectReason(raw: string): string {
+  return raw.split(/\s+/).filter(Boolean).join(" ");
+}
+
+/**
+ * Refuse a parked run's output, terminally.
+ *
+ * The other half of the review gate. Rejecting is **not reversible**: the run ends
+ * `rejected` and the recovery is a NEW run, which re-derives from current documents rather
+ * than republishing what was refused. A second reject, and an approve-after-reject, are
+ * both the existing 409 `run_not_awaiting_approval` — never a silent no-op.
+ *
+ * 200, not approve's 202: rejecting starts no work, so it is complete when it returns. A
+ * caller must not present it as "publishing", and must not poll for anything afterwards.
+ *
+ * **A reason is REQUIRED and is the whole record.** Nothing is written to `feedback` — no
+ * run has a content piece at review — so `state` plus `finished_reason` is all a rejection
+ * ever leaves behind, and the reviewer is the only person who will ever know why. That is
+ * why the bounds are the API's and not a suggestion.
+ *
+ * **No rejecter is sent, and none is recorded** — a difference from approve, not an
+ * oversight. `approved_by` exists because an approval authorises an outward publish and
+ * lands on every `actions` row; a rejection authorises nothing and sends nothing.
+ *
+ * There is deliberately no `no_checkpoint` refusal here: a run parked having produced
+ * nothing is precisely what a reviewer should be able to dismiss. A reviewer must always
+ * be able to say no.
+ */
+export function rejectRun(runId: string, reason: string): Promise<RunDecision> {
+  return request<RunDecision>(`/api/v1/runs/${encodeURIComponent(runId)}/reject`, {
+    method: "POST",
+    // Only a reason. See the docstring: there is nothing else this route accepts, and
+    // nothing else it should be given.
+    body: JSON.stringify({ reason: cleanRejectReason(reason) }),
+  });
+}
+
+/**
+ * Whether a run is in the one state the reject endpoint will accept.
+ *
+ * The same predicate as `canApprove` today, and deliberately its own name rather than a
+ * shared call: the two endpoints answer the same 409 for the same condition NOW, and the
+ * day one of them accepts a state the other refuses — reject has no `no_checkpoint`
+ * refusal already — the seam is where it needs to be instead of being introduced under
+ * pressure.
+ */
+export function canReject(state: string): boolean {
+  return state === "awaiting_approval";
+}
+
+/**
  * Ask for a run. Returns as soon as the API has accepted it — 202, not 200.
  *
  * The work then happens in the background and takes MINUTES, so a caller must not present
@@ -176,10 +261,31 @@ export const GOAL_MAX = 500;
  * A list uses it to decide whether to keep polling at all: a dashboard of finished runs
  * should not hold a timer forever, and one with a live run must not go stale.
  */
-const TERMINAL_STATES = new Set(["awaiting_approval", "done", "failed", "partial"]);
+const TERMINAL_STATES = new Set([
+  "awaiting_approval",
+  "done",
+  "failed",
+  "partial",
+  // A human said no. Nothing in the machine will ever move this run again -- the recovery
+  // from a rejection is a NEW run -- so a screen that left it out would poll a finished
+  // run forever and hold an event stream open for events that cannot come.
+  "rejected",
+]);
+
+/**
+ * Whether nothing more is coming for a run in this state.
+ *
+ * Exported because the run timeline needs the same answer for a run shape that is not a
+ * `RunSummary`, and a second copy of the set there is a second chance for the two screens
+ * to disagree about which states are over — which is precisely how `rejected` would have
+ * been added to one and not the other.
+ */
+export function isTerminalState(state: string): boolean {
+  return TERMINAL_STATES.has(state);
+}
 
 export function isLive(run: RunSummary): boolean {
-  return !TERMINAL_STATES.has(run.state);
+  return !isTerminalState(run.state);
 }
 
 /**
@@ -192,6 +298,13 @@ export function isLive(run: RunSummary): boolean {
  * colour: a partial run produced something but did not finish, and painting it green is
  * the exact failure this product cares most about avoiding.
  *
+ * `rejected` is `muted`, and it is written as its own branch rather than left to the
+ * default so that it is INTENT and not the accident of falling through. The reasoning is
+ * `partial`'s, pointed the other way: `partial` is `warn` so a shortfall is not read as a
+ * success, and `rejected` must not be `warn` or `err` because a person deciding "no" is
+ * neither a shortfall nor a fault — and a fault colour on it tells the owner the machine
+ * broke when what actually happened is that they made a call.
+ *
  * An unrecognised state falls through to `muted` rather than throwing — see the module
  * note on why `state` is a `string`.
  */
@@ -200,6 +313,7 @@ export function runStateTone(state: string): "ok" | "warn" | "err" | "accent" | 
   if (state === "awaiting_approval") return "accent";
   if (state === "failed") return "err";
   if (state === "partial") return "warn";
+  if (state === "rejected") return "muted";
   return "muted";
 }
 

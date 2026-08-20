@@ -31,7 +31,14 @@ from backend.app.agents.state import AgentState, approve, from_checkpoint, to_ch
 
 logger = logging.getLogger(__name__)
 
-RunState = Literal["queued", "running", "awaiting_approval", "done", "failed", "partial"]
+#: Every state a run row may hold. Wider than `AgentState.Outcome` by exactly one value,
+#: and deliberately so: `rejected` is a HUMAN conclusion, written by the reject route, and
+#: the graph has no way to reach it -- `run_executor` clamps whatever a graph reports to
+#: {done, failed, partial}. Keep `Outcome` at six; a seventh there would imply a node could
+#: decide a person's "no".
+RunState = Literal[
+    "queued", "running", "awaiting_approval", "done", "failed", "partial", "rejected"
+]
 EventStatus = Literal["started", "done", "failed", "skipped"]
 
 #: Keys allowed on an event payload. An allowlist rather than a denylist: a new node that
