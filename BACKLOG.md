@@ -550,10 +550,18 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   canned-string ones — destroying evidence to refresh a header. Needs one `--live
   --deepeval` run by somebody with a key, which is ⛔ by the money guardrail. Roughly 280
   mid-tier calls for the full 20 cases × 2 arms.
-- [ ] **`frontend/app/components/safe-html.tsx` has no tests, and it is the XSS boundary.**
-  Named by the test work rather than deferred silently: it is the highest-value target in
-  the frontend and deserves a focused suite (allowed tags, stripped handlers, entity
-  handling), not a few assertions appended to a component test.
+- [x] **`frontend/app/components/safe-html.tsx` has no tests, and it is the XSS boundary.**
+  — `500850c`. 24 cases against real payloads (img/onerror, case-varied `<ScRiPt>`, the SVG
+  vector, the `noscript` mutation payload, `javascript:`/`data:`/whitespace-smuggled hrefs,
+  the no-DOMParser fallback). Mutation-tested rather than assumed: `dangerouslySetInnerHTML`
+  turns 12 of 24 red, widening `SAFE_SCHEMES` turns 3 red. Two defects were in the TESTS,
+  which is the part worth keeping: the entity case, written as a JSX attribute literal, was
+  decoded by JSX before it reached the component — so it received a REAL script tag and the
+  test silently duplicated the first case in the file while appearing to prove the opposite;
+  and the no-escape-hatch source scan matched the component's own docstring explaining why it
+  avoids `innerHTML`, a check satisfiable only by deleting the explanation. `vite-raw.d.ts`
+  declares the `?raw` suffix that scan imports through, narrowly — a wildcard shim would type
+  a typo as `any`.
 - [ ] **`statusTone(status)` remains status-only for callers that have no document.**
   `documentTone(document)` is what the screens use, and it is what lets a zero-passage
   `indexed` file avoid a green pill. The narrower function is kept because a caller with
