@@ -884,7 +884,7 @@ A1 is the first code to create.
   call, with the spend and the ceiling stated; a business under it runs; and the check is
   proven to run BEFORE the call, not after (the same ordering rule as the run budget).**
 
-- [ ] **A8 · Two documentation claims the code does not support** — cheap, and claims
+- [x] **A8 · Two documentation claims the code does not support** — cheap, and claims
   discipline is binding on docs per `CRITERIA_MAP.md` §7. (1) §1's Documentation row claims
   "6 documents + **in-app help assistant**". No assistant exists: no route, no screen, no
   service, no help retrieval path — and unlike step 5's retrieval trace, this claim is not
@@ -980,6 +980,20 @@ A1 is the first code to create.
   Deliberately out of A3's scope (routes + tests only).
   **done = a settings screen lists connections with their derived usability, starts a connect,
   and disconnects; the secret is never rendered beyond its mask.**
+
+- [ ] **A8-i · Two documents describe a frontend route tree that does not exist** — found by A8
+  and correctly left alone as a third, separate claim rather than folded in. `CRITERIA_MAP.md`
+  §1's "User interactions" row points at `frontend/app/(app)/`, and `ARCHITECTURE.md` §10's
+  route tree describes `(marketing)/`, `(auth)/`,
+  `(app)/businesses/[id]/{documents,opportunities,content/[pieceId],settings}` and `f/[formId]/`.
+  **None of those exist.** Verified 2026-08-20: `frontend/app` is FLAT — `connections`,
+  `developer`, `documents`, `leads`, `login`, `memory`, `onboard`, `runs/[runId]`, plus a root
+  `page.tsx`. There is no route group at all and no public lead-form route under `f/`. Bigger
+  than a row edit because §10's "Guard placement" paragraph reasons FROM that tree, so the
+  paragraph has to be re-derived from the real one, not just relabelled — and the real lead form
+  is a public POST endpoint rather than a page, which is the interesting part to state correctly.
+  **done = both documents describe the tree that exists; §10's guard reasoning follows from it;
+  a grader diffing either against `ls frontend/app` finds no invented route.**
 
 ## B · ⛔ BLOCKED — what the human must supply, and the exact question
 

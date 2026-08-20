@@ -174,7 +174,7 @@ Step 4 before step 5 is the whole point: a crash between 5 and 6 leaves an `in_f
 │  frontend/  Next.js 16 · React 19 · Tailwind 4 · shadcn/ui           │
 │  user mode: onboarding · documents · opportunities · run timeline ·   │
 │             review & approve · lead inbox                            │
-│  /developer (role-gated server-side): models · sliders · prompt       │
+│  /developer (role-gated on the API): models · sliders · prompt        │
 │             versions · tool toggles · raw traces                      │
 └───────────────┬──────────────────────────────────┬───────────────────┘
                 │ REST + SSE                       │ public form POST
@@ -389,7 +389,7 @@ A 10-payload injection corpus is a test, not a checklist — ten distinct *mecha
 
 **The request layer.** Body size is capped on the declared `Content-Length` *and* on every chunk as it streams (`core/body_limit.py`) — a header-only limit is "please declare your own size", and the header can lie or be absent. It sits deliberately above `api/leads`' own 8 KiB cap so that endpoint's control still bites. CSRF is Origin/Referer validation (`core/csrf.py`), not double-submit: the frontend calls a *different* origin with `credentials: "include"`, so page script cannot read the API's cookie and the "double" half does not exist — and double-submit's own weak point, a sibling subdomain forging both halves, is exactly the gap `SameSite=Lax` leaves. It fires on cookie *presence*, so the anonymous public lead form (a cross-host write by design) is untouched.
 
-**Other controls.** SSRF: HTTPS only, DNS-resolve and reject private/link-local/metadata ranges, 5 s timeout, 2 MB cap, `robots.txt` respected, redirect chain re-validated at every hop. Secrets: env-only, never in a browser bundle, provider keys never per-tenant in v1. AuthN: argon2 + HMAC session cookie, `httpOnly`, `sameSite=lax`, `__Host-` prefixed wherever `Secure` is possible (which makes the no-`domain` rule browser-enforced rather than convention), and **no `domain` attribute, ever**. Passwords are additionally checked against the HIBP corpus by k-anonymity — five hex characters of the SHA-1 on the wire, comparison local, network off unless configured, failing open on an outage. AuthZ: role checked server-side — developer mode is a server-rendered gate, not a hidden route. Audit log: every Actuator call, approval, policy change, and settings edit, append-only. GDPR: EU-region providers with no-train terms, per-business export and delete, documents deletable with their embeddings, retention configurable.
+**Other controls.** SSRF: HTTPS only, DNS-resolve and reject private/link-local/metadata ranges, 5 s timeout, 2 MB cap, `robots.txt` respected, redirect chain re-validated at every hop. Secrets: env-only, never in a browser bundle, provider keys never per-tenant in v1. AuthN: argon2 + HMAC session cookie, `httpOnly`, `sameSite=lax`, `__Host-` prefixed wherever `Secure` is possible (which makes the no-`domain` rule browser-enforced rather than convention), and **no `domain` attribute, ever**. Passwords are additionally checked against the HIBP corpus by k-anonymity — five hex characters of the SHA-1 on the wire, comparison local, network off unless configured, failing open on an outage. AuthZ: role checked server-side **on the API** — every route under `/api/v1/admin/*` carries `require_admin` (`api/admin_models.py`, `api/cost.py`), so what is gated is developer mode's DATA, not its shell: `/developer` renders for any signed-in account and shows the 403 as an explanatory card. That is deliberate — a second check in the frontend would put an authorisation decision somewhere that cannot enforce it, and would be a second thing to keep in step with the real one. Audit log: every Actuator call, approval, policy change, and settings edit, append-only. GDPR: EU-region providers with no-train terms, per-business export and delete, documents deletable with their embeddings, retention configurable.
 
 ---
 
@@ -410,8 +410,8 @@ app/
 │  │  │                        edit → approve → export
 │  │  ├─ leads/                inbox with attribution
 │  │  └─ settings/             brand voice, channels, approval policy
-│  └─ developer/               role-gated: models, sliders, prompt versions,
-│                              tool toggles, raw traces
+│  └─ developer/               models, sliders, prompt versions, tool toggles,
+│                              raw traces — the API is role-gated, not the route
 └─ f/[formId]/                 PUBLIC lead form — no auth, no cookies,
                                its own minimal bundle
 ```

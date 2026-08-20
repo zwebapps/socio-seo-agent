@@ -249,7 +249,7 @@ Every renderer output passes deterministic validation before it is shown: length
 | E2 | Personality / brand voice | 9 | user-mode selector |
 | E3 | Choose the LLM | 9 | developer-mode model picker |
 | E4 | LLM settings | 9 | temperature / max-token sliders |
-| E5 | Interactive help | 14 | in-app help assistant over the docs |
+| E5 | Interactive help | 14 | **NOT BUILT** — no route, no screen, no help-retrieval path. Planned for Phase 14; it is not counted as delivered below |
 | M1 | Token + cost display | 2, 9 | live run cost + cost dashboard |
 | M2 | Memory | 7 | three-store table + cross-run demo |
 | M3 | External API tool | 4 | search/SERP provider |
@@ -263,4 +263,4 @@ Every renderer output passes deterministic validation before it is shown: length
 | **H3** | **Eval report** | **12** | DeepEval (not Ragas — it cannot install against openai v3; see `ARCHITECTURE.md` §14) + the deterministic rubric, RAG-off vs RAG-on |
 | H4 | Learns from feedback | 13 | proposed-rule diffs from reject reasons |
 
-**Delivered: 4 easy · 8 medium · 4 hard**, against a requirement of 2 medium + 1 hard. Phases 0–11 alone already carry 3 hard tasks.
+**Delivered: 3 easy · 8 medium · 4 hard**, against a requirement of 2 medium + 1 hard. Three easy, not four: E5's help assistant is planned and unbuilt, and a ledger that counted it would be claiming a delivery on the strength of a row in its own table. Phases 0–11 alone already carry 3 hard tasks.
