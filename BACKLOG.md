@@ -628,18 +628,352 @@ repo-wide grep for `oauth|access_token|graph.facebook|linkedin.com/v2` returned 
   `List-Unsubscribe` survives delivery.
 - [ ] **No connect/callback/disconnect API routes** for platform connections. The store,
   the cipher and the OAuth seam are done and tested; nothing exposes them, so a business
-  cannot connect an account even to the fake provider.
+  cannot connect an account even to the fake provider. **→ superseded by A3 in the finish
+  plan below; work that entry, not this line.**
 - [ ] **`nodes._notify_owner` builds a `notify.email` the email actuator refuses** — no
   sender, no body, no unsubscribe, no consent basis. Either that node supplies them or
   owner notifications get their own action type with transactional rules. Widening
-  `CONSENT_BASES` to make it pass would throw away the point of the check.
+  `CONSENT_BASES` to make it pass would throw away the point of the check. **→ superseded by
+  A4 + A4b below, which settle the ruling and name two further defects.**
 - [ ] **`publish.page` is simulated even though the page is served by this app.**
   `publish_landing_page` exists with no caller, so "publishing" a landing page is a status
   change nobody makes. This is the cheapest real publish left and it needs no credential.
+  **→ superseded by A1a + A1b below. The audit found it is much more than "the cheapest
+  publish left": it is the reason the lead chain is unreachable from a run at all.**
 - [ ] **MEASURE reports the attribution PATH, not lead counts.** Real counts need a
   lead-store read, which is outside its documented grants (`geo.probe`,
-  `analytics.fetch`), so it states `leads_measured: false` with the reason.
+  `analytics.fetch`), so it states `leads_measured: false` with the reason. **→ superseded by
+  A5 below, which grants the read and keeps the no-fabricated-zero rule.**
 - [ ] **The weekly published-pieces-per-business cap** (`ARCHITECTURE.md` §8) is not
   implemented; it needs a cross-run ledger read the node cannot make hermetically today.
-- [ ] **The Docker `images` CI job is still unverified** against the new frontend test
-  files — the local build ran past 15 minutes twice and was killed.
+  **→ superseded by A6 below. That stated reason is STALE: `NodeDeps.actuator_store` is
+  already the injected-store pattern this needs.**
+- [ ] ⛔ **The Docker `images` CI job is still unverified** against the new frontend test
+  files — the local build ran past 15 minutes twice and was killed. **→ reclassified ⛔ in
+  §B below: verifying it needs a push, which is outward-facing.**
+
+---
+
+# The finish plan (architect, 2026-08-20)
+
+Written in answer to "finish the backlog". Read the three-bucket split below before
+picking anything up: **the honest answer is that the backlog cannot be fully closed by
+the loop**, and §C names the residue so nobody spends a sitting trying.
+
+Audit basis: backend suite **2577 tests, green** (`pytest -q`, exit 0, real Postgres on
+:5435); frontend **108 tests, green** (`pnpm test`, 8 files). Every `[x]` sampled below
+was checked against the code, not against its commit message.
+
+## A · LOOP-SAFE — ordered, topmost first
+
+Dependencies are stated. Do not reorder A1 below A4/A5: both of those count things that
+A1 is the first code to create.
+
+- [ ] **A1a · A real `publish.page` actuator, so a run actually creates the landing page**
+  — `publish.page` is not "the cheapest real publish left", it is the missing link in the
+  product's core chain, and the audit found the consequence is larger than the item says:
+  **nothing in the application ever calls `content_store.create_landing_page`**, so no
+  landing `content_pieces` row has ever existed outside `tests/db/test_content_store.py`,
+  `GET /p/{piece_id}` can never serve anything, and **no per-channel tracked short link is
+  ever minted in a real run** (`tests/api/test_runs_api.py::test_the_pack_never_invents_a_tracked_short_link`
+  documents exactly this). So run → page → tracked link → click → lead → attribution — what
+  `BUILD_ORDER.md` Phase 8 calls "the only screen that proves the product's actual promise"
+  — is unreachable from a run today; a lead can only exist if a human mints a link by hand.
+  Build a `LandingPageActuator` in `backend/app/actuators/landing.py` that performs
+  `publish.page` by calling `services/landing_service.publish_landing_page(status="published")`,
+  and register it in `run_executor._build_actuator_for` in place of the `FakeActuator`.
+  **It belongs in the actuator layer, not in the node** — publishing to a surface this app
+  serves is `ARCHITECTURE.md` §3's `publish_cms`, and the actuator layer is what buys the
+  content-derived idempotency key; a node calling `publish_landing_page` directly would put
+  a DB write in a node (`test_engine_boundary.py` is right to object) and a resumed EXPORT
+  would create a duplicate content piece plus a duplicate set of short links every time.
+  `LandingPageNotPublishableError` maps to `ActuationRefusedError`, not `ActuatorError`: a
+  page that cannot capture a lead is a policy refusal, not a provider failure.
+  **done = a test drives EXPORT against real Postgres and asserts (a) one `content_pieces`
+  row with `status='published'` and its spec in `meta`, (b) `GET /p/{id}` returns 200 with
+  the form, (c) one `short_links` row per channel CTA, each `?ref=<code>`-retargeted, and
+  (d) running EXPORT twice creates exactly one piece and one link set — the second is
+  `replayed`. `Outcome.fake` is False on this action while `social.post` stays True in the
+  same run, so the Delivery tab tells the two apart.**
+
+- [ ] **A1b · The published page and its real short links reach the export pack and the
+  Delivery tab** — depends on A1a. `review_service` currently hard-codes
+  `_NO_LANDING_PAGE`/`trackedLinkNote` and `test_the_pack_never_invents_a_tracked_short_link`
+  forbids `/l/` anywhere in the pack. Both were correct while nothing minted a link and
+  both are now wrong. Revisit them honestly rather than deleting them: the prohibition
+  becomes "no short link may appear unless a `short_links` row backs it".
+  **done = the pack carries the real `/p/{id}` URL and one real `/l/{code}` per channel;
+  the two notes appear only when the run genuinely published neither; the amended test
+  asserts a fabricated code still fails.**
+
+- [ ] **A2a · Carry `RetrievalTrace` into `AgentState` so the agentic-RAG evidence leaves
+  the process** — not previously in this backlog and it is the highest-stakes gap for
+  grading. `nodes._retrieved()` calls `box.call(KB_SEARCH, question)` and immediately
+  reduces the result to `_passages(trace)`, so the query rewrites, the per-chunk relevance
+  grades and the fallback decision are **discarded at the call site**. No `AgentState` key
+  holds them and no route returns them. That leaves `BUILD_ORDER.md` Phase 3's "Visible: a
+  retrieval trace panel … **this panel IS the Hard #1 evidence**" undelivered, and makes
+  `CRITERIA_MAP.md` §8 step 5's own mitigation — "show it from the API response" —
+  unsupported, because no API response contains it. Add a bounded `retrieval_traces` key
+  (cap the count and drop chunk TEXT, keeping ids, grades and the decision: the checkpoint
+  is rewritten on every node, which is why `summarise_crawl` exists).
+  **done = a test asserts a run's checkpoint holds, for at least one node, the rewritten
+  queries, a grade per chunk id, and the fallback decision; and asserts the stored trace
+  carries no chunk body text.**
+
+- [ ] **A2b · A retrieval-trace panel on the review screen** — depends on A2a. Query →
+  chunks → grades → decision, per node, with an honest empty state for a business with no
+  documents (which is a normal state, not a failure).
+  **done = a Vitest case renders a trace and asserts the fallback decision is shown in
+  words; a second asserts the no-documents state names the node and does not imply
+  retrieval failed. Then delete "no UI yet" from `CRITERIA_MAP.md` §8 step 5 — and not
+  before.**
+
+- [ ] **A3 · Connect / callback / disconnect routes for `platform_connections`** — genuinely
+  loop-safe, no credential: `get_oauth_provider()` returns `FakeOAuthProvider` for every
+  platform, `PLATFORM_CREDENTIAL_KEY=ephemeral` is the documented local cipher mode
+  (`.env.example:49`), and `connection_service.begin_connect/complete_connect/
+  refresh_connection/revoke_connection` are all implemented and tested. Only the HTTP layer
+  is missing. **Two rulings so this is not improvised.** (1) `begin_connect` returns a
+  `state` whose docstring says verification "has to be held wherever the browser's session
+  is" — hold it in a signed, short-TTL, `__Host-`-prefixed, `SameSite=Lax` cookie over the
+  existing `core/security.py` HMAC, **not** a DB row (a table that needs sweeping for a
+  one-shot nonce) and **not** Redis (not a hard dependency of the API today). (2) The
+  callback is a redirect-borne GET carrying no `Origin`, so `core/csrf.py` must not be
+  touched to accommodate it — **the state-cookie comparison IS the CSRF control on that
+  route**, which is the standard OAuth design. `oauth_status()` must be surfaced verbatim,
+  so the screen says publishing is waiting on somebody else's approval queue.
+  **done = tests assert a full connect → callback → view → disconnect cycle against
+  `FakeOAuthProvider` with no network; a callback whose `state` does not match the cookie
+  is refused; the response never contains a token or ciphertext, only the mask; and
+  business B cannot see or revoke business A's connection (RLS).**
+
+- [ ] **A4 · `notify.owner`: a transactional action type, not a widened `CONSENT_BASES`** —
+  depends on nothing; ruling settled here. The item asks whether the node supplies the
+  missing fields or owner notifications get their own action type. **It is the second**, and
+  the reasons are not stylistic: (a) `actuators/email.py`'s own comment says a transactional
+  message "is a different action type with different rules, not this one with a flag";
+  (b) an owner service notification must not carry a marketing unsubscribe link —
+  unsubscribing from "your run published 3 of 4" breaks the product — and `existing_customer`
+  is a soft-opt-in *marketing* basis, so borrowing it would be the same widening in
+  disguise. **Two defects the item does not name, both found in this audit and both in
+  scope.** (i) `_notify_owner` passes `target=address`, which the email actuator refuses on
+  purpose (`_check_target_is_a_handle`) because `actuate()` renders `target` — and that
+  address then flows `Outcome.target` → `_outcome_row` → `runs.checkpoint` → the Delivery
+  tab. The new type must derive its target through a `recipient_target`-style handle and a
+  `build_*_actuation` helper, exactly as `build_email_actuation` does. (ii) The recipient is
+  read from `state["dna"]["email"]`, which is a contact address extracted from a crawled
+  homepage; our own transactional mail must go to the **authenticated account** address.
+  Resolve it in `run_executor` and inject it on `NodeDeps` (the `actuator_store` pattern), so
+  the node still touches no database.
+  **done = `notify.owner` is refused with a named reason when the sender identity or body is
+  missing, and SUCCEEDS on a well-formed owner notification driven through the REAL payload
+  parser; a test asserts the actuation's `target` contains no `@`; and the recipient comes
+  from the account, not from `dna`. Plus the claims fix below, in the same sitting.**
+
+- [ ] **A4b · The test double for `notify.email` is wider than the actuator, and asserts a
+  green path the product does not have** — `tests/agents/test_export.py::test_the_owner_is_told_what_went_live_and_what_did_not`
+  asserts `notified is True` using a generic `Publisher(NOTIFY_ACTION)`. Against the real
+  actuator that same payload is refused (no sender, no body, no unsubscribe, no consent
+  basis, and a bare address in `target`). Same class as "the engine was correcting hashtags
+  in the eval harness and not in the product".
+  **done = the EXPORT notify tests route their actuation through the real
+  `parse_email_payload` / the real owner-notify parser, so a double can never again be more
+  permissive than the actuator it stands in for.**
+
+- [ ] **A5 · MEASURE gets a first-party `leads.count` grant, and still refuses to print a
+  zero** — depends on A1a (before it there are no tracked links to count against). The
+  tool-grant question resolves **in favour of granting**: MEASURE makes no model call
+  (verified — no `_ask`, no router use in the node), so a first-party read widens no
+  injection surface; the data is the tenant's own, and `memory.load` at INTAKE is the
+  precedent for granting a node a first-party read; and `AGENT_RUNTIME.md` §3 already lists
+  MEASURE's *Emits* as "metrics, lead attribution", so this fits the documented design
+  rather than expanding it. **`analytics.fetch` stays unwired and stays named** — that grant
+  is the GSC/GA4 cut, and quietly reusing it for a lead read would make the named gap
+  disappear; our own leads and Google's analytics are different claims. **The honesty
+  constraint is the task, not a caveat:** `LEADS_NOT_YET_NOTE`'s reasoning is correct, so
+  report counts only with the window stated and keep an explicit `too_early` state for a
+  piece published moments ago — never a bare `leads: 0`, and never a conversion rate on a
+  denominator below a stated minimum.
+  **done = with clicks and leads present, MEASURE reports both with the window named; with
+  a piece published seconds ago it reports `too_early` and the reason, not a zero; a test
+  asserts no rate is emitted below the minimum denominator; the §3 doc table and
+  `NODE_TOOLS` are updated together (`test_tool_allowlist.py` parses the doc, so a
+  one-sided change fails the build).**
+
+- [ ] **A6 · The weekly published-pieces-per-business cap** (`ARCHITECTURE.md` §7.4) —
+  depends on A1a. **The recorded reason for it being blocked is stale:** `NodeDeps` already
+  carries `actuator_store`, which is the same injected-store pattern, and the `actions`
+  table already holds precisely what needs counting (`status='succeeded'`,
+  `action_type IN PUBLISHABLE_ACTIONS`, `created_at >= now() - 7 days`). An in-memory
+  counter makes it hermetic. §7.4 calls it "a quality control, not a cost control", so it is
+  enforced **in EXPORT before actuating**, as a refusal naming the count and the window —
+  not as a model-call guard and never as a silent skip.
+  **done = a business at the cap gets a refusal that states the count, the window and the
+  cap; a business under it publishes; the count is per business (a test proves A's
+  publishes do not consume B's allowance); and a `refused` row lands in `actions`.**
+
+- [ ] **A7 · The per-business monthly USD cap** — not previously listed. `ARCHITECTURE.md`
+  §7.4 states three cap levels as fact; only the **per-run** one exists (`llm/contract.py:BudgetState`
+  is documented "remaining spend for a run"). `services/cost_service.cost_report(business_id,
+  window_days=...)` already computes windowed spend, so the read exists.
+  **done = a business over its monthly ceiling has its next run refused before any provider
+  call, with the spend and the ceiling stated; a business under it runs; and the check is
+  proven to run BEFORE the call, not after (the same ordering rule as the run budget).**
+
+- [ ] **A8 · Two documentation claims the code does not support** — cheap, and claims
+  discipline is binding on docs per `CRITERIA_MAP.md` §7. (1) §1's Documentation row claims
+  "6 documents + **in-app help assistant**". No assistant exists: no route, no screen, no
+  service, no help retrieval path — and unlike step 5's retrieval trace, this claim is not
+  marked aspirational. Correct the row; E5 is a bonus task and `BUILD_ORDER.md`'s own ledger
+  reaches 4 easy / 8 medium / 4 hard without it, so building an assistant is a separate,
+  larger decision for the human, not a doc fix. (2) `ARCHITECTURE.md` §9 says "developer
+  mode is a server-rendered gate, not a hidden route", while `frontend/app/developer/layout.tsx`
+  says in its own comment "No role check here. The gate is server-side on the API." The
+  **data is genuinely protected** — every `/api/v1/admin/*` route carries `require_admin` —
+  so this is a wording defect, not a hole: say "the data is gated server-side on every admin
+  route; the shell renders and shows the refusal".
+  **done = both statements match the code, and a grader reading either document is not told
+  about a screen that does not exist.**
+
+- [ ] **A9 · `/developer/cost` tells an owner two contradictory things, and the route's gate
+  is a category error** — found by live testing, and the ruling covers both halves so the
+  loop does not have to choose. Verified: `backend/app/api/cost.py:63` gates `GET /cost` with
+  `require_admin` (**platform_admin** — `api/admin_models.py:165`), while the same route
+  takes `current_business`, reads `model_usage` under RLS **as one tenant**, and echoes
+  `business_id` deliberately "because a spend figure with no statement of whose spend it is
+  invites being read as a platform total". So a PLATFORM role guards a structurally
+  PER-TENANT read — which serves neither audience: the owner who would want their own
+  numbers is refused, and the platform operator who is admitted gets their own single
+  tenant's numbers rather than a platform total.
+
+  **Ruling on access (the product half): keep `require_admin`. Do NOT widen the gate, and do
+  NOT move the screen in this task.** `BUILD_ORDER.md` Phase 9 places the cost dashboard in
+  **developer mode**, "role-gated server-side", and lists user mode as dashboard / documents
+  / opportunities / timeline / review / leads / memory — no cost. So the gate matches the
+  documented user-vs-developer split, and loosening an authorization check to make a
+  sentence true is the wrong direction of fix. The two things that ARE missing are recorded
+  in §D rather than built here, because each is new scope and one of them is a product call
+  the human owns: a **platform-wide** total needs a `SECURITY DEFINER` aggregate (the page's
+  own docstring already names this as the mechanism — "not a looser session"), and an
+  **owner-facing** per-business spend view is a product decision about whether an owner sees
+  cost at all.
+
+  **Ruling on copy (the loop-safe half): yes, the refusal reason becomes per-page, and the
+  duplicate goes.** The generic string is not merely vague on Cost, it is FALSE — there is no
+  setting to change and the page has just told the reader it is their own tenant's data.
+  Three edits: (1) `frontend/app/developer/shell.tsx:105-118` takes the `forbidden` reason as
+  a prop so each page supplies a true one (routing / sampling / tool access keep
+  "platform-wide settings"; Cost says the console is operator-only and points the owner at
+  the run timeline's live cost, which they CAN see); (2) delete the second hardcoded copy in
+  `frontend/app/developer/models/page.tsx:119-130` — two copies of one string is the same
+  drift this repo already fixed once for channel limits; (3) correct the Cost `PageHeader`,
+  which currently describes a per-tenant owner view on an operator-only screen — it is the
+  operator's own tenant's ledger, and it should say so rather than implying any signed-in
+  business can read it here.
+  **done = a Vitest case renders the Cost page's `forbidden` state and asserts the words
+  "platform-wide settings" do NOT appear, while a routing/sampling/tool-access page's
+  `forbidden` state asserts they DO; a test asserts the refusal string exists in exactly one
+  place in the frontend; and the Cost header no longer promises a view the gate refuses.
+  `CRITERIA_MAP.md` §7 claims discipline is binding on UI copy, so this is the same class of
+  fix as A8.**
+
+## B · ⛔ BLOCKED — what the human must supply, and the exact question
+
+- [ ] ⛔ **The OpenRouter account's data policy** — cheapest unblock available and it
+  releases three items at once. Ask: *"On the OpenRouter account behind this key, enable the
+  data policy that permits mid- and strong-tier models (it currently returns 404 `no
+  endpoints matching your guardrail restrictions`), or supply a key whose account already
+  does."* Unblocks: a live run reaching OPPORTUNITY/PLAN/GENERATE at all, `evals/run.py
+  --tier {mid,strong}`, and the first real dollar figures in `model_usage`. **Costs money to
+  use, so the run itself stays gated too.**
+- [ ] ⛔ **`TAVILY_API_KEY`** — ask: *"Provide a Tavily key (free tier is enough for the demo)
+  so `serp.search` and HARVEST's competitor discovery run against real search instead of the
+  fake."* Structural half is done; without it HARVEST honestly reports "no provider
+  configured", which is correct and is why the loop must not wire the fake in its place.
+- [ ] ⛔ **Langfuse keys** — ask: *"Provide `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
+  (EU region), or confirm H2 is demoed from `model_usage` + the run timeline instead."* The
+  seam is a no-op without keys by design; demo step 13 names a Langfuse trace.
+- [ ] ⛔ **`RESEND_API_KEY`** — ask: *"Provide a Resend key and a verified sending domain, and
+  name one address you consent to receive a test send at."* What a key proves that
+  `MockTransport` cannot: real status codes, that a 200 always carries `id`, and that
+  `List-Unsubscribe` survives delivery. **Sending to a real address is outward-facing** —
+  the loop must not do it even with a key present.
+- [ ] ⛔ **A live Ragas measurement** — several judge calls per case-arm, real money. Ask:
+  *"Authorise roughly N judge calls of spend for one `--ragas --live` run?"* Everything up to
+  the provider call is already proven.
+- [ ] ⛔ **`answer_relevancy` needs an embeddings endpoint** — ask: *"Set
+  `RAGAS_EMBEDDINGS_MODEL` plus a key that serves embeddings."* Reported as `n/m` until then,
+  never as a score, which is correct.
+- [ ] ⛔ **Regenerating `evals/report.md`** — the checked-in report is a real `--live` run
+  (2026-08-19, `gpt-4.1-mini`, real money) and regenerating it hermetically would overwrite
+  measured numbers with FakeProvider canned strings. Ask: *"Authorise ~280 mid-tier calls for
+  one `--live --deepeval` run over 20 cases × 2 arms?"* **The loop must never regenerate this
+  file hermetically to fix its header** — that destroys evidence.
+- [ ] ⛔ **Tier 1 direct publish** — per-platform App Review (Meta screencast + privacy
+  policy + business verification, 2–6 weeks and refusable; LinkedIn MDP; TikTok audit). Ask:
+  *"Do you want to start the Meta/LinkedIn/TikTok review applications, accepting that they
+  may be refused and cannot land inside this timeline?"* No real `OAuthProvider` or
+  `SocialPublisher` should be written before an approval exists — untested code pretending
+  to be a feature is worse than a stated gap.
+- [ ] ⛔ **The Docker `images` CI job is unverified** — the local build ran past 15 minutes
+  twice and was killed. Verifying it properly means a push, which is outward-facing. Ask:
+  *"Push the branch so the `images` job runs, or authorise an unbounded local `docker build`?"*
+  Fold it into the next PR the human pushes anyway. **Packaging note for the safe-html
+  commit: `frontend/vite-raw.d.ts` is currently UNTRACKED and `safe-html.test.tsx` imports
+  `./safe-html.tsx?raw`. `tsconfig.json` includes `**/*.tsx`, so if the suite lands without
+  that declaration file, `pnpm typecheck` AND `next build` both fail and the web job goes
+  red. Commit the two together.**
+
+## C · The residue — why "finish the backlog" cannot mean "no open items"
+
+Every item in §A can be closed by the loop. **No item in §B can**, and there is no honest
+way to tick one: each needs a credential, real money, a third party's approval queue, or a
+push. Manufacturing a green tick on any of them would break the guardrail against
+presenting synthetic output as real, which is the one rule this project has enforced
+hardest.
+
+So the truthful stopping point is: **§A closed, §B still open and correctly marked.** That
+is the report to give — not a fully-ticked file. The residue is, precisely: three
+credentials (Tavily, Langfuse, Resend), two spend authorisations (live Ragas, the
+`--live --deepeval` report), one account setting (the OpenRouter data policy), one external
+approval queue (App Review), and one push (the `images` job).
+
+## D · Deliberately deferred / won't do — do not rediscover these
+
+- **GSC/GA4 `analytics` engine** — cut; two OAuth flows for a metric that cannot move inside
+  the timeline. `analytics.fetch` stays granted-and-unwired so the omission is named.
+- **Per-business model override (`model_routes.business_id`)** — one nullable column, no
+  demand. Leave it.
+- **A `channel_specs` config table** — resolved by `engines/channel/specs.py`; the drift this
+  was about was between two code copies, and nothing has asked for per-tenant limits.
+- **Login CSRF** — deliberate. A pre-login request carries no cookie to check; closing it
+  needs a pre-session synchronizer token the Origin-validation design avoids. `SameSite=Lax`
+  blocks the cross-site POST.
+- **Text extraction as a security boundary** — deliberate, and MEASURED rather than assumed:
+  the tests assert the survivals as well as the drops precisely so this can never be
+  upgraded into "hidden instructions never reach the model". The barrier is the tool
+  allowlist.
+- **Refusing a cookie-bearing request with no `Origin`/`Referer`** — intended; the cookie is
+  a browser credential and there is no machine-to-machine mode.
+- **Folding `statusTone` into `documentTone`** — deliberate; a caller with only a status
+  string is a real case. Fold if a third colour rule appears.
+- **Transaction-per-test or schema-per-run for the `db` suite** — real and larger than it
+  looks: every `db` file writes to shared tables and teardown is by pattern. Deferred with
+  the reason, not forgotten.
+- **A sweeper for runs stranded `running`** — that is a worker's job; `ROADMAP` names
+  ARQ/Redis and it is not installed. `POST /runs/{id}/resume` plus the UI control is the
+  recovery path today.
+- **Real `OAuthProvider` / `SocialPublisher`** — absent on purpose until an App Review
+  approval exists to exercise them against.
+- **A platform-wide cost total for the operator** — cannot come from reading `model_usage`
+  as one tenant; needs a `SECURITY DEFINER` aggregate written for the purpose, in the same
+  posture as the other cross-business definer functions. Named by A9, deliberately not built
+  there: new scope, and nobody has asked for it.
+- **An owner-facing per-business spend view** — a PRODUCT question for the human, not a bug:
+  does a normal owner get to see their own model cost? The read is already tenant-scoped and
+  refusing it protects nothing, but `BUILD_ORDER.md` Phase 9 deliberately puts the cost
+  dashboard in developer mode. Ask before building. If the answer is yes, it is a new USER-mode
+  screen on its own route — not a loosened gate on `/developer/cost`.
+- **Wikipedia editing · a customer mobile app · autonomous publishing · paid ads** — cut in
+  `CLAUDE.md` / `BUILD_ORDER.md`. Cut things stay cut unless the human reopens them.
