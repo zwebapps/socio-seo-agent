@@ -80,10 +80,19 @@ and each step is a thing the agent will use:
    passage count at the top is what the agent can actually quote.
 4. **`/memory`** — add a preference. It is carried into every run from then on, and the
    panel shows the exact lines the next run's prompt will receive.
-5. **Start a run from the dashboard**, then watch `/runs/{id}`: the timeline names every
+5. **`/connections`** — the platform accounts a publish step would use. Worth opening
+   before your first run, because it is the screen that tells you what publishing can
+   honestly do here: which accounts are connected, whether a publish would actually be
+   ACCEPTED (derived server-side, never recomputed in the browser), and which platforms
+   are waiting on their own App Review. It also states two things plainly rather than
+   letting you find them by clicking — that no credential can be stored until
+   `PLATFORM_CREDENTIAL_KEY` is set, and that with only the fake provider configured an
+   authorisation cannot complete at all, because its address is a reserved domain that
+   can never resolve.
+6. **Start a run from the dashboard**, then watch `/runs/{id}`: the timeline names every
    node, what each one cost, and any source that failed. Open the review tabs for the
    draft, the deterministic SEO findings, the per-channel posts and the AI answer blocks.
-6. **`/leads`** — a captured lead, named against the content piece that earned it.
+7. **`/leads`** — a captured lead, named against the content piece that earned it.
 
 **With no model key in `.env` everything still runs**, on deterministic fake providers,
 and every surface says so — the run timeline names the fake, the review screen lists
@@ -161,7 +170,7 @@ What happens then depends on the destination, and the product says which:
 |---|---|
 | **Export pack** (every channel) | Real. `GET /api/v1/runs/{id}/export` as JSON or markdown, plus a screen — text to paste, which works on channels no API can reach |
 | **Email** | Real the moment `RESEND_API_KEY` is set. Refuses a send with no unsubscribe link in the body, no sender identity, or no recorded consent basis |
-| **Social** (LinkedIn, Facebook, Instagram) | Refuses with *"no connection — connect the account first"*. Direct publishing needs per-platform App Review, which is weeks of someone else's process, not code |
+| **Social** (LinkedIn, Facebook, Instagram, TikTok, …) | Refuses with *"no connection — connect the account first"*, and `/connections` is where you would connect one. Two honest caveats it states itself: direct publishing needs per-platform App Review — weeks of someone else's process, not code — and with only the fake provider configured an authorisation cannot complete, because its address is a reserved domain. The routes and the screen are real; the provider behind them is not yet |
 | **Landing page** | **Real, and the only destination that needs no credential** — this app serves the page. EXPORT writes a published `content_pieces` row and mints one tracked short link per channel CTA, so a run leaves something a visitor can open and a lead can be attributed to |
 
 **A simulated send is never rendered as a real one.** With no credential an actuator
