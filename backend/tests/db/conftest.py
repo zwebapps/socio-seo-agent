@@ -17,7 +17,7 @@ Two deliberate choices, both learned by getting them wrong first:
   bugs into five green "skipped" lines, which is worse than a red suite.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from uuid import UUID, uuid4
 
 import pytest
@@ -32,6 +32,9 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from backend.app.core.config import get_settings
+from backend.app.db import session as session_module
+from backend.app.db.adapters.content_store import PostgresContentStore
+from backend.app.db.adapters.lead_store import PostgresLeadStore
 
 # Only these mean "there is no database to talk to". Anything else is a bug.
 _CONNECTION_FAILURES = (OperationalError, ConnectionRefusedError, OSError)
@@ -107,3 +110,49 @@ async def two_businesses(owner_session: AsyncSession) -> AsyncIterator[tuple[UUI
         text("DELETE FROM users WHERE id = ANY(:ids)"), {"ids": [a_user, b_user]}
     )
     await owner_session.commit()
+
+
+# --------------------------------------------------------------------------- #
+# The store fixtures, shared by every test that drives real SQL through the
+# restricted role. They lived in `test_content_store.py` until a second file
+# needed them; two copies of a fixture that scopes row-level security is the
+# kind of drift that ends with one file testing RLS and the other quietly not.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def scoped_sessions(app_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Point the session factory at this test's engine.
+
+    Patching the factory rather than injecting sessions keeps the real RLS scoping under
+    test instead of replacing it with a hand-rolled copy that could differ.
+
+    Function-scoped, because an asyncpg pool belongs to the event loop that created it --
+    see the note at the top of this file.
+    """
+    monkeypatch.setattr(
+        session_module,
+        "_session_factory",
+        async_sessionmaker(app_engine, expire_on_commit=False, autoflush=False),
+    )
+    yield
+
+
+@pytest.fixture
+def content_store(scoped_sessions: None) -> PostgresContentStore:
+    return PostgresContentStore()
+
+
+@pytest.fixture
+def link_store(scoped_sessions: None) -> PostgresLeadStore:
+    return PostgresLeadStore()
+
+
+@pytest.fixture
+async def business_a(two_businesses: tuple[UUID, UUID]) -> AsyncIterator[UUID]:
+    yield two_businesses[0]
+
+
+@pytest.fixture
+async def business_b(two_businesses: tuple[UUID, UUID]) -> AsyncIterator[UUID]:
+    yield two_businesses[1]

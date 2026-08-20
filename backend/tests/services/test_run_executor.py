@@ -647,3 +647,58 @@ def test_an_unrecognised_runtime_still_starts_the_run() -> None:
     from backend.app.services.run_executor import select_runtime
 
     assert select_runtime("lnagraph") is run_state_graph
+
+
+# --------------------------------------------------------------------------- #
+# What the resolver wires, which is not the same question as what an actuator does
+# --------------------------------------------------------------------------- #
+
+
+def test_publish_page_resolves_to_a_real_actuator_not_a_simulation() -> None:
+    """The wiring guard for `publish.page`.
+
+    `tests/db/test_landing_actuator.py` proves the actuator publishes, but it INJECTS
+    that actuator — so every one of its assertions would still pass if this resolver
+    went back to handing out a `FakeActuator`, and the product would quietly return to
+    simulating a page it is perfectly capable of publishing. That regression is
+    invisible from the actuator's own tests, so it is asserted here.
+
+    `fake is False` is the load-bearing assertion rather than the class name: what must
+    not regress is the OUTCOME reaching `published.simulated` and the Delivery tab, and
+    a future real publisher for some other surface must be free to replace the class.
+    """
+    resolve = executor_module._build_actuator_resolver()
+
+    page = resolve("publish.page")
+
+    assert page is not None, "publish.page must be wired: this app serves the page"
+    assert page.action_type == "publish.page"
+    assert page.fake is False, (
+        "publish.page needs no credential -- this app serves the landing page, so a "
+        "simulated outcome here is a lie the Delivery tab would render as delivered"
+    )
+
+
+def test_social_post_still_simulates_so_the_two_stay_distinguishable() -> None:
+    """The other half of the same guarantee, and the reason `fake` has to mean something.
+
+    `social.post` is gated on per-platform App Review nobody has (`docs/CHANNELS.md`
+    §2), so it must keep reporting `fake`. If both actions ever returned the same flag
+    the flag would carry no information, and a run's report could not tell a real
+    publish from a simulated post — which is the single thing the actuator layer exists
+    to prevent.
+    """
+    resolve = executor_module._build_actuator_resolver()
+
+    social = resolve("social.post")
+    page = resolve("publish.page")
+
+    assert social is not None
+    assert social.fake is True
+    assert page is not None
+    assert social.fake != page.fake
+
+
+def test_an_unknown_action_type_is_unwired_rather_than_guessed() -> None:
+    """EXPORT records `None` as unwired. Guessing an actuator would publish somewhere."""
+    assert executor_module._build_actuator_resolver()("publish.telepathy") is None

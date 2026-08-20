@@ -45,7 +45,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Final
 from uuid import UUID
 
-from backend.app.actuators import Actuator, FakeActuator
+from backend.app.actuators import Actuator
 from backend.app.agents.graph import GraphResult, run_graph
 from backend.app.agents.nodes import NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
@@ -264,15 +264,24 @@ def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
 
     **Nothing here silently becomes a no-op.** `notify.email` is built by the email
     actuator's own credential check, which returns a FAKE that names the missing variable
-    when there is no key; `social.post` and `publish.page` fall back to `FakeActuator`,
-    whose `Outcome.fake` reaches `published.simulated` and the timeline sentence, so a
+    when there is no key; `social.post` simulates when no `SocialPublisher` is configured,
+    and its `Outcome.fake` reaches `published.simulated` and the timeline sentence, so a
     surface cannot report "Published 3 of 3" about three posts that never left the
     process. An unknown action type gets `None`, which EXPORT records as unwired rather
     than guessing.
+
+    `publish.page` is the exception and the only real publish here: this app serves the
+    landing page, so there is no credential to be missing and nothing to simulate. That
+    makes the mixed case the interesting one -- a single run now carries a REAL published
+    page beside a SIMULATED social post, which is exactly the pair the Delivery tab has to
+    keep apart.
     """
     from backend.app.actuators.email import build_email_actuator
+    from backend.app.actuators.landing import LandingPageActuator
     from backend.app.actuators.social import SocialPostActuator
     from backend.app.db.adapters.connection_store import PostgresConnectionStore
+    from backend.app.db.adapters.content_store import PostgresContentStore
+    from backend.app.db.adapters.lead_store import PostgresLeadStore
 
     def resolve(action_type: str) -> Actuator | None:
         if action_type == "notify.email":
@@ -288,11 +297,18 @@ def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
             # reports "not connected" rather than a cheerful simulated post.
             return SocialPostActuator(connections=PostgresConnectionStore())
         if action_type == "publish.page":
-            # The landing page is served by this app (`api/pages.py`), so "publishing" it
-            # is a status change rather than an outbound call -- but `publish_landing_page`
-            # has no caller yet and wiring it here would be inventing a flow. Simulated,
-            # visibly, until that lands.
-            return FakeActuator(action_type)
+            # The landing page is served by THIS app (`api/pages.py`), so publishing it
+            # needs no credential, no third party and no network -- which is why this is
+            # the one integration here that is real rather than gated on somebody else's
+            # approval queue, and why `LandingPageActuator.fake` is permanently False.
+            #
+            # It was simulated only because nothing called `publish_landing_page`, and the
+            # cost of that gap was the whole conversion chain: no landing `content_pieces`
+            # row was ever written by a run, `GET /p/{id}` could serve nothing, and no
+            # tracked short link was minted outside a hand-written test.
+            return LandingPageActuator(
+                content_store=PostgresContentStore(), link_store=PostgresLeadStore()
+            )
         return None
 
     return resolve

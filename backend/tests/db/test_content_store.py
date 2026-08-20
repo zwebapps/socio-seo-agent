@@ -30,14 +30,12 @@ Four things are proved here, and the last one is the reason the file exists.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from backend.app.api import leads as leads_api
 from backend.app.core.rate_limit import (
@@ -65,44 +63,6 @@ CHROME = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 BASE = "https://sma.example"
-
-
-@pytest.fixture
-def scoped_sessions(app_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Point the session factory at this test's engine.
-
-    Patching the factory rather than injecting sessions keeps the real RLS scoping under
-    test instead of replacing it with a hand-rolled copy that could differ.
-
-    Function-scoped, because an asyncpg pool belongs to the event loop that created it --
-    see this package's conftest.
-    """
-    monkeypatch.setattr(
-        session_module,
-        "_session_factory",
-        async_sessionmaker(app_engine, expire_on_commit=False, autoflush=False),
-    )
-    yield
-
-
-@pytest.fixture
-def content_store(scoped_sessions: None) -> PostgresContentStore:
-    return PostgresContentStore()
-
-
-@pytest.fixture
-def link_store(scoped_sessions: None) -> PostgresLeadStore:
-    return PostgresLeadStore()
-
-
-@pytest.fixture
-async def business_a(two_businesses: tuple[UUID, UUID]) -> AsyncIterator[UUID]:
-    yield two_businesses[0]
-
-
-@pytest.fixture
-async def business_b(two_businesses: tuple[UUID, UUID]) -> AsyncIterator[UUID]:
-    yield two_businesses[1]
 
 
 def a_spec(**over: Any) -> LandingPageSpec:
