@@ -98,6 +98,54 @@ make images           # build both Docker images
 make ragas-env        # build .venv-ragas, only needed for `evals/run.py --ragas`
 ```
 
+### Driving the whole flow in one command
+
+Clicking through the journey above is the way to *see* the product. `scripts/smoke.sh` is
+the way to *check* it: it drives every stage through the HTTP surface and exits non-zero
+on the first unexpected status, so it works by hand and in CI.
+
+```bash
+./scripts/smoke.sh
+```
+
+Ten stages — signup (which creates the user, the business and its slug in one
+transaction), the CSRF guard, the body limit in front of argon2, the link hub on both
+address forms, **a run executing the graph end to end**, a resume that refuses what it
+should, tenant isolation, memory and leads, and the platform-admin gate. It prints a
+working email and password at the end, so the fastest way to a populated UI is to run it
+and sign in with what it gives you.
+
+Two things worth knowing before the first run.
+
+**It spends money if you have a key.** A model key in `.env` means a run makes real
+calls. To exercise the same flow for free, start a second API with the keys unset — a
+missing credential means the fake provider, by design — and point the script at it:
+
+```bash
+OPENROUTER_API_KEY="" ANTHROPIC_API_KEY="" uv run uvicorn backend.app.asgi:app --port 8101
+```
+
+```bash
+API=http://127.0.0.1:8101 ./scripts/smoke.sh
+```
+
+**On fake providers a run ends `partial`, and stops before REVIEW.** The canned text
+genuinely does not pass the SEO gate, so the revision loop runs its bounded two retries
+and then says so — correct behaviour, and the reason the timeline reports a score rather
+than a success. The consequence for testing: **approve → EXPORT → MEASURE is not
+reachable on fake providers**, because nothing gets past the gate to approve. Seeing the
+publishing half needs either a real model key or a test that drives EXPORT directly
+(`backend/tests/db/test_landing_actuator.py` does exactly that, on real SQL).
+
+`/developer` is platform-admin only, so an ordinary owner is correctly refused it. Grant
+yourself the role when you need those screens:
+
+```bash
+uv run python scripts/grant_platform_admin.py --email you@example.com
+```
+
+`--revoke` puts it back, and `--list` says who has it.
+
 ### Publishing, and what it honestly does
 
 The graph stops at a human gate. `POST /api/v1/runs/{id}/approve` is what lets it past —
@@ -111,11 +159,14 @@ What happens then depends on the destination, and the product says which:
 | **Export pack** (every channel) | Real. `GET /api/v1/runs/{id}/export` as JSON or markdown, plus a screen — text to paste, which works on channels no API can reach |
 | **Email** | Real the moment `RESEND_API_KEY` is set. Refuses a send with no unsubscribe link in the body, no sender identity, or no recorded consent basis |
 | **Social** (LinkedIn, Facebook, Instagram) | Refuses with *"no connection — connect the account first"*. Direct publishing needs per-platform App Review, which is weeks of someone else's process, not code |
-| **Landing page** | Simulated, visibly. The page is served by this app; wiring the status change is the cheapest real publish left |
+| **Landing page** | **Real, and the only destination that needs no credential** — this app serves the page. EXPORT writes a published `content_pieces` row and mints one tracked short link per channel CTA, so a run leaves something a visitor can open and a lead can be attributed to |
 
 **A simulated send is never rendered as a real one.** With no credential an actuator
 returns a real outcome marked `fake`, with a `fake://…` reference, and that flag travels
-to the ledger, the timeline and the Delivery tab. Attribution does not depend on any of
+to the ledger, the timeline and the Delivery tab. The landing page is what makes that
+flag worth carrying: one run now holds a REAL published page beside a SIMULATED social
+post, so a surface that rendered the two alike would be visibly wrong rather than
+theoretically wrong. Attribution does not depend on any of
 it: the tracked short link works whether we posted or you pasted, which is the whole
 reason the lead loop is decoupled from publishing.
 
