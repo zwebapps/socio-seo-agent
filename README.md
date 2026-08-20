@@ -6,8 +6,14 @@ visibility on **Google**, in **AI answer engines**, and on **social media** — 
 a lead-capture and attribution loop, so the output is measured in leads rather
 than in vibes.
 
-**Status: Phase 0 complete** — foundations, quality gates, and infrastructure.
-No agent yet; Phase 1 is the first end-to-end slice.
+**Status: the loop runs end to end.** Phases 0–13 are complete — the graph executes,
+runs are resumable and reviewable, the knowledge base ingests the business's own
+documents and is read while the agent works, leads are captured and attributed, and
+the whole thing is tenant-isolated behind row-level security. What is **not** done is
+listed honestly in [BACKLOG.md](BACKLOG.md), including the parts that need a credential
+somebody has to supply.
+
+Read [PROBLEM.md](PROBLEM.md) first if you want the *why* before the *what*.
 
 ---
 
@@ -43,6 +49,8 @@ marketers, and small agencies running several clients.
 | [docs/CHANNELS.md](docs/CHANNELS.md) | What we can actually publish, and per-platform content |
 | [docs/FREE_CHANNELS.md](docs/FREE_CHANNELS.md) | Free presence and citations; why Wikipedia is excluded |
 | [docs/CRITERIA_MAP.md](docs/CRITERIA_MAP.md) | Evidence map, agent concepts, claims discipline |
+| [PROBLEM.md](PROBLEM.md) | The problem, the users, and why an agent rather than a script |
+| [BACKLOG.md](BACKLOG.md) | **What is done and what is open** — including the weaknesses this project's own tooling found |
 
 ## Quickstart
 
@@ -56,8 +64,33 @@ make api              # terminal 1 — FastAPI on :8100
 make web              # terminal 2 — Next.js on :3100
 ```
 
-Open http://localhost:3100. The page reports live backend status; stop the API
-and press **Re-check** to see the designed failure state.
+Open http://localhost:3100 and walk it in this order — it is the customer journey,
+and each step is a thing the agent will use:
+
+1. **Sign up.** One account owns one business, created in the same transaction.
+2. **`/onboard`** — paste a website URL. It is crawled and read into a draft Business
+   DNA that you confirm or correct; confirming is what stores it, and `banned_claims`
+   from that profile is what the regulated-claim gate later enforces.
+3. **`/documents`** — upload a price list or service sheet (pdf, docx, md, txt, html).
+   The screen reports what indexing ACHIEVED, not that the upload worked: a scanned PDF
+   yields no text, and it says so rather than implying the file is searchable. The
+   passage count at the top is what the agent can actually quote.
+4. **`/memory`** — add a preference. It is carried into every run from then on, and the
+   panel shows the exact lines the next run's prompt will receive.
+5. **Start a run from the dashboard**, then watch `/runs/{id}`: the timeline names every
+   node, what each one cost, and any source that failed. Open the review tabs for the
+   draft, the deterministic SEO findings, the per-channel posts and the AI answer blocks.
+6. **`/leads`** — a captured lead, named against the content piece that earned it.
+
+**With no model key in `.env` everything still runs**, on deterministic fake providers,
+and every surface says so — the run timeline names the fake, the review screen lists
+what the work was written *without*. That is the point: nothing here reports synthetic
+output as a real measurement. A run on the fake provider ends `partial`, because the
+canned text genuinely does not pass the SEO gate.
+
+`/developer` is the operator side, behind a platform-admin role: the model picker and
+provider toggles, per-node tool kill switches, sampling bounds, and a cost dashboard
+built on real `model_usage` rows.
 
 ```bash
 make check            # lint + types + tests — exactly what CI runs
@@ -90,7 +123,7 @@ backend/                     everything Python
 │  ├─ asgi.py                process entry point — the ONLY place that loads .env
 │  ├─ main.py                app factory (no import-time side effects)
 │  ├─ api/                   FastAPI routes (thin)
-│  ├─ agents/                the graph: state, driver, nodes
+│  ├─ agents/                the graph: state, both drivers, nodes, tool allowlist
 │  ├─ core/                  config, security
 │  ├─ db/                    models, migrations, adapters
 │  ├─ engines/               deterministic computation — guarded by a test
@@ -135,7 +168,7 @@ model key placed there would be a published key.
 
 | Decision | Why | Rejected |
 |---|---|---|
-| **LangGraph** state machine (Phase 6) | resumable, bounded steps, human interrupt, per-node evaluation | unbounded ReAct loop |
+| **LangGraph** `StateGraph` | resumable, bounded steps, a human interrupt at a defined point, per-node evaluation. Run checkpoints stay in our own `runs.checkpoint` column rather than a LangGraph checkpointer — one source of truth for "where is this run". The hand-written driver it replaced is still selectable by `agent_runtime`, and the test suite runs every branch against both | unbounded ReAct loop; a second durable checkpoint store |
 | **OpenRouter** + a second direct adapter | one integration for many models; the abstraction is proven by two implementations, not asserted | per-provider SDK sprawl |
 | **Postgres + pgvector** | app data and RAG in one store to operate and back up | a separate vector database |
 | **Deterministic SEO scoring** | counting is not a language task; it must be testable and free | an LLM judging SEO |
