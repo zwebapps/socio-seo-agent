@@ -954,7 +954,7 @@ A1 is the first code to create.
   **done = no gated route asserts what KIND of thing it is refusing unless it actually knows;
   a test pins the cost route's 403 body against the claim it makes.**
 
-- [ ] **A3-i · `revoke_connection` can make disconnecting IMPOSSIBLE** — found by A3 and worked
+- [x] **A3-i · `revoke_connection` can make disconnecting IMPOSSIBLE** — found by A3 and worked
   around at the route rather than fixed at the source, deliberately, because the service is
   not the route's file and is separately tested. `connection_service.revoke_connection` calls
   `reveal_access` first, which raises `CredentialUnreadableError` on an envelope that will not
@@ -970,7 +970,7 @@ A1 is the first code to create.
   the pure `unusable_reason` on every read, which is why the settings view and the publish
   refusal cannot disagree), but a SQL-level report would disagree with the API. This wants a
   sweep, not a route — same shape as the payment-style reconcilers.
-- [ ] **A3-iii · `backend/tests/conftest.py` does not strip `PLATFORM_CREDENTIAL_KEY`** the way
+- [x] **A3-iii · `backend/tests/conftest.py` does not strip `PLATFORM_CREDENTIAL_KEY`** the way
   it strips the six outbound credentials. Not a network risk, but a developer with a real AES
   key set gets `AesGcmCipher` where CI gets `NotConfiguredCipher` — the class of divergence that
   ends in "works in CI, fails on the box", which this repo has already been bitten by once.
@@ -994,6 +994,13 @@ A1 is the first code to create.
   is a public POST endpoint rather than a page, which is the interesting part to state correctly.
   **done = both documents describe the tree that exists; §10's guard reasoning follows from it;
   a grader diffing either against `ls frontend/app` finds no invented route.**
+
+- [ ] **A3-v · `provider.revoke` is guarded only for `OAuthError`** — found by A3-i and correctly
+  left alone. A future real provider raising anything else (a bare transport error) would 500 a
+  disconnect through the same door A3-i just closed. Deliberately NOT widened to `except
+  Exception`: that hides genuine defects, and `platform_oauth.OAuthProvider` documents
+  `OAuthError` as the contract today. Worth doing only when a real provider client is written —
+  which is itself gated on App Review, so this waits on §B.
 
 ## B · ⛔ BLOCKED — what the human must supply, and the exact question
 

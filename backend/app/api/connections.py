@@ -65,7 +65,6 @@ from backend.app.core.token_cipher import (
 )
 from backend.app.db.adapters.connection_store import PostgresConnectionStore
 from backend.app.services.connection_service import (
-    ConnectionStatus,
     ConnectionStore,
     ConnectionView,
     begin_connect,
@@ -606,34 +605,21 @@ async def disconnect(
     Another business's connection is simply not there: row-level security scopes the read,
     so the revoke finds nothing and this returns 204 without having touched their row
     (``tests/db/test_platform_connections.py`` proves the database half).
+
+    A credential that will not decrypt -- a rotated key, or the ephemeral vault after a
+    restart -- is handled inside ``revoke_connection`` and does not surface here: it
+    revokes locally, logs that the platform was not told, and returns normally. This route
+    used to catch ``TokenCipherError`` and reach that end state itself, which put the
+    decision in the one place that happened to notice rather than in the one place every
+    caller goes through.
     """
     _known_platform(platform)
 
-    try:
-        await revoke_connection(
-            store=store,
-            provider=factory(platform),
-            business_id=business_id,
-            platform=platform,
-        )
-    except TokenCipherError:
-        # `revoke_connection` reads the credential first, to revoke it at the platform.
-        # An envelope that will not open -- a rotated key, or the ephemeral vault after a
-        # restart -- must not make disconnecting impossible: a credential we cannot
-        # decrypt is one we cannot use either, so the honest end state is a revoked row
-        # with nothing in it. Recorded as a defect in `connection_service` rather than
-        # patched there; this route refuses to 500 on it meanwhile.
-        logger.warning(
-            "disconnect could not read the credential to revoke it upstream; forgetting "
-            "it locally: business=%s platform=%s",
-            business_id,
-            platform,
-        )
-        await store.set_status(
-            business_id=business_id,
-            platform=platform,
-            status=ConnectionStatus.REVOKED,
-            forget_credential=True,
-        )
+    await revoke_connection(
+        store=store,
+        provider=factory(platform),
+        business_id=business_id,
+        platform=platform,
+    )
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)

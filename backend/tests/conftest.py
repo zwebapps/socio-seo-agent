@@ -12,6 +12,12 @@ network calls that pass locally and fail in CI.
 So the keys are stripped here, before anything is imported. A test that wants a
 configured provider passes `env={...}` explicitly, which is how every provider seam in
 this project is written.
+
+One entry in the list is stripped for a second reason rather than that one --
+`PLATFORM_CREDENTIAL_KEY` cannot make an outbound call, but it does decide which cipher
+the whole suite runs against, and a suite that exercises a different cipher on a
+developer's box than in CI is the failure mode this file exists to prevent, arriving by
+the other door. See the comment beside it.
 """
 
 import os
@@ -26,6 +32,14 @@ _CREDENTIALS = (
     "RESEND_API_KEY",
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
+    # Not an outbound call -- a DIVERGENCE. `core/token_cipher.select_token_cipher` reads
+    # this from `os.environ`, so a developer holding a real AES key runs the suite against
+    # `AesGcmCipher` where CI, which has no key, runs it against `NotConfiguredCipher`.
+    # Two different ciphers under one green tick is the "works in CI, fails on the box"
+    # shape, and it is the shape this repo has already been bitten by. Stripped for the
+    # same reason as the rest: a test that wants a cipher passes `env={...}` to
+    # `select_token_cipher`, or injects the cipher it means.
+    "PLATFORM_CREDENTIAL_KEY",
 )
 
 #: DeepEval is a dev dependency (the LLM-judged eval arm, `evals/deepeval_arm.py`),
@@ -63,5 +77,5 @@ def _no_credentials_leaked() -> None:
     for name in _CREDENTIALS:
         assert name not in os.environ, (
             f"{name} is set during the test suite. Tests must never hold a real "
-            "credential: pass env={...} to the provider seam instead."
+            "credential: pass env={...} to the seam that reads it instead."
         )

@@ -669,10 +669,17 @@ async def test_disconnecting_still_forgets_a_credential_that_will_not_decrypt() 
     """The ephemeral vault does not survive a restart, which is documented behaviour, not
     a fault -- and a customer must still be able to disconnect. A credential we cannot
     decrypt is one we cannot use, so the honest end state is a revoked row with nothing in
-    it."""
-    store = FakeConnectionStore()
+    it.
 
-    async with _client(store) as client:
+    This route no longer catches anything to achieve that: ``revoke_connection`` decides
+    it, and ``tests/services/test_connection_service.py`` asserts the decision and the log
+    line that records it. What is pinned HERE is the promise the outside sees -- a 204 and
+    a wiped row -- so folding the workaround into the service cannot quietly change it.
+    """
+    store = FakeConnectionStore()
+    provider = RecordingProvider()
+
+    async with _client(store, provider=provider) as client:
         started = await _start(client)
         await client.get(
             f"/api/v1/connections/{PLATFORM}/callback",
@@ -687,6 +694,10 @@ async def test_disconnecting_still_forgets_a_credential_that_will_not_decrypt() 
     assert after is not None
     assert after.status is ConnectionStatus.REVOKED
     assert after.has_credential is False
+    assert provider.revoked == [], (
+        "there was no readable token to send, so a revoke reaching the platform here "
+        "would have been made with something invented"
+    )
 
 
 async def test_an_unknown_platform_is_a_404_that_names_the_known_ones() -> None:

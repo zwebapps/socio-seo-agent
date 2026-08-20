@@ -12,6 +12,7 @@ and ``tests/db/test_platform_connections.py`` tests the storage. It goes through
 is asserted on the same code the database path uses.
 """
 
+import logging
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -19,8 +20,10 @@ from uuid import UUID, uuid4
 import pytest
 
 from backend.app.core.token_cipher import (
+    CipherNotConfiguredError,
     EphemeralVaultCipher,
     Secret,
+    TokenCipherError,
     credential_aad,
     mask_secret,
 )
@@ -71,6 +74,16 @@ class InMemoryConnectionStore:
     def __init__(self) -> None:
         self._cipher = EphemeralVaultCipher()
         self._rows: dict[tuple[UUID, str], _Row] = {}
+
+    def simulate_restart(self) -> None:
+        """Replace the ephemeral vault, leaving every stored envelope unreadable.
+
+        Exactly what a deploy does under ``PLATFORM_CREDENTIAL_KEY=ephemeral``, which is
+        the documented local configuration: the rows survive and the plaintexts do not.
+        Not a fault -- and the one state in which a disconnect has to work without being
+        able to read what it is disconnecting.
+        """
+        self._cipher = EphemeralVaultCipher()
 
     async def save_grant(
         self, *, business_id: UUID, platform: str, grant: TokenGrant
@@ -152,6 +165,24 @@ class InMemoryConnectionStore:
         return self._cipher.decrypt(
             envelope, aad=credential_aad(business_id=business_id, platform=platform)
         )
+
+
+class _StoreWithUnopenableCredential(InMemoryConnectionStore):
+    """The store, with ``reveal_access`` raising a chosen cipher failure.
+
+    A subclass rather than a second double: everything else about the row -- the write,
+    the view, the status move, the wipe -- has to behave exactly as it does everywhere
+    else in this file, or the test would be proving something about a stub instead of
+    about the lifecycle. Only the one read is replaced, and it is replaced with the error
+    a store would genuinely raise rather than with a generic exception.
+    """
+
+    def __init__(self, error: TokenCipherError) -> None:
+        super().__init__()
+        self._error = error
+
+    async def reveal_access(self, *, business_id: UUID, platform: str) -> Secret | None:
+        raise self._error
 
 
 class MovableClock:
@@ -398,6 +429,87 @@ async def test_revoke_tells_the_platform_before_forgetting_the_credential() -> N
 
     assert provider.revoked is True, "the platform was never told"
     assert result is not None and result.has_credential is False
+
+
+async def test_revoking_a_credential_that_will_not_decrypt_still_disconnects(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unreadable envelope must not make disconnecting impossible.
+
+    Under ``PLATFORM_CREDENTIAL_KEY=ephemeral`` -- the documented local configuration --
+    every envelope is unreadable after ANY restart, and a rotated key does the same thing
+    in production. Reading the credential first is correct (we cannot revoke at the
+    platform without it), but letting that read decide whether the customer is allowed to
+    disconnect turns the one request whose entire content is "stop being able to act as
+    me" into a 500 they can never get past.
+
+    So: the credential is forgotten, and the fact that the platform was never told is
+    RECORDED. Both halves are asserted, because the failure mode of a silent version of
+    this is worse than the crash -- it would claim a remote revocation that never
+    happened.
+    """
+    caplog.set_level(logging.WARNING)
+    store = InMemoryConnectionStore()
+    clock = MovableClock()
+    business_id = uuid4()
+    provider = RefusingProvider(retryable=False)
+
+    await _connect(store, _provider(clock), business_id)
+    store.simulate_restart()
+    result = await revoke_connection(
+        store=store, provider=provider, business_id=business_id, platform=PLATFORM
+    )
+
+    assert result is not None
+    assert result.status is ConnectionStatus.REVOKED
+    assert result.has_credential is False
+    assert result.unusable_reason(now=clock()) is not None
+    assert await store.reveal_access(business_id=business_id, platform=PLATFORM) is None
+
+    assert provider.revoked is False, (
+        "the credential could not be read, so the platform CANNOT have been told -- a "
+        "revoke call here would have been made with something we invented"
+    )
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "revoked locally only" in logged, (
+        "a local-only revocation that says nothing is indistinguishable from one that "
+        "reached the platform"
+    )
+    assert PLATFORM in logged
+
+
+async def test_revoking_works_even_when_no_cipher_is_configured_at_all(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same judgement, for the other way a credential becomes unreadable.
+
+    ``CipherNotConfiguredError`` (the key was removed after the rows were written) and
+    ``CredentialUnreadableError`` (the key changed, or the vault restarted) are different
+    problems with different fixes, and the log says which -- but neither may block a
+    disconnect, so the decision is taken on their shared base class rather than on one of
+    them. A catch narrowed to the subclass would pass the test above and still 500 here.
+    """
+    caplog.set_level(logging.WARNING)
+    store = _StoreWithUnopenableCredential(
+        CipherNotConfiguredError("PLATFORM_CREDENTIAL_KEY is not set")
+    )
+    business_id = uuid4()
+    provider = RefusingProvider(retryable=False)
+
+    await _connect(store, _provider(MovableClock()), business_id)
+    result = await revoke_connection(
+        store=store, provider=provider, business_id=business_id, platform=PLATFORM
+    )
+
+    assert result is not None
+    assert result.status is ConnectionStatus.REVOKED
+    assert result.has_credential is False
+    assert provider.revoked is False
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "revoked locally only" in logged
+    assert "PLATFORM_CREDENTIAL_KEY is not set" in logged, (
+        "the cipher's own sentence names the fix; summarising it loses the fix"
+    )
 
 
 async def test_refreshing_or_revoking_an_absent_connection_is_not_an_error() -> None:

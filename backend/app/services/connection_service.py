@@ -28,6 +28,12 @@ rest of this codebase applies to derived state.
 :func:`complete_connect` fails and no row is written. The alternative — write the token
 in the clear and tidy it up later — leaves every credential taken before the cleanup
 readable forever, in every backup made meanwhile.
+
+That refusal is about *storing*, and it does not generalise to reading. A credential we
+cannot open is one we cannot use either, so it must never block the customer from
+disconnecting: :func:`revoke_connection` handles the unreadable case itself and records
+that the platform was not told, because the alternative is an account nobody can
+disconnect for as long as the key stays rotated.
 """
 
 from __future__ import annotations
@@ -41,7 +47,7 @@ from enum import StrEnum
 from typing import Final, Protocol
 from uuid import UUID
 
-from backend.app.core.token_cipher import Secret
+from backend.app.core.token_cipher import Secret, TokenCipherError
 from backend.app.services.platform_oauth import (
     CONNECTABLE_PLATFORMS,
     PLATFORM_SCOPES,
@@ -335,22 +341,60 @@ async def revoke_connection(
     business_id: UUID,
     platform: str,
 ) -> ConnectionView | None:
-    """Disconnect: tell the platform, then forget the credential.
+    """Disconnect: tell the platform if we can, then forget the credential.
 
     In that order, and the order is the whole point. Wiping our copy first would leave a
     live token on the platform that we can no longer revoke — the credential outlives the
-    disconnect the customer just asked for. Conversely a provider that fails to revoke
-    must NOT stop us forgetting: the customer asked to disconnect, and a token we cannot
-    revoke is a token we should at least stop being able to use.
+    disconnect the customer just asked for. Conversely nothing that goes wrong upstream
+    may stop us forgetting: the customer asked to disconnect, and a token we cannot revoke
+    is a token we should at least stop being able to use.
+
+    There are two ways "tell the platform" does not happen, and neither is allowed to
+    become a refusal to disconnect:
+
+    * the provider rejects the revoke — the platform has our request and answered it;
+    * **the credential cannot be read at all** — a rotated key, or the ephemeral vault
+      after ANY restart, which is the documented local configuration. Then there is
+      nothing to send, because the only thing we could send is a token we do not have.
+
+    Both end in the same place — ``revoked``, credential wiped — and both are logged as a
+    WARNING naming the platform as *not told*. That log line is the whole record: the
+    status column deliberately does not distinguish (see :class:`ConnectionStatus`, "here
+    or at the platform"), so a local-only revocation that logged nothing would be
+    indistinguishable from one that reached the platform, and the difference is exactly
+    what an operator chasing a live token needs. Raising instead — which is what reading
+    the credential unguarded does — would make the one request whose entire content is
+    "stop being able to act as me" a 500 the customer can never get past. The decision
+    lives here rather than at each caller so that every caller gets it right; the
+    ``TokenCipherError`` catch in ``api/connections.py`` folded into this.
     """
-    credential = await store.reveal_access(business_id=business_id, platform=platform)
+    try:
+        credential = await store.reveal_access(business_id=business_id, platform=platform)
+    except TokenCipherError as exc:
+        # The cipher's own sentence is carried through rather than summarised: it names
+        # which failure this is and what to do about it, and the two causes have different
+        # fixes even though they have the same consequence here. Caught on the base class
+        # for that reason -- `CipherNotConfiguredError` and `CredentialUnreadableError`
+        # both mean "there is no token to send".
+        logger.warning(
+            "the stored credential could not be read, so the platform was NOT told and "
+            "the connection is revoked locally only: business=%s platform=%s reason=%s",
+            business_id,
+            platform,
+            exc,
+        )
+        credential = None
+
     if credential is not None:
         try:
             await provider.revoke(credential)
         except OAuthError as exc:
+            # Same sentence shape as the unreadable-credential branch above, on purpose:
+            # both record the same fact — the platform did not forget this credential —
+            # and two phrasings for one fact is two things to grep for.
             logger.warning(
-                "revoke at platform failed, forgetting locally anyway: "
-                "business=%s platform=%s error=%s",
+                "the platform refused the revoke, so the connection is revoked locally "
+                "only: business=%s platform=%s error=%s",
                 business_id,
                 platform,
                 exc,
