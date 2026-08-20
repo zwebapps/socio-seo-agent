@@ -154,7 +154,7 @@ Same libraries you've used before, installed fresh here — nothing inherited fr
 | DB | Postgres 16 + **pgvector** · SQLAlchemy · Alembic | app data + RAG in one store |
 | Frontend | **Next.js 16 · React 19 · Tailwind 4 · shadcn/ui** | grading criterion is "uses a front-end library"; Streamlit forfeits it |
 | Observability | **Langfuse** (docker or free cloud) | self-hostable, EU, cheap at eval volume |
-| Eval | **Ragas** + deterministic rubric | faithfulness/relevancy + SEO/brand/format compliance |
+| Eval | **DeepEval** + deterministic rubric | faithfulness/relevancy (LLM-judged, judge routed through our own `ModelRouter`) + SEO/brand/format compliance. DeepEval rather than Ragas because Ragas caps `openai<3` through `instructor` and this project is deliberately on openai v3 — see `ARCHITECTURE.md` §14 |
 | Jobs | FastAPI `BackgroundTasks` + SSE, then **ARQ/Redis** once a run exceeds ~60 s | don't buy a queue before durability is needed |
 | Data providers | Tavily *or* Brave (search) · optional **Apify actors** for SERP/social/Maps | buy the scraping, don't build it |
 | Tests | pytest · pytest-asyncio · `respx` | every external call faked; no live API calls in CI, ever |
@@ -185,7 +185,7 @@ Social-Marketing-Agent/          ← repo root; nothing above this line is ours
 │  └─ api/                       auth businesses documents runs opportunities
 │                                content approvals metrics feedback settings
 ├─ frontend/                     Next.js (user mode + /developer)
-├─ evals/                        datasets/, run_ragas.py, rubric.py, geo_eval.py, report.md
+├─ evals/                        dataset.py, run.py, rubric.py, deepeval_arm.py, report.md
 └─ docker-compose.yml            postgres · redis · langfuse · api · web
 ```
 
@@ -263,13 +263,13 @@ Timeboxes are part-time days. Each phase ends green: ruff + mypy + pytest pass a
 | **7** | UI | 2 | **User mode:** onboarding → documents → opportunities → run timeline (nodes, tool calls, live cost) → draft / SEO score / social / AI-answer tabs → edit → approve → export. **Developer mode** `/developer`, role-gated server-side: model picker, temperature & max-tokens sliders, prompt-version selector, tool toggles, raw trace. Brand voice (professional/friendly/concise) sits in *user* mode — it's a brand decision, not an LLM knob. Empty states, skeletons, retryable error toasts, WCAG AA. **DoD:** a non-technical person completes onboarding → approved content unaided |
 | **8** | Auth, memory, feedback | 1.5 | JWT cookie + argon2; all data scoped per user+business with a cross-tenant test; short-term = thread checkpoint, long-term = DNA + `learned_style`; thumbs + 4-axis rubric + reject reason. **DoD:** two users cannot see each other's businesses (asserted) |
 | **9** | Security hardening | 1 | Prompt-injection: fetched/document text wrapped in a data envelope with an explicit instruction-hierarchy rule; no tool call may be triggered by fetched content; `publish` never reachable from crawled text. SSRF allowlist (HTTPS only, DNS-resolve and block private/link-local, 5 s timeout, 2 MB cap, robots respected). Rate limits per user and IP. Output guard against regulated claims via `dna.avoid`. Secrets env-only, never in the browser. PII scan on uploads. **DoD:** 10-payload injection corpus, all fail to change behaviour, proven by a test |
-| **10** | Observability + evaluation | 2 | Langfuse on every LLM/tool call with run_id, prompt version, cost, and user feedback attached as a score. Eval set: 20 business/topic cases. **Ragas** faithfulness + relevancy on grounded sections; deterministic rubric for SEO score, brand violations, format compliance; **GEO eval** = SoV delta. `evals/report.md` compares prompt v1 vs v2 and cheap vs strong model. **DoD:** `python evals/run.py` emits defensible numbers |
+| **10** | Observability + evaluation | 2 | Langfuse on every LLM/tool call with run_id, prompt version, cost, and user feedback attached as a score. Eval set: 20 business/topic cases. **DeepEval** faithfulness + relevancy on grounded sections (not Ragas — see `ARCHITECTURE.md` §14); deterministic rubric for SEO score, brand violations, format compliance; **GEO eval** = SoV delta. `evals/report.md` compares prompt v1 vs v2 and cheap vs strong model. **DoD:** `python evals/run.py` emits defensible numbers |
 | **11** | Agentic RAG + learning loop | 2 | Retrieval becomes a tool the agent chooses, with query rewriting → relevance grading → fallback to `web_search` when graded irrelevant (the grade→re-retrieve→fallback cycle is what makes it agentic). Top-rated approved pieces become retrieved few-shot exemplars; recurring reject reasons distil weekly into proposed `dna` brand rules the user approves — never silently mutated. **DoD:** demonstrate a rejected style issue that stops recurring |
 | **12** | Docs + demo | 1 | README (what/why/who, 5-min quickstart, screenshots, architecture diagram, cost table), `DECISIONS.md` (every choice + the rejected alternative), `EVALUATION.md`, `DEMO.md` (6-min script), in-app help assistant answering "how do I…" from the docs via the same RAG stack |
 
 **Track A total ≈ 20 working days part-time.**
 
-**Cut order if time runs short** (each cut is safe, in this order): Phase 11 → Ragas half of 10 (keep Langfuse) → Phase 6 lead loop (keep the CTA and UTMs, drop the hosted form) → Phase 4 down to one model instead of three. **Never cut:** 0–3, 5, 7, 9. Phases 0–5 + 7 alone satisfy every *required* grading criterion; everything past that is bonus points.
+**Cut order if time runs short** (each cut is safe, in this order): Phase 11 → the LLM-judged half of 10 (keep Langfuse and the deterministic rubric) → Phase 6 lead loop (keep the CTA and UTMs, drop the hosted form) → Phase 4 down to one model instead of three. **Never cut:** 0–3, 5, 7, 9. Phases 0–5 + 7 alone satisfy every *required* grading criterion; everything past that is bonus points.
 
 ### Track B — the product path (after the course)
 

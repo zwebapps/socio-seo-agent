@@ -460,9 +460,15 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   generic error would turn a working safeguard into a mystery. Original text: a run stranded
   `running`
   by a dead process is recoverable only by curl. The runs list is its natural home.
-- [ ] **No frontend test framework exists** (no vitest/jest in `package.json`), so none of
-  the React code has automated tests — the backend half of this work has 18, the UI half
-  has none. Worth an explicit decision rather than drift.
+- [x] **No frontend test framework exists** — `729a020`. Decision taken: **Vitest + React
+  Testing Library in jsdom**, 53 tests, wired into the `web` CI job as its own step. Aimed
+  where a bug is invisible rather than at coverage — `partial` never rendering as `ok`,
+  polling that provably STOPS, the pagination dedupe run as a real sequence, a refusal shown
+  verbatim, and every empty review tab naming its own node. Each behaviour was
+  mutation-tested (broken in the source, suite confirmed red, source restored). It found a
+  contradiction in shipped copy: "Searchable — 0 passages the agent can quote".
+  Deliberately still untested: `safe-html.tsx`, which is the XSS boundary and the
+  highest-value target in the frontend — it needs its own suite (see below).
 - [x] **`GET /api/v1/runs` has a cap, not pagination** — `417c5f8`. A keyset cursor on
   `(created_at, id)` — the tuple the query already orders by — compared as a row value, because
   `created_at < stamp` alone drops every run sharing that microsecond and `<=` repeats it.
@@ -511,3 +517,23 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   criteria permit ("Ragas or DeepEval") — see `evals/`. Left OPEN rather than ticked because
   somebody grading against the literal word "Ragas" deserves to find this paragraph rather than
   a silent substitution.
+- [ ] **`evals/report.md` still names Ragas in its header and its column titles.** The
+  checked-in report is a real `--live` run (2026-08-19, `gpt-4.1-mini`, real money), and
+  regenerating it hermetically would overwrite measured numbers with FakeProvider
+  canned-string ones — destroying evidence to refresh a header. Needs one `--live
+  --deepeval` run by somebody with a key, which is ⛔ by the money guardrail. Roughly 280
+  mid-tier calls for the full 20 cases × 2 arms.
+- [ ] **`frontend/app/components/safe-html.tsx` has no tests, and it is the XSS boundary.**
+  Named by the test work rather than deferred silently: it is the highest-value target in
+  the frontend and deserves a focused suite (allowed tags, stripped handlers, entity
+  handling), not a few assertions appended to a component test.
+- [ ] **`statusTone(status)` remains status-only for callers that have no document.**
+  `documentTone(document)` is what the screens use, and it is what lets a zero-passage
+  `indexed` file avoid a green pill. The narrower function is kept because a caller with
+  only a status string is a real case, but the two must not drift — if a third colour rule
+  appears, fold them.
+- [ ] **The Docker `images` CI job is unverified against the new frontend test files.**
+  `docker build -f frontend/Dockerfile` ran past 15 minutes locally and was killed. Local
+  `pnpm build` exercises the same compile-and-typecheck path with the test files present
+  and `--frozen-lockfile` is verified, so the risk is low — but low is not verified, and CI
+  is where it will be found out.

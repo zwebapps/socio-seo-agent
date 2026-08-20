@@ -179,7 +179,7 @@ Data envelope with instruction hierarchy on all crawled and uploaded text · per
 ---
 
 ### Phase 12 — Observability + evaluation · 2 d
-Langfuse on every LLM and tool call: `run_id`, `business_id`, node, model, prompt version, tokens, USD, latency, outcome, with user feedback attached as a score. Eval set of 20 business/topic cases. **Ragas** faithfulness + answer relevancy on the RAG-grounded sections; deterministic rubric for SEO score, brand-rule violations, format compliance; **GEO eval** = SoV delta. `evals/report.md` compares prompt v1 vs v2 and cheap vs strong model.
+Langfuse on every LLM and tool call: `run_id`, `business_id`, node, model, prompt version, tokens, USD, latency, outcome, with user feedback attached as a score. Eval set of 20 business/topic cases. **DeepEval** faithfulness + answer relevancy on the RAG-grounded sections (LLM-judged, judge routed through our own `ModelRouter`; not Ragas — see `ARCHITECTURE.md` §14); deterministic rubric for SEO score, brand-rule violations, format compliance; **GEO eval** = SoV delta. `evals/report.md` compares prompt v1 vs v2 and cheap vs strong model.
 
 **DoD:** `python evals/run.py` produces a report with numbers you can defend, including a **RAG-off vs RAG-on faithfulness comparison** — the single most persuasive chart in the submission.
 
@@ -233,7 +233,7 @@ Every renderer output passes deterministic validation before it is shown: length
 **Cut in this order** (ranked by demo value lost, least first):
 
 1. Phase 13 (feedback learning) — Hard #4, but you already have three Hard tasks
-2. The Ragas half of Phase 12 — keep Langfuse; tracing is the cheaper Hard task
+2. The LLM-judged half of Phase 12 — keep Langfuse and the deterministic rubric; tracing is the cheaper Hard task
 3. Phase 8 down to CTA + UTMs, dropping the hosted form
 4. Phase 5 down to probing one model instead of three
 5. Phase 4's `serp` half, keeping the `seo` scorer
@@ -260,7 +260,7 @@ Every renderer output passes deterministic validation before it is shown: length
 | M8 | Security guard | 11 | injection corpus + the visible "ignored" banner |
 | **H1** | **Agentic RAG** | **3** | grade → re-retrieve → fallback, with the trace panel |
 | **H2** | **Observability** | **12** | Langfuse traces + feedback as scores |
-| **H3** | **Eval report** | **12** | Ragas + rubric, RAG-off vs RAG-on |
+| **H3** | **Eval report** | **12** | DeepEval (not Ragas — it cannot install against openai v3; see `ARCHITECTURE.md` §14) + the deterministic rubric, RAG-off vs RAG-on |
 | H4 | Learns from feedback | 13 | proposed-rule diffs from reject reasons |
 
 **Delivered: 4 easy · 8 medium · 4 hard**, against a requirement of 2 medium + 1 hard. Phases 0–11 alone already carry 3 hard tasks.
