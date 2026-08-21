@@ -95,8 +95,8 @@ makes a partial result a first-class outcome rather than a crash.
 | `OPPORTUNITY` | agent | mid | `facts` | ranked `Opportunity[]`, one chosen | `kb.search` `record_opportunities` | none found → return the audit instead |
 | `PLAN` | agent | mid | opportunity, `facts`, `dna` | `Outline` — H-tree, keywords, answer blocks, CTA | `kb.search` `record_outline` | no target keyword → reject, retry once |
 | `GENERATE` | agent | **strong** | outline, `kb`, `exemplars`, `remembered` | `Draft` with citations | `kb.search` `web_search` `record_page` | section retry ×2 → shorter piece |
-| `CONVERT` | agent | cheap | outline, draft, `kb`, `dna` | `LandingPageSpec` — offer, sourced proof, form, primary CTA, one CTA per channel | `kb.search` `record_landing_page` | no landing page → the run keeps its article and records the loss |
-| `VALIDATE` | **engines only** | — | draft, landing page | `seo_report`, `claim_check`, `landing_report` | `seo.score` `claims.check` `landing.check` `kb.verify` | < 85 → back to the node that produced the failing artifact, with `fix_hint`s |
+| `CONVERT` | agent | cheap | outline, draft, crawled pages, `kb`, `dna` | `distribution` — where the clicks land on the business's OWN site, and one ask per channel | `kb.search` `record_distribution` | no plan → the run keeps its article and records the loss |
+| `VALIDATE` | **engines only** | — | draft, the per-channel ask | `seo_report`, `claim_check` | `seo.score` `claims.check` `kb.verify` | < 85 → back to GENERATE with `fix_hint`s |
 | `REPACK` | agent | cheap | `spine`, `channel_specs` | `renderings` per channel | `channel.validate` `claims.check` `record_posts` | over-length → trim + regenerate one channel |
 | `REVIEW` | **interrupt** | — | everything | `approval` | none | reject reason feeds the feedback loop |
 | `EXPORT` | **actuator** | — | approval token | published refs | `publish` `notify` | idempotent; refuses without a token |

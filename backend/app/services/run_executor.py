@@ -284,6 +284,7 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         geo_probe=_build_geo_probe(business_id, router),
         actuator_for=_build_actuator_resolver(),
         actuator_store=PostgresActionStore(),
+        publish_distribution=_build_publish_distribution(),
         owner_notice=await _resolve_owner_notice(business_id),
         # Same rule as `serp_search` and for the same reason: a FAKE search result
         # reaching a draft is worse than no search at all, because afterwards nothing
@@ -291,6 +292,62 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         # not run rather than treating an empty answer as a finding.
         web_search=serp_search,
     )
+
+
+def _build_publish_distribution() -> Callable[..., Awaitable[Any]]:
+    """Mint the tracked links and write the article piece, for EXPORT.
+
+    A closure over the two stores rather than a NodeDeps field per store, so the node
+    stays database-free and the argument list stays about the RUN rather than about
+    persistence.
+
+    The origin check lives inside `publish_distribution`, not here: CONVERT proposes the
+    destination from crawled pages — text we do not control — and the guard belongs at
+    the write, where no retry can talk past it.
+    """
+    from backend.app.db.adapters.content_store import PostgresContentStore
+    from backend.app.db.adapters.lead_store import PostgresLeadStore
+    from backend.app.engines.landing import ChannelCta
+    from backend.app.services.landing_service import publish_distribution
+
+    content_store = PostgresContentStore()
+    link_store = PostgresLeadStore()
+
+    async def publish(
+        *,
+        business_id: UUID,
+        run_id: UUID | None,
+        plan: Mapping[str, Any],
+        draft: Mapping[str, Any],
+        website: str,
+    ) -> dict[str, Any]:
+        ctas = [
+            ChannelCta(channel=str(cta["channel"]), text=str(cta["text"]))
+            for cta in plan.get("ctas", [])
+            if isinstance(cta, Mapping) and cta.get("channel") and cta.get("text")
+        ]
+        result = await publish_distribution(
+            business_id=business_id,
+            destination_url=str(plan.get("destination_url") or ""),
+            website=website,
+            ctas=ctas,
+            article_title=str(draft.get("title") or "Untitled"),
+            article_body_md=str(draft.get("html") or ""),
+            content_store=content_store,
+            link_store=link_store,
+            run_id=run_id,
+        )
+        # Primitives only: this lands in `published`, which is checkpointed to JSONB.
+        return {
+            "content_piece_id": str(result.content_piece_id),
+            "destination_url": result.destination_url,
+            "ctas": [
+                {"channel": cta.channel, "text": cta.text, "url": cta.url, "code": cta.code}
+                for cta in result.ctas
+            ],
+        }
+
+    return publish
 
 
 def _build_actuator_resolver() -> Callable[[str], Actuator | None]:

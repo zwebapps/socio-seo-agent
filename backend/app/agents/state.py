@@ -169,11 +169,19 @@ class AgentState(TypedDict):
     opportunity: NotRequired[dict[str, Any] | None]
     outline: NotRequired[dict[str, Any] | None]
     draft: NotRequired[dict[str, Any] | None]
-    #: The landing page CONVERT wrote: headline, offer, sourced proof points, the
-    #: form spec, the primary CTA and one CTA per channel. A `LandingPageSpec`
-    #: dumped to primitives, because this is checkpointed to a JSONB column and a
+    #: What CONVERT wrote: where the CTAs point on the business's OWN site, and the
+    #: ask per channel. `{"destination_url": str, "ctas": [{"channel", "text"}]}`.
+    #:
+    #: It replaced `landing_page` when the founder ruled that we host no page (recorded
+    #: in `CLAUDE.md`, 2026-08-21): the business already has a website, so a run improves
+    #: that site's SEO and drives traffic to it rather than standing up a competitor to
+    #: it. Primitives, not a model, because this is checkpointed to a JSONB column and a
     #: state that cannot serialise cannot resume.
-    landing_page: NotRequired[dict[str, Any] | None]
+    #:
+    #: `landing_page` and `landing_report` are GONE from new states. A checkpoint written
+    #: before this change still holds them; nothing reads them, and nothing migrates a
+    #: JSONB column, so they simply travel unused until that run is finished.
+    distribution: NotRequired[dict[str, Any] | None]
     #: Channel -> the finished post for that channel, as
     #: ``{"body", "hashtags", "hashtags_removed", "hashtags_shortfall", "over_target"}``.
     #:
@@ -196,10 +204,6 @@ class AgentState(TypedDict):
     #: the graph treats an absent verdict as "nothing checked" and a present
     #: failing one as a publication block.
     claim_check: NotRequired[dict[str, Any] | None]
-    #: The deterministic conversion verdict on `landing_page`, written by VALIDATE.
-    #: `None` means there was nothing to audit, which is NOT the same as a pass --
-    #: the graph gates on a present, failing verdict and leaves an absent one alone.
-    landing_report: NotRequired[dict[str, Any] | None]
     #: Who approved publication, and the ONLY thing that lets EXPORT act.
     #:
     #: `None` means nobody has, and EXPORT then publishes nothing and says so. It is
@@ -285,11 +289,10 @@ def new_state(
         opportunity=None,
         outline=None,
         draft=None,
-        landing_page=None,
+        distribution=None,
         renderings={},
         seo_report=None,
         claim_check=None,
-        landing_report=None,
         approved_by=None,
         published=None,
         measurement=None,

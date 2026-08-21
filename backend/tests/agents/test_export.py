@@ -185,10 +185,24 @@ def _notifier() -> tuple[OwnerNoticeActuator, RecordingSender]:
     return OwnerNoticeActuator(sender), sender
 
 
+async def _mint(**kwargs: Any) -> dict[str, Any]:
+    """A link-minting stub.
+
+    Present by default because EXPORT records a `links_not_wired` error without one —
+    correct behaviour, and noise in a test about whether a POST went out. The test that
+    cares about the warning injects `publish_distribution=None` explicitly.
+    """
+    return {
+        "content_piece_id": "11111111-1111-4111-8111-111111111111",
+        "destination_url": "https://mueller-sanitaer.de/notdienst",
+        "ctas": [{"channel": "linkedin", "text": "Book", "url": "http://x/l/abc", "code": "abc"}],
+    }
+
+
 def _deps(**over: Any) -> NodeDeps:
     # No `channels` here: the run's channel set is state, not a dependency, so `_state`
     # below declares it. EXPORT reads `renderings` rather than the channel list anyway.
-    base: dict[str, Any] = {"router": object()}
+    base: dict[str, Any] = {"router": object(), "publish_distribution": _mint}
     base.update(over)
     return NodeDeps(**base)
 
@@ -212,7 +226,6 @@ def _state(**over: Any) -> AgentState:
     state.update(
         {
             "approved_by": APPROVER,
-            "landing_page": {"headline": "Notdienst in 30 Minuten", "offer": "Festpreis"},
             "renderings": {
                 "linkedin": {"body": "Wir sind da.", "hashtags": ["#Notdienst"]},
                 "facebook": {"body": "Wir sind da.", "hashtags": []},
@@ -276,21 +289,6 @@ async def test_the_approver_is_recorded_on_every_actuation() -> None:
 # --------------------------------------------------------------------------- #
 # EXPORT: what it publishes, and in what order
 # --------------------------------------------------------------------------- #
-
-
-async def test_the_landing_page_is_published_before_the_posts_that_point_at_it() -> None:
-    """Ordering with a consequence: every post carries the ask that points at the page,
-    so posting first spends the clicks a tracked link earns on a page that is not there
-    yet -- and those clicks are the leads the whole chain exists to capture."""
-    posts = Publisher()
-    page = Publisher(PAGE_PUBLISH_ACTION)
-    deps, ledger = _wired(posts, page)
-
-    updates = await build_nodes(deps)["EXPORT"](_state())
-
-    assert ledger.claimed[0].action_type == PAGE_PUBLISH_ACTION
-    assert ledger.targets(SOCIAL_POST_ACTION) == ["linkedin", "facebook"]
-    assert updates["published"]["refs"][0]["target"] == "landing_page"
 
 
 async def test_a_published_post_carries_its_body_and_hashtags() -> None:
@@ -434,20 +432,25 @@ async def test_a_simulated_publish_says_so_all_the_way_up() -> None:
     )
 
 
-async def test_an_integration_missing_for_one_action_type_only_loses_that_one() -> None:
-    """Configured integrations, but none that can publish a page. Distinct from "no
-    integration at all", and the run has to be able to say which it was."""
-    deps, _ = _wired(Publisher())
+async def test_link_minting_that_is_not_wired_is_named_without_stopping_the_posts() -> None:
+    """The attribution half and the publishing half fail independently.
+
+    Minting the tracked links is not an actuator — it is a database write — so a
+    deployment can have a working publisher and no link minting. The posts are still
+    worth sending, and the owner has to be told their clicks will not be attributable
+    rather than discovering it from an empty leads screen weeks later.
+    """
+    deps, _ = _wired(Publisher(), publish_distribution=None)
 
     updates = await build_nodes(deps)["EXPORT"](_state())
 
     report = updates["published"]
-    assert report["not_published"] == ["landing_page"]
     assert [ref["target"] for ref in report["refs"] if ref["status"] == "succeeded"] == [
         "linkedin",
         "facebook",
-    ]
-    assert "no actuator is configured" in updates["errors"][-1].message
+    ], "the posts still went out"
+    assert any(error.code == "links_not_wired" for error in updates["errors"])
+    assert "distribution" not in report, "no links, so nothing to show as links"
 
 
 async def test_nothing_to_publish_is_its_own_stated_reason() -> None:

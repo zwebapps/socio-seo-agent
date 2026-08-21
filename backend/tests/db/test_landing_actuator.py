@@ -29,22 +29,18 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
-import httpx
 import pytest
 from sqlalchemy import text
 
-from backend.app.actuators import FakeActuator, OutcomeStatus
+from backend.app.actuators import OutcomeStatus
 from backend.app.actuators.landing import LandingPageActuator
 from backend.app.agents.nodes import (
     PAGE_PUBLISH_ACTION,
-    SOCIAL_POST_ACTION,
     NodeDeps,
     build_nodes,
 )
 from backend.app.agents.state import AgentState, new_state
 from backend.app.db.adapters.content_store import (
-    LANDING_SPEC_KEY,
-    LANDING_SURFACE,
     PostgresContentStore,
 )
 from backend.app.db.adapters.lead_store import PostgresLeadStore
@@ -55,7 +51,6 @@ from backend.app.engines.landing.contract import (
     LandingPageSpec,
     ProofPoint,
 )
-from backend.app.main import create_app
 
 pytestmark = [pytest.mark.db]
 
@@ -136,7 +131,9 @@ def _state(business_id: UUID, spec: LandingPageSpec, **over: Any) -> AgentState:
         dna={"name": "Müller Sanitär GmbH", "city": "Koblenz"},
         channels=("linkedin", "facebook"),
     )
-    state.update({"approved_by": APPROVER, "landing_page": spec.model_dump(mode="json")})
+    # No `landing_page` key any more: the actuator tests build their own `Actuation`
+    # payload from the spec, and EXPORT has no page to carry.
+    state.update({"approved_by": APPROVER})
     state.update(over)  # type: ignore[typeddict-item]
     return state
 
@@ -174,182 +171,95 @@ async def read_links(business_id: UUID) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- #
 
 
-async def test_export_publishes_a_real_page_with_a_tracked_link_per_channel(
-    content_store: PostgresContentStore,
-    link_store: PostgresLeadStore,
-    business_a: UUID,
-) -> None:
-    """The whole point of A1a: a run leaves a servable page and real tracked links."""
-    ledger = Ledger()
-    spec = a_spec()
-    deps = _deps(content_store, link_store, ledger)
-
-    updates = await build_nodes(deps)["EXPORT"](_state(business_a, spec))
-
-    page = _ref(updates, PAGE_PUBLISH_ACTION)
-    assert page["status"] == "succeeded"
-    # Not simulated, and the ref is a real URL rather than a `fake://` string. These two
-    # assertions are the ones `FakeActuator` could never satisfy.
-    assert page["fake"] is False
-    assert page["external_ref"].startswith(f"{BASE}/p/")
-    assert updates["published"]["simulated"] is False
-
-    pieces = await read_pieces(business_a)
-    assert len(pieces) == 1
-    assert pieces[0]["status"] == "published"
-    assert pieces[0]["surface"] == LANDING_SURFACE
-    # `run_id` is deliberately NOT asserted non-null: `AgentState` carries no run id at
-    # all, so `_actuate` cannot put one on the `Actuation` and the column stays NULL for
-    # every page a run publishes. That is a real attribution gap, filed rather than
-    # widened into this task -- closing it means changing the state contract and the
-    # checkpoint shape in both drivers. The actuator already forwards
-    # `actuation.run_id`, so it needs no change when the state key lands.
-    assert pieces[0]["run_id"] is None
-    # The spec is kept under its own key, so the page can be re-rendered and diffed
-    # without the model that wrote it.
-    assert pieces[0]["meta"][LANDING_SPEC_KEY]["headline"] == spec.headline
-
-    links = await read_links(business_a)
-    assert len(links) == len(spec.ctas)
-    assert {link["channel"] for link in links} == {"linkedin", "facebook"}
-    for link in links:
-        assert link["content_piece_id"] == pieces[0]["id"]
-        # Retargeted after minting, so each link attributes its OWN clicks.
-        assert f"ref={link['code']}" in link["target_url"]
-
-
-async def test_the_published_page_is_actually_servable(
-    content_store: PostgresContentStore,
-    link_store: PostgresLeadStore,
-    business_a: UUID,
-) -> None:
-    """`status='published'` has to mean the public route serves it.
-
-    Storing a row and calling it published is the simulation this task replaced. The
-    public route refuses anything that is not `approved` or `published`, so this is
-    what proves the status the actuator writes is the one the route accepts.
-    """
-    ledger = Ledger()
-    deps = _deps(content_store, link_store, ledger)
-    await build_nodes(deps)["EXPORT"](_state(business_a, a_spec()))
-
-    piece_id = (await read_pieces(business_a))[0]["id"]
-
-    app = create_app()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
-    ) as client:
-        page = await client.get(f"/p/{piece_id}")
-
-    assert page.status_code == 200
-    assert "Checkliste anfordern" in page.text
-    # The consent sentence is not decoration: the form stores contact details.
-    assert "einverstanden" in page.text
-
-
 # --------------------------------------------------------------------------- #
-# 4. The one that matters most
+# The landing actuator, invoked DIRECTLY
+#
+# EXPORT no longer reaches it: the founder ruled that we host no landing page
+# (`CLAUDE.md`, 2026-08-21), so `PAGE_PUBLISH_ACTION` left `PUBLISHABLE_ACTIONS`.
+# The actuator and `publish_landing_page` are RETAINED, because pieces published
+# before that ruling exist and `GET /p/{piece_id}` must keep serving them — so the
+# tests that drove it through the graph are rewritten to call it directly rather
+# than deleted, which would have left retained code with no coverage at all.
 # --------------------------------------------------------------------------- #
 
 
-async def test_running_export_twice_publishes_exactly_one_page(
-    content_store: PostgresContentStore,
-    link_store: PostgresLeadStore,
-    business_a: UUID,
+async def test_the_actuator_still_publishes_a_page_with_a_link_per_channel(
+    scoped_sessions: None, business_a: UUID
 ) -> None:
-    """EXPORT is reached by RESUME, and humans retry a resume.
+    """The retained path, exercised without the graph."""
+    from backend.app.actuators.contract import Actuation
+    from backend.app.actuators.landing import LandingPageActuator
 
-    Without a holding idempotency key this mints a second page and a second set of
-    short links on every retry -- and the first page's links keep pointing at the first
-    page, so half a campaign's clicks land on an orphan. This is the reason
-    `publish.page` belongs in the actuator layer and not in the node.
-    """
-    ledger = Ledger()
     spec = a_spec()
-    deps = _deps(content_store, link_store, ledger)
-    export = build_nodes(deps)["EXPORT"]
-
-    first = await export(_state(business_a, spec))
-    second = await export(_state(business_a, spec))
-
-    assert len(await read_pieces(business_a)) == 1
-    assert len(await read_links(business_a)) == len(spec.ctas)
-
-    assert _ref(first, PAGE_PUBLISH_ACTION)["status"] == "succeeded"
-    assert _ref(first, PAGE_PUBLISH_ACTION)["replayed"] is False
-    # "already done" is a different fact about this run and the same fact about the
-    # world, so it is reported as a success that says it replayed.
-    assert _ref(second, PAGE_PUBLISH_ACTION)["status"] == "succeeded"
-    assert _ref(second, PAGE_PUBLISH_ACTION)["replayed"] is True
-    # Same page, not a second one that happens to look alike.
-    assert (
-        _ref(second, PAGE_PUBLISH_ACTION)["external_ref"]
-        == _ref(first, PAGE_PUBLISH_ACTION)["external_ref"]
+    actuator = LandingPageActuator(
+        content_store=PostgresContentStore(),
+        link_store=PostgresLeadStore(),
+        base_url=BASE,
     )
 
-
-# --------------------------------------------------------------------------- #
-# 5-6. Honesty under mixed configuration, and refusal
-# --------------------------------------------------------------------------- #
-
-
-async def test_a_real_publish_and_a_simulated_post_stay_distinguishable(
-    content_store: PostgresContentStore,
-    link_store: PostgresLeadStore,
-    business_a: UUID,
-) -> None:
-    """One run, two integrations, two different truths -- and the report says which.
-
-    This is the mixed state the resolver's docstring promises and nothing could
-    previously demonstrate: `publish.page` is real now, while `social.post` is still
-    gated on App Review nobody has. A Delivery tab that rendered these identically
-    would be the exact lie the actuator layer exists to prevent.
-    """
-    ledger = Ledger()
-    deps = _deps(
-        content_store,
-        link_store,
-        ledger,
-        also={SOCIAL_POST_ACTION: FakeActuator(SOCIAL_POST_ACTION)},
-    )
-
-    updates = await build_nodes(deps)["EXPORT"](
-        _state(
-            business_a,
-            a_spec(),
-            renderings={"linkedin": {"body": "Wir sind da.", "hashtags": []}},
+    outcome = await actuator.perform(
+        Actuation(
+            business_id=business_a,
+            action_type=actuator.action_type,
+            target="landing_page",
+            payload=spec.model_dump(mode="json"),
+            approved_by=APPROVER,
         )
     )
 
-    assert _ref(updates, PAGE_PUBLISH_ACTION)["fake"] is False
-    assert _ref(updates, SOCIAL_POST_ACTION)["fake"] is True
-    # The run-level flag stays True while ANY destination is simulated, so the note
-    # cannot claim a clean sweep -- and it names the simulation explicitly.
-    assert updates["published"]["simulated"] is True
-    assert "SIMULATED" in updates["published"]["note"]
+    assert outcome.status is OutcomeStatus.SUCCEEDED
+    assert outcome.fake is False, "this app serves the page, so there is nothing to fake"
+
+    pieces = await read_pieces(business_a)
+    assert len(pieces) == 1
+    links = await read_links(business_a)
+    assert {link["channel"] for link in links} == {cta.channel for cta in spec.ctas}
 
 
-async def test_an_unpublishable_page_is_refused_and_writes_nothing(
-    content_store: PostgresContentStore,
-    link_store: PostgresLeadStore,
-    business_a: UUID,
+async def test_the_published_page_is_still_servable(
+    scoped_sessions: None, business_a: UUID
 ) -> None:
-    """A page that cannot capture a lead is a POLICY refusal, not a provider failure.
+    """The reason the actuator is retained rather than deleted: a real row exists and
+    the public route has to keep resolving it."""
+    from backend.app.actuators.contract import Actuation
+    from backend.app.actuators.landing import LandingPageActuator
 
-    And nothing is half-written: the deterministic audit runs before the first INSERT,
-    so a refused publish leaves no orphan piece and no dangling links behind it.
-    """
-    ledger = Ledger()
-    deps = _deps(content_store, link_store, ledger)
-
-    # No consent sentence and no form field: the audit's own errors, not invented ones.
-    updates = await build_nodes(deps)["EXPORT"](
-        _state(business_a, a_spec(consent_text="", form_fields=[]))
+    actuator = LandingPageActuator(
+        content_store=PostgresContentStore(),
+        link_store=PostgresLeadStore(),
+        base_url=BASE,
+    )
+    await actuator.perform(
+        Actuation(
+            business_id=business_a,
+            action_type=actuator.action_type,
+            target="landing_page",
+            payload=a_spec().model_dump(mode="json"),
+            approved_by=APPROVER,
+        )
     )
 
-    page = _ref(updates, PAGE_PUBLISH_ACTION)
-    assert page["status"] == "refused"
-    # The reason reaches the surface, because the fix hints are what the model needs.
-    assert "consent" in (page["error"] or "").lower()
-    assert await read_pieces(business_a) == []
-    assert await read_links(business_a) == []
+    piece_id = (await read_pieces(business_a))[0]["id"]
+    target = await PostgresContentStore().resolve_landing_page(piece_id)
+
+    assert target is not None, "the SECURITY DEFINER resolver still finds it"
+
+
+# --------------------------------------------------------------------------- #
+# What EXPORT does instead
+# --------------------------------------------------------------------------- #
+
+
+async def test_export_no_longer_publishes_a_page(scoped_sessions: None, business_a: UUID) -> None:
+    """The ruling, asserted against real SQL rather than trusted.
+
+    A run that still wrote a `content_pieces` row with `surface='landing_page'` would be
+    hosting a page for a business that asked us not to — and the row is the only place
+    that would show.
+    """
+    deps, _ = _deps(PostgresContentStore(), PostgresLeadStore(), Ledger()), None
+
+    updates = await build_nodes(deps)["EXPORT"](_state(business_a, a_spec()))
+
+    assert all(piece["surface"] != "landing_page" for piece in await read_pieces(business_a))
+    assert "landing_page" not in [ref["target"] for ref in updates["published"]["refs"]]

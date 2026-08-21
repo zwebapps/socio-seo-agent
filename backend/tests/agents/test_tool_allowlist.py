@@ -370,12 +370,21 @@ def test_the_node_that_may_search_is_the_one_that_writes_the_article() -> None:
     assert [node for node, tools in NODE_TOOLS.items() if "web_search" in tools] == ["GENERATE"]
 
 
-def test_the_landing_audit_belongs_to_the_node_with_no_model_in_it() -> None:
-    """ "Is there a form, and can it be answered" is set membership. Granting
-    `landing.check` to CONVERT instead would let the node that WROTE the page be the one
-    that grades it."""
-    assert "landing.check" in NODE_TOOLS["VALIDATE"]
-    assert "landing.check" not in NODE_TOOLS["CONVERT"]
+def test_the_node_that_writes_the_copy_cannot_grade_it() -> None:
+    """The property the retired `landing.check` grant used to demonstrate.
+
+    That audit went with the landing page (`CLAUDE.md`, 2026-08-21), but the rule it
+    illustrated is the reason VALIDATE exists as its own node: the node that WROTE the
+    copy must not be the one that decides whether it passes. CONVERT holds no verdict
+    tool at all, and VALIDATE holds no output tool — so neither can do the other's job.
+    """
+    assert "claims.check" in NODE_TOOLS["VALIDATE"]
+    assert "seo.score" in NODE_TOOLS["VALIDATE"]
+    assert "claims.check" not in NODE_TOOLS["CONVERT"]
+    assert "seo.score" not in NODE_TOOLS["CONVERT"]
+    assert not any(tool.startswith("record_") for tool in NODE_TOOLS["VALIDATE"]), (
+        "VALIDATE takes verdicts; a node with an output tool could rewrite what it graded"
+    )
 
 
 # --------------------------------------------------------------------------- #

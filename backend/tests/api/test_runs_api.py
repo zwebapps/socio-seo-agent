@@ -284,7 +284,7 @@ LINKEDIN_BODY = "Kurz erklärt: was ein Notar beurkundet. #Notar"
 
 
 async def _exportable_run(service: RunService, *, published: dict[str, Any] | None = None) -> UUID:
-    """A run with two channels and a landing page, checkpointed through the real state.
+    """A run with two channels and a distribution plan, checkpointed through the real state.
 
     Two channels on purpose, and specifically LinkedIn and Instagram: one carries a
     clickable link and the other does not, and that difference is the whole reason the
@@ -293,7 +293,6 @@ async def _exportable_run(service: RunService, *, published: dict[str, Any] | No
     would hide a drift between the spec and this projection, which is the only bug this
     route can really have.
     """
-    from backend.app.engines.landing import ChannelCta, FormField, LandingPageSpec, ProofPoint
 
     run = await service.start(business_id=BUSINESS, goal="more local leads")
     state = new_state(business_id=BUSINESS, goal="more local leads")
@@ -319,16 +318,12 @@ async def _exportable_run(service: RunService, *, published: dict[str, Any] | No
             "over_target": False,
         },
     }
-    state["landing_page"] = LandingPageSpec(
-        headline="Grundstückskauf in Koblenz beurkunden lassen",
-        subhead="Termin innerhalb einer Woche",
-        offer="Kostenlose Ersteinschätzung Ihres Kaufvertrags",
-        proof_points=[ProofPoint(text="Über 400 Beurkundungen", source="Kanzleiprofil 2025")],
-        form_fields=[FormField(name="email", label="E-Mail", required=True)],
-        primary_cta="Termin anfragen",
-        consent_text="Ich bin mit der Kontaktaufnahme einverstanden.",
-        ctas=[ChannelCta(channel="instagram", text="Link in der Bio")],
-    ).model_dump(mode="json")
+    # The distribution plan replaced the landing page: `/runs/{id}/review` renders
+    # where the CTAs point rather than a page we host.
+    state["distribution"] = {
+        "destination_url": "https://notar-koblenz.example/beurkundung",
+        "ctas": [{"channel": "linkedin", "text": "Kostenlose Ersteinschätzung"}],
+    }
     state["fact_gaps"] = ["uploaded documents"]
     if published is not None:
         # Set on the state rather than merged into a read-back checkpoint: the stored
@@ -380,8 +375,10 @@ async def test_the_export_pack_projects_paste_ready_copy_from_the_checkpoint() -
     assert instagram["pasteCharacters"] == len(instagram["pasteText"])
     assert instagram["pasteCharacters"] > instagram["bodyCharacters"]
 
-    assert body["landingPage"]["offer"] == "Kostenlose Ersteinschätzung Ihres Kaufvertrags"
-    assert body["landingPage"]["proofPoints"][0]["source"] == "Kanzleiprofil 2025"
+    # The destination is on the notary's OWN site, and the ask is what earns the click.
+    # There is no offer, form or proof point to export because there is no page.
+    assert body["distribution"]["destinationUrl"] == "https://notar-koblenz.example/beurkundung"
+    assert body["distribution"]["channelCtas"][0]["text"] == "Kostenlose Ersteinschätzung"
     assert body["aiBlocks"]["blocks"] == ["Ein Notar beurkundet Grundstückskaufverträge."]
     assert body["factGaps"] == ["uploaded documents"]
 
@@ -447,8 +444,8 @@ async def test_a_run_with_no_renderings_names_the_node_rather_than_an_empty_pack
     assert body["hasPack"] is False
     assert body["channels"] == []
     assert "REPACK" in body["channelsNote"], "the empty half must name the node that fills it"
-    assert body["landingPage"] is None
-    assert "CONVERT" in body["landingPageNote"], "and the two notes name DIFFERENT nodes"
+    assert body["distribution"] is None
+    assert "CONVERT" in body["distributionNote"], "and the two notes name DIFFERENT nodes"
 
 
 async def test_a_run_that_has_saved_nothing_at_all_says_that_instead() -> None:
@@ -644,9 +641,11 @@ async def test_the_markdown_rendering_contains_the_copy_and_the_counts_it_claims
     assert "platform limit 3,000" in text
     # The Instagram truth, in the file as well as on the screen.
     assert "not clickable on this channel" in text
-    # The landing page and the answer blocks, because the pack is not only the posts.
-    assert "Kostenlose Ersteinschätzung Ihres Kaufvertrags" in text
-    assert "Kanzleiprofil 2025" in text
+    # The destination and the answer blocks, because the pack is not only the posts. The
+    # destination is stated as a bare URL rather than described: it is on the notary's own
+    # site, so it is an address they recognise and can check.
+    assert "https://notar-koblenz.example/beurkundung" in text
+    assert "Kostenlose Ersteinschätzung" in text
     assert "Ein Notar beurkundet Grundstückskaufverträge." in text
     # And what the run did NOT have, carried into the file rather than left on the screen.
     assert "uploaded documents" in text
