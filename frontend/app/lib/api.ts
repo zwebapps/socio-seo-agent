@@ -93,6 +93,45 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+export type OnboardingState = {
+  /**
+   * False when the account has no business row at all — a platform admin created by
+   * `scripts/grant_platform_admin.py`, or an owner whose business was removed. Kept
+   * separate from `onboarded` because such an account cannot onboard: the confirm
+   * route writes to a specific business and there is none.
+   */
+  hasBusiness: boolean;
+  onboarded: boolean;
+  name: string | null;
+  website: string | null;
+};
+
+/**
+ * Whether this business has confirmed a profile yet.
+ *
+ * The dashboard needs it to decide what to lead with. A run without a confirmed DNA
+ * cannot do anything — INTAKE exits with "no business profile" by design — so a screen
+ * that offers "Start a run" first to a business with no profile is offering the one
+ * action that cannot work.
+ */
+/**
+ * Name the business, after the account exists.
+ *
+ * Signup used to refuse without a business name, so the field stood between somebody
+ * and an account they had not yet decided how to use. This is that step, taken from
+ * the dashboard when they are ready.
+ */
+export function createBusiness(name: string): Promise<{ businessId: string; name: string }> {
+  return request<{ businessId: string; name: string }>("/api/v1/auth/business", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function fetchOnboardingState(): Promise<OnboardingState> {
+  return request<OnboardingState>("/api/v1/onboarding");
+}
+
 export async function previewOnboarding(url: string): Promise<PreviewResponse> {
   let response: Response;
   try {

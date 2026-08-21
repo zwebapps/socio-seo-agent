@@ -227,7 +227,6 @@ def _nodes(
     opportunity_node: Node | None = None,
     stop_after: str | None = None,
     claim_check: Callable[[], dict[str, object]] | None = None,
-    landing_report: Callable[[], dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     """A full set of injected node callables, all inert.
 
@@ -243,7 +242,10 @@ def _nodes(
 
     async def convert(state: AgentState) -> dict[str, object]:
         return {
-            "landing_page": {"headline": "h", "attempt": state["validate_loops"]},
+            "distribution": {
+                "destination_url": "https://mueller-sanitaer.de/notdienst",
+                "ctas": [{"channel": "linkedin", "text": "Book a callout"}],
+            },
             "_cost": cost,
         }
 
@@ -251,13 +253,11 @@ def _nodes(
         # Call score() ONCE. Calling it twice consumed two values from the
         # iterator, so `passed` was computed from the NEXT score and the retry
         # never fired -- the test would have silently proved nothing. The same
-        # applies to claim_check and landing_report, which are also often iterators.
+        # applies to claim_check, which is also often an iterator.
         value = score()
         updates: dict[str, object] = {"seo_report": {"score": value, "passed": value >= 85}}
         if claim_check is not None:
             updates["claim_check"] = claim_check()
-        if landing_report is not None:
-            updates["landing_report"] = landing_report()
         return updates
 
     return {
@@ -494,118 +494,14 @@ async def test_a_banned_claim_blocks_even_when_the_seo_score_passes(driver: Driv
     assert result.state["outcome"] == "partial"
 
 
-# --------------------------------------------------------------------------- #
-# The landing-page gate: a quality verdict on a DIFFERENT artifact
-#
-# Two artifacts can now fail independently, and the graph has to answer two
-# questions rather than one: is this a compliance block or a quality partial, and
-# which node has to run again. Getting the second one wrong is expensive rather
-# than unsafe -- GENERATE is the strong tier and 86% of a run's cost -- which is
-# exactly the kind of mistake no test would otherwise catch.
-# --------------------------------------------------------------------------- #
-
-
-def _landing_verdict(passed: bool, score: int = 55) -> dict[str, object]:
-    if passed:
-        return {"score": 100, "passed": True, "findings": []}
-    return {
-        "score": score,
-        "passed": False,
-        "findings": [
-            {
-                "code": "form_fields",
-                "severity": "error",
-                "fix_hint": "Add between 1 and 3 form fields.",
-                "message": "There is no form.",
-            }
-        ],
-    }
-
-
-async def test_a_failing_landing_page_goes_back_to_convert_and_not_to_generate(
-    driver: Driver,
-) -> None:
-    """The article passed, so rewriting it would pay the strong tier to fix a
-    headline on a different page. The shortest edge that can fix the failure is the
-    one the graph must take."""
-    verdicts = iter([_landing_verdict(False), _landing_verdict(True)])
-
-    result = await driver(
-        _state(), nodes=_nodes(seo_score=91, landing_report=lambda: next(verdicts))
-    )
-
-    visited = result.state["visited"]
-    assert visited.count("CONVERT") == 2, "the landing page should have been rewritten once"
-    assert visited.count("GENERATE") == 1, "the article passed; it must not be regenerated"
-    assert result.state["validate_loops"] == 1
-    assert result.state["outcome"] == "awaiting_approval"
-
-
-async def test_a_landing_page_that_never_passes_is_a_quality_partial_not_a_block(
-    driver: Driver,
-) -> None:
-    """A page that cannot convert is publishable-after-editing, unlike one making a
-    forbidden claim. The two must stay distinguishable to whoever reads the run."""
-    result = await driver(
-        _state(), nodes=_nodes(seo_score=91, landing_report=lambda: _landing_verdict(False))
-    )
-
-    assert result.state["outcome"] == "partial"
-    assert result.state.get("publication_blocked") is not True
-    reason = (result.state["finished_reason"] or "").lower()
-    assert "landing page scored 55" in reason, "the reason must name WHICH artifact fell short"
-    assert "needs human edit" in reason
-
-
-async def test_a_failing_draft_takes_the_longer_edge_even_when_it_fails_alongside(
-    driver: Driver,
-) -> None:
-    """When the draft is what failed, CONVERT's own re-run is a consequence of being
-    downstream -- not a reason to skip GENERATE."""
-    scores = iter([70, 91])
-    verdicts = iter([_landing_verdict(False), _landing_verdict(True)])
-
+async def test_a_banned_claim_blocks_even_on_a_perfect_score(driver: Driver) -> None:
+    """The two verdicts are independent, and the claim check is the hard one. A 95 buys
+    nothing: the claim gate covers the article AND the per-channel ask as one verdict,
+    and a run carrying a forbidden claim must not reach the screen where a human could
+    approve it."""
     result = await driver(
         _state(),
-        nodes=_nodes(seo_score=lambda: next(scores), landing_report=lambda: next(verdicts)),
-    )
-
-    visited = result.state["visited"]
-    assert visited.count("GENERATE") == 2
-    assert visited.count("CONVERT") == 2
-    assert result.state["outcome"] == "awaiting_approval"
-
-
-async def test_an_absent_landing_report_is_not_read_as_a_failure(driver: Driver) -> None:
-    """A run whose CONVERT node produced nothing has already recorded that as an
-    error. Treating the missing verdict as a failure would burn both retries on a
-    node that cannot succeed, and would block every run whose node set predates this
-    gate."""
-    result = await driver(_state(), nodes=_nodes(seo_score=91, landing_report=None))
-
-    assert result.state["outcome"] == "awaiting_approval"
-    assert result.state["validate_loops"] == 0
-
-
-async def test_a_passing_landing_page_costs_no_retry(driver: Driver) -> None:
-    result = await driver(
-        _state(), nodes=_nodes(seo_score=91, landing_report=lambda: _landing_verdict(True))
-    )
-
-    assert result.state["validate_loops"] == 0
-    assert result.state["outcome"] == "awaiting_approval"
-
-
-async def test_a_banned_claim_still_blocks_when_the_landing_page_is_fine(driver: Driver) -> None:
-    """The claim check covers the article AND the landing copy as one verdict, so a
-    clean landing audit cannot buy a forbidden claim past the gate."""
-    result = await driver(
-        _state(),
-        nodes=_nodes(
-            seo_score=95,
-            claim_check=lambda: _claim_verdict(False),
-            landing_report=lambda: _landing_verdict(True),
-        ),
+        nodes=_nodes(seo_score=95, claim_check=lambda: _claim_verdict(False)),
     )
 
     assert result.state["publication_blocked"] is True
@@ -692,3 +588,21 @@ async def test_an_unrelated_degradation_does_not_turn_a_judgement_into_a_failure
 
     assert result.state["outcome"] == "done"
     assert "met the bar" in (result.state["finished_reason"] or "")
+
+
+async def test_a_weak_draft_retries_at_generate(driver: Driver) -> None:
+    """The routing rule that replaced a two-way branch.
+
+    It used to choose: a landing page failing its own conversion audit needed only
+    CONVERT re-run, because the article had passed. That artifact went with the page
+    (`CLAUDE.md`, 2026-08-21), so there is one destination now — and a condition that can
+    only ever take one value is a branch that looks live and is not, which is why the
+    tests for the other arm are gone rather than adapted.
+    """
+    scores = iter([70, 91])
+
+    result = await driver(_state(), nodes=_nodes(seo_score=lambda: next(scores)))
+
+    visited = result.state["visited"]
+    assert visited.count("GENERATE") == 2, "the draft is what gets rewritten"
+    assert result.state["outcome"] == "awaiting_approval"

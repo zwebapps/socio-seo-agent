@@ -1,11 +1,12 @@
 # Development entry points. Run everything from this directory.
-.PHONY: help install up down logs api web dev test lint format typecheck check images clean ragas-env
+.PHONY: help install up down logs api worker web dev test lint format typecheck check images clean ragas-env
 
 help:
 	@echo "make install    install python + node dependencies"
 	@echo "make up         start postgres + redis (add: --profile storage for minio)"
 	@echo "make down       stop infrastructure"
 	@echo "make api        run FastAPI with hot reload on :8100"
+	@echo "make worker     run the scheduler (scheduled runs, stranded-run sweep)"
 	@echo "make web        run Next.js with hot reload on :3100"
 	@echo "make test       pytest"
 	@echo "make check      lint + format check + typecheck + test   (what CI runs)"
@@ -28,6 +29,13 @@ logs:
 
 api:
 	uv run uvicorn backend.app.asgi:app --reload --port 8100
+
+# The scheduler. A third process, alongside the API and the web app: it is what makes
+# an automation setting do something. Without it `automation_settings.next_run_at` is a
+# value nothing reads. No queue broker to run -- the due list is a database scan; see
+# `backend/app/worker/scheduler.py` for why there is no arq.
+worker:
+	uv run python -m backend.app.worker
 
 web:
 	cd frontend && pnpm dev

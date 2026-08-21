@@ -22,6 +22,7 @@ import { Pill, SoftCard, SoftWell } from "../../components/soft";
 // produced nothing looks like a success.
 import { isTerminalState, runStateLabel, runStateTone } from "../../lib/runs-api";
 import { DecisionGate, RunReviewTabs } from "./review";
+import { WorkflowCanvas } from "./workflow-canvas";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
@@ -228,7 +229,30 @@ export default function RunPage({ params }: { params: Promise<{ runId: string }>
         </SoftCard>
       )}
 
+      {/*
+        The graph first, the list second. The canvas shows the SHAPE of the run — the
+        branches, the revision loop, and the human gate that EXPORT and MEASURE sit
+        behind — which a vertical list cannot. The list stays because it is the
+        accessible rendering of the same events: the canvas is `aria-hidden`, so a
+        screen-reader user gets the text version rather than a graph of divs.
+      */}
+      {run && (
+        <div className="mt-7">
+          <WorkflowCanvas
+            events={events}
+            currentNode={run.currentNode}
+            runState={runStateLabel(run.state)}
+          />
+        </div>
+      )}
+
       <SoftCard className="mt-7 p-6" size="lg">
+        <h2
+          className="mb-3 text-[11px] font-semibold uppercase tracking-wider"
+          style={{ color: "var(--text-muted)" }}
+        >
+          Timeline
+        </h2>
         <ol className="space-y-1">
           {NODE_ORDER.map((node) => {
             const status = statusByNode.get(node);

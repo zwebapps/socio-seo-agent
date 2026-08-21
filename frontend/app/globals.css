@@ -330,6 +330,15 @@ body {
    while it is being dragged with the mouse in some browsers and :focus-visible does not
    always apply — so the ring is also attached to plain :focus here. A slider whose
    focus is invisible is unusable from the keyboard. */
+/* A choice pill whose real control is a visually-hidden checkbox beside it. The global
+   :focus-visible rule cannot reach the pill, because the focus is on the input — and a
+   keyboard user tabbing through channel choices with no visible ring cannot tell where
+   they are. Same reasoning as the range rule below. */
+.soft-choice > input:focus-visible + span {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
 .soft-range:focus {
   outline: 2px solid var(--focus-ring);
   outline-offset: 3px;

@@ -282,7 +282,10 @@ async def test_a_rejected_signup_never_echoes_the_password(db: AsyncSession) -> 
         responses = [
             await _signup(client, "not-an-email", password=secret_password),
             await _signup(client, _email(), password=too_short),
-            await _signup(client, _email(), password=secret_password, businessName="  "),
+            # An OVER-LONG business name, not a blank one: blank now legitimately
+            # means "no business yet" and returns 201, so it no longer produces the
+            # 422 this test needs in order to inspect one.
+            await _signup(client, _email(), password=secret_password, businessName="x" * 300),
         ]
 
     for response in responses:
@@ -299,9 +302,22 @@ async def test_signup_rejects_a_malformed_email(db: AsyncSession) -> None:
     assert response.json()["detail"]["code"] == "invalid_email"
 
 
-async def test_signup_rejects_a_blank_business_name(db: AsyncSession) -> None:
+async def test_signup_without_a_business_name_succeeds(db: AsyncSession) -> None:
+    """The reversal. A blank name means "not naming one yet", and the account is
+    created alone — naming the business is `POST /auth/business`, taken later."""
     async with _client(db) as client:
         response = await _signup(client, _email(), businessName="   ")
+
+    assert response.status_code == 201
+    assert response.json()["businessId"] is None
+
+
+async def test_signup_rejects_a_business_name_longer_than_the_column(
+    db: AsyncSession,
+) -> None:
+    """Optional is not unvalidated."""
+    async with _client(db) as client:
+        response = await _signup(client, _email(), businessName="x" * 300)
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "invalid_business_name"

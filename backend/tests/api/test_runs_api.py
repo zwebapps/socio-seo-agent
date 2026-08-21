@@ -6,6 +6,7 @@ whole run, and a stream that never terminates leaks a connection per reload.
 """
 
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,8 +16,11 @@ import pytest
 
 from backend.app.agents.state import new_state
 from backend.app.api import runs as runs_api
+from backend.app.core.config import get_settings
 from backend.app.db.models import Role, User
+from backend.app.llm.pricing import format_usd
 from backend.app.main import create_app
+from backend.app.services import cost_service
 from backend.app.services.run_service import MAX_RUN_LIST_LIMIT, InMemoryRunStore, RunService
 
 BUSINESS = uuid4()
@@ -281,7 +285,7 @@ LINKEDIN_BODY = "Kurz erklärt: was ein Notar beurkundet. #Notar"
 
 
 async def _exportable_run(service: RunService, *, published: dict[str, Any] | None = None) -> UUID:
-    """A run with two channels and a landing page, checkpointed through the real state.
+    """A run with two channels and a distribution plan, checkpointed through the real state.
 
     Two channels on purpose, and specifically LinkedIn and Instagram: one carries a
     clickable link and the other does not, and that difference is the whole reason the
@@ -290,7 +294,6 @@ async def _exportable_run(service: RunService, *, published: dict[str, Any] | No
     would hide a drift between the spec and this projection, which is the only bug this
     route can really have.
     """
-    from backend.app.engines.landing import ChannelCta, FormField, LandingPageSpec, ProofPoint
 
     run = await service.start(business_id=BUSINESS, goal="more local leads")
     state = new_state(business_id=BUSINESS, goal="more local leads")
@@ -316,16 +319,12 @@ async def _exportable_run(service: RunService, *, published: dict[str, Any] | No
             "over_target": False,
         },
     }
-    state["landing_page"] = LandingPageSpec(
-        headline="Grundstückskauf in Koblenz beurkunden lassen",
-        subhead="Termin innerhalb einer Woche",
-        offer="Kostenlose Ersteinschätzung Ihres Kaufvertrags",
-        proof_points=[ProofPoint(text="Über 400 Beurkundungen", source="Kanzleiprofil 2025")],
-        form_fields=[FormField(name="email", label="E-Mail", required=True)],
-        primary_cta="Termin anfragen",
-        consent_text="Ich bin mit der Kontaktaufnahme einverstanden.",
-        ctas=[ChannelCta(channel="instagram", text="Link in der Bio")],
-    ).model_dump(mode="json")
+    # The distribution plan replaced the landing page: `/runs/{id}/review` renders
+    # where the CTAs point rather than a page we host.
+    state["distribution"] = {
+        "destination_url": "https://notar-koblenz.example/beurkundung",
+        "ctas": [{"channel": "linkedin", "text": "Kostenlose Ersteinschätzung"}],
+    }
     state["fact_gaps"] = ["uploaded documents"]
     if published is not None:
         # Set on the state rather than merged into a read-back checkpoint: the stored
@@ -377,8 +376,10 @@ async def test_the_export_pack_projects_paste_ready_copy_from_the_checkpoint() -
     assert instagram["pasteCharacters"] == len(instagram["pasteText"])
     assert instagram["pasteCharacters"] > instagram["bodyCharacters"]
 
-    assert body["landingPage"]["offer"] == "Kostenlose Ersteinschätzung Ihres Kaufvertrags"
-    assert body["landingPage"]["proofPoints"][0]["source"] == "Kanzleiprofil 2025"
+    # The destination is on the notary's OWN site, and the ask is what earns the click.
+    # There is no offer, form or proof point to export because there is no page.
+    assert body["distribution"]["destinationUrl"] == "https://notar-koblenz.example/beurkundung"
+    assert body["distribution"]["channelCtas"][0]["text"] == "Kostenlose Ersteinschätzung"
     assert body["aiBlocks"]["blocks"] == ["Ein Notar beurkundet Grundstückskaufverträge."]
     assert body["factGaps"] == ["uploaded documents"]
 
@@ -444,8 +445,8 @@ async def test_a_run_with_no_renderings_names_the_node_rather_than_an_empty_pack
     assert body["hasPack"] is False
     assert body["channels"] == []
     assert "REPACK" in body["channelsNote"], "the empty half must name the node that fills it"
-    assert body["landingPage"] is None
-    assert "CONVERT" in body["landingPageNote"], "and the two notes name DIFFERENT nodes"
+    assert body["distribution"] is None
+    assert "CONVERT" in body["distributionNote"], "and the two notes name DIFFERENT nodes"
 
 
 async def test_a_run_that_has_saved_nothing_at_all_says_that_instead() -> None:
@@ -641,9 +642,11 @@ async def test_the_markdown_rendering_contains_the_copy_and_the_counts_it_claims
     assert "platform limit 3,000" in text
     # The Instagram truth, in the file as well as on the screen.
     assert "not clickable on this channel" in text
-    # The landing page and the answer blocks, because the pack is not only the posts.
-    assert "Kostenlose Ersteinschätzung Ihres Kaufvertrags" in text
-    assert "Kanzleiprofil 2025" in text
+    # The destination and the answer blocks, because the pack is not only the posts. The
+    # destination is stated as a bare URL rather than described: it is on the notary's own
+    # site, so it is an address they recognise and can check.
+    assert "https://notar-koblenz.example/beurkundung" in text
+    assert "Kostenlose Ersteinschätzung" in text
     assert "Ein Notar beurkundet Grundstückskaufverträge." in text
     # And what the run did NOT have, carried into the file rather than left on the screen.
     assert "uploaded documents" in text
@@ -753,6 +756,17 @@ def _client_with_executor(service: RunService, executor: _RecordingExecutor) -> 
     app.dependency_overrides[runs_api.get_run_service] = lambda: service
     app.dependency_overrides[runs_api.current_business] = lambda: BUSINESS
     app.dependency_overrides[runs_api.get_executor] = lambda: executor
+    # The spend reader is faked here rather than left real, and it is not a convenience.
+    # Unoverridden it is `monthly_spend_usd`, a live `model_usage` read -- so every test
+    # that posted a run through this helper opened a Postgres connection, and the pool
+    # binds to whichever test's event loop reached it first. Every later test in the
+    # module then failed with "attached to a different loop", which is the shared-table
+    # db-suite pollution BACKLOG.md section D records, arriving in a route test that has
+    # no reason to touch a database at all. Zero spend is also the honest fixture: these
+    # tests are about the run lifecycle, and the ceiling has its own tests below.
+    # `_spend` is defined further down, beside the ceiling tests it was written for;
+    # the lambda body runs per request, so the forward reference resolves.
+    app.dependency_overrides[runs_api.get_monthly_spend_reader] = lambda: _spend("0")
     from backend.app.api.auth import current_user
 
     app.dependency_overrides[current_user] = _user
@@ -775,6 +789,72 @@ async def test_starting_a_run_submits_it_for_execution() -> None:
     assert response.status_code == 202
     run_id = UUID(response.json()["runId"])
     assert executor.submitted == [(run_id, BUSINESS, "more local leads", False)]
+
+
+async def test_a_run_records_the_channels_the_caller_chose() -> None:
+    """The seam that existed and could not be reached.
+
+    `NodeDeps.channels` was injectable from the first day the nodes were written, and
+    the one production construction site never passed it -- so the system looked
+    configurable and rendered the same three channels for every business.
+    """
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post(
+            "/api/v1/runs", json={"goal": "more local leads", "channels": ["linkedin"]}
+        )
+
+    assert response.status_code == 202
+    run = await service.get(UUID(response.json()["runId"]))
+    assert run is not None
+    assert run.channels == ["linkedin"]
+
+
+async def test_omitting_channels_records_none_rather_than_guessing_the_default() -> None:
+    """Empty on the row means "nobody chose", which is not the same fact as a caller
+    choosing all three. The executor resolves it at `new_state`, so the distinction
+    survives in the row and the default can change without rewriting history."""
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    run = await service.get(UUID(response.json()["runId"]))
+    assert run is not None
+    assert run.channels == []
+
+
+async def test_an_unknown_channel_is_refused_by_name_rather_than_dropped() -> None:
+    """A silent drop would look like a successful run that simply produced nothing for
+    the channel asked for, and the caller would have no way to tell."""
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post(
+            "/api/v1/runs",
+            json={"goal": "more local leads", "channels": ["linkedin", "threads"]},
+        )
+
+    assert response.status_code == 422
+    assert "threads" in response.text
+
+
+async def test_a_channel_alias_is_canonicalised_not_treated_as_a_second_channel() -> None:
+    """`engines/channel/specs.py` exists because two tables of channel names
+    disagreed; accepting both spellings as separate channels would rebuild that."""
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post(
+            "/api/v1/runs",
+            json={"goal": "more local leads", "channels": ["facebook_post", "facebook"]},
+        )
+
+    assert response.status_code == 202
+    run = await service.get(UUID(response.json()["runId"]))
+    assert run is not None
+    assert run.channels == ["facebook"]
 
 
 async def test_resuming_a_stalled_run_submits_it_with_resume_set() -> None:
@@ -1555,3 +1635,268 @@ async def test_rejection_needs_a_session() -> None:
         response = await client.post(f"/api/v1/runs/{uuid4()}/reject", json={"reason": REASON})
 
     assert response.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# The per-business monthly ceiling (`ARCHITECTURE.md` 7.4)
+#
+# Two properties are under test, and the second is the one that is easy to fake.
+#
+# 1. a business past its ceiling is REFUSED, with both numbers stated;
+# 2. the ceiling is read BEFORE anything that could reach a provider.
+#
+# A test that only asserts (1) passes whether the check runs before the call or after
+# it -- an over-budget business would be refused either way, having already spent the
+# money. So the ordering is asserted directly, on the HAPPY path, where a
+# check-after-the-call would still return 202: `_TracingExecutor` and the spend reader
+# append to one shared list, and the assertion is on the ORDER of that list. Moving
+# `_require_monthly_headroom` below `executor.submit` turns
+# `["spend-read", "submit"]` into `["submit", "spend-read"]` and fails it.
+#
+# `submit` standing in for "a provider call" is exact here rather than approximate: it
+# is the route's only path to the executor, the executor is the only thing that drives
+# the graph, and the graph is the only caller of the router. Nothing else in these
+# handlers can spend a cent.
+# --------------------------------------------------------------------------- #
+
+
+class _TracingExecutor(_RecordingExecutor):
+    """A recording executor that also records WHEN it was reached."""
+
+    def __init__(self, trace: list[str]) -> None:
+        super().__init__()
+        self._trace = trace
+
+    def submit(self, run_id: UUID, business_id: UUID, goal: str, *, resume: bool = False) -> None:
+        self._trace.append("submit")
+        super().submit(run_id, business_id, goal, resume=resume)
+
+
+def _spend(usd: str, *, trace: list[str] | None = None, seen: list[UUID] | None = None) -> Any:
+    """A ledger read double, returning `usd` as a `Decimal` -- never a float."""
+
+    async def read(business_id: UUID) -> Decimal:
+        if trace is not None:
+            trace.append("spend-read")
+        if seen is not None:
+            seen.append(business_id)
+        return Decimal(usd)
+
+    return read
+
+
+def _client_with_spend(
+    service: RunService, executor: _RecordingExecutor, spend: Any
+) -> httpx.AsyncClient:
+    app = create_app()
+    app.dependency_overrides[runs_api.get_run_service] = lambda: service
+    app.dependency_overrides[runs_api.current_business] = lambda: BUSINESS
+    app.dependency_overrides[runs_api.get_executor] = lambda: executor
+    app.dependency_overrides[runs_api.get_monthly_spend_reader] = lambda: spend
+    from backend.app.api.auth import current_user
+
+    app.dependency_overrides[current_user] = _user
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+def _cap() -> Decimal:
+    return get_settings().business_monthly_cap_usd
+
+
+async def test_a_business_over_its_monthly_ceiling_cannot_start_a_run() -> None:
+    """The refusal states BOTH numbers.
+
+    "Over budget" with no figures is a support ticket: the owner cannot tell whether they
+    are a cent over or a hundred dollars over, and nobody can check it against the cost
+    screen. So the spend and the ceiling are both in the message, formatted by the same
+    `format_usd` that screen uses.
+    """
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+    spent = _cap() + Decimal("5")
+
+    async with _client_with_spend(service, executor, _spend(str(spent))) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "monthly_cap_exceeded"
+    assert format_usd(spent) in detail["message"], "the refusal must state what was spent"
+    assert format_usd(_cap()) in detail["message"], "the refusal must state the ceiling"
+
+    assert executor.submitted == [], "nothing may be submitted after a cap refusal"
+    assert await service.recent() == [], (
+        "a refused run must not leave a row behind: it would count as a run in the list "
+        "and on the cost screen while having done nothing"
+    )
+
+
+async def test_a_business_under_its_monthly_ceiling_runs() -> None:
+    """The other half of the same control. A guard that refuses everyone is not a cap."""
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+
+    async with _client_with_spend(service, executor, _spend("0.01")) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    assert response.status_code == 202, response.text
+    assert executor.submitted == [
+        (UUID(response.json()["runId"]), BUSINESS, "more local leads", False)
+    ]
+
+
+async def test_the_ceiling_is_read_before_the_run_reaches_the_executor() -> None:
+    """The ordering, asserted on the happy path so it cannot pass by accident.
+
+    This is the test that fails if the check is moved after `executor.submit`: both calls
+    happen either way and the response is 202 either way, so only their ORDER separates a
+    control from an audit.
+    """
+    trace: list[str] = []
+    service = RunService(InMemoryRunStore())
+    executor = _TracingExecutor(trace)
+
+    async with _client_with_spend(service, executor, _spend("0.01", trace=trace)) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    assert response.status_code == 202, response.text
+    assert trace == ["spend-read", "submit"], (
+        "the ceiling must be read before the run is handed to the executor; "
+        f"got {trace} -- a check after the call is accounting, not control"
+    )
+
+
+async def test_a_business_exactly_at_its_ceiling_is_refused() -> None:
+    """AT the ceiling counts as over.
+
+    Same boundary as `BudgetState.can_afford`, which affords nothing once `remaining_usd`
+    is zero, and same as `RunSpend.at_cap`, which reports `>=`. A run whose first call
+    costs an unknown amount cannot be started with nothing left, and two cap levels that
+    disagreed at their boundary would be reported as a bug within a week.
+    """
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+
+    async with _client_with_spend(service, executor, _spend(str(_cap()))) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "monthly_cap_exceeded"
+    assert executor.submitted == []
+
+
+async def test_the_ceiling_comes_from_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The number is a setting, so an operator can lower it without a deploy.
+
+    Also pins the direction: the same spend that passes under a $25 ceiling is refused
+    under a 10-cent one, which is what makes this the ceiling doing the work rather than
+    the spend figure.
+
+    Patched on `cost_service`, which is where the ceiling is now read: the composition of
+    ledger-read + configured-ceiling + stated-figures moved there when the scheduler
+    became a second caller that had to enforce the same number. Two entry points reading
+    two settings would be the same bug one level down.
+    """
+    tight = get_settings().model_copy(update={"business_monthly_cap_usd": Decimal("0.10")})
+    monkeypatch.setattr(cost_service, "get_settings", lambda: tight)
+
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+
+    async with _client_with_spend(service, executor, _spend("0.20")) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    assert response.status_code == 409, response.text
+    assert format_usd(Decimal("0.10")) in response.json()["detail"]["message"]
+    assert executor.submitted == []
+
+
+async def test_the_ceiling_is_read_for_the_calling_business() -> None:
+    """One business's spend must not consume another's allowance.
+
+    The business id is not accepted from the client anywhere in this module, so what is
+    asserted here is that the guard reads the SAME id the run is started for, rather than
+    a platform-wide total that would refuse everyone once any one business overspent.
+    """
+    seen: list[UUID] = []
+    service = RunService(InMemoryRunStore())
+    executor = _RecordingExecutor()
+
+    async with _client_with_spend(service, executor, _spend("0.01", seen=seen)) as client:
+        assert (
+            await client.post("/api/v1/runs", json={"goal": "more local leads"})
+        ).status_code == 202
+
+    assert seen == [BUSINESS]
+
+
+async def test_resuming_is_refused_when_the_ceiling_is_used_up() -> None:
+    """Resume restarts the graph with a FRESH per-run budget.
+
+    Leaving it unguarded would let a business past its ceiling walk through it one resume
+    at a time, which the per-run cap cannot see and this ceiling exists to stop.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    executor = _RecordingExecutor()
+
+    async with _client_with_spend(service, executor, _spend(str(_cap()))) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "monthly_cap_exceeded"
+    assert executor.submitted == []
+
+
+async def test_resume_reads_the_ceiling_before_the_executor() -> None:
+    """Same ordering assertion as for start, on the other guarded entry point."""
+    trace: list[str] = []
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    executor = _TracingExecutor(trace)
+
+    async with _client_with_spend(service, executor, _spend("0.01", trace=trace)) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/resume")
+
+    assert response.status_code == 202, response.text
+    assert trace == ["spend-read", "submit"], f"got {trace}"
+
+
+async def test_an_unknown_run_is_still_404_for_a_business_over_its_ceiling() -> None:
+    """Which refusal comes first is a disclosure decision, not a style one.
+
+    A cross-business or absent run id stays indistinguishable from absent even when the
+    caller's ledger would refuse them anyway -- otherwise "409 rather than 404" would tell
+    a caller that an id they guessed exists.
+    """
+    service = RunService(InMemoryRunStore())
+    other = await service.start(business_id=uuid4(), goal="someone else's run")
+    executor = _RecordingExecutor()
+
+    async with _client_with_spend(service, executor, _spend(str(_cap()))) as client:
+        response = await client.post(f"/api/v1/runs/{other.id}/resume")
+
+    assert response.status_code == 404
+    assert executor.submitted == []
+
+
+async def test_approving_a_parked_run_is_not_blocked_by_the_ceiling() -> None:
+    """A deliberate exclusion, recorded as a test so it cannot be undone by accident.
+
+    Approval publishes work that was already generated and already paid for. Refusing it
+    at the review gate would strand a draft a person is looking at, and buy nothing: the
+    only way to reach `awaiting_approval` is through `start_run`, which IS guarded, so
+    what approval can release is bounded by runs that began before the breach.
+    """
+    service = RunService(InMemoryRunStore())
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    state = new_state(business_id=BUSINESS, goal="more leads")
+    await service.checkpoint(run.id, state=state, current_node="REVIEW")
+    await service.await_approval(run.id)
+
+    executor = _RecordingExecutor()
+    async with _client_with_spend(service, executor, _spend(str(_cap() + Decimal("5")))) as client:
+        response = await client.post(f"/api/v1/runs/{run.id}/approve")
+
+    assert response.status_code == 202, response.text
+    assert [(rid, resume) for rid, _, _, resume in executor.submitted] == [(run.id, True)]

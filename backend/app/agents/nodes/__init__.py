@@ -39,9 +39,9 @@ no change here.
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Final, NamedTuple, get_args
+from typing import Any, Final, NamedTuple
 from uuid import UUID
 
 from backend.app.actuators import (
@@ -62,8 +62,8 @@ from backend.app.actuators.owner_notice import (
     build_owner_notice_actuation,
 )
 from backend.app.agents.nodes.prompts import (
+    DISTRIBUTION_TOOL,
     GENERATE_TOOL,
-    LANDING_TOOL,
     OPPORTUNITY_TOOL,
     PLAN_TOOL,
     PROMPT_VERSION,
@@ -72,14 +72,19 @@ from backend.app.agents.nodes.prompts import (
     fence,
     system,
 )
-from backend.app.agents.state import AgentState, NodeError
+from backend.app.agents.state import (
+    DEFAULT_CHANNELS,
+    AgentState,
+    NodeError,
+    channels_of,
+    run_uuid,
+)
 from backend.app.agents.tools import (
     CHANNEL_VALIDATE,
     CLAIMS_CHECK,
     CRAWL_SITE,
     GEO_PROBE,
     KB_SEARCH,
-    LANDING_CHECK,
     MEMORY_LOAD,
     NAP_AUDIT,
     NOTIFY,
@@ -99,15 +104,6 @@ from backend.app.engines.channel import (
     hard_char_limits,
 )
 from backend.app.engines.claims import ClaimCheckRequest, check_claims
-from backend.app.engines.landing import (
-    ChannelCta,
-    FormField,
-    FormFieldName,
-    LandingCheckRequest,
-    LandingPageSpec,
-    ProofPoint,
-    check_landing_page,
-)
 from backend.app.engines.nap import (
     CanonicalNap,
     DirectoryListing,
@@ -122,7 +118,6 @@ from backend.app.engines.serp import (
     expand_keywords,
 )
 from backend.app.llm import Message, Role, TaskClass, ToolCall, ToolSpec
-from backend.app.services.link_service import KNOWN_CHANNELS
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +136,6 @@ Node = Callable[[AgentState], Awaitable[dict[str, Any]]]
 #: target is not enforcement. Being over the target is REPORTED instead (see `repack`).
 CHANNEL_LIMITS: Mapping[str, int] = hard_char_limits()
 
-DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
 
 #: The bio-link hub always gets its own CTA, whatever channels a run renders posts
 #: for. docs/CHANNELS.md section 1: an Instagram feed caption and a TikTok caption
@@ -149,13 +143,6 @@ DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
 #: path for those surfaces -- and a hub with no CTA on it is an empty page in
 #: somebody's bio.
 HUB_CHANNEL: str = "link_hub"
-
-#: The form field names a generated form may use, derived from the `landing` engine's
-#: own contract rather than repeated here. A second copy of this list is exactly how a
-#: generated form and the endpoint that receives it would drift apart -- and the
-#: failure mode is silent: the visitor fills the field in and the submission is
-#: refused.
-_LEGAL_FORM_FIELDS: Final[frozenset[str]] = frozenset(get_args(FormFieldName.__value__))
 
 #: How many keyword seeds HARVEST searches. Each is a provider call, so this is the
 #: main lever on harvest cost.
@@ -229,13 +216,16 @@ NOTIFY_ACTION: Final = OWNER_NOTICE_ACTION
 #: two capabilities, so they cannot share one implementation: a node holding `notify`
 #: and not `publish` must not be able to post, and the check has to live somewhere that
 #: the grant name reaches.
-PUBLISHABLE_ACTIONS: Final[frozenset[str]] = frozenset({SOCIAL_POST_ACTION, PAGE_PUBLISH_ACTION})
+#: What EXPORT may actuate. `PAGE_PUBLISH_ACTION` is deliberately NOT here any more:
+#: the founder ruled we host no landing page, so no run publishes one. The action type
+#: and its actuator remain in the codebase because pieces published before that ruling
+#: still exist and `GET /p/{piece_id}` must keep serving them.
+PUBLISHABLE_ACTIONS: Final[frozenset[str]] = frozenset({SOCIAL_POST_ACTION})
 #: Deliberately just the one, and `notify.email` is deliberately NOT in it. No node sends
 #: marketing email, so granting the capability here would widen what an induced tool call
 #: could reach for nothing in return.
 NOTIFIABLE_ACTIONS: Final[frozenset[str]] = frozenset({NOTIFY_ACTION})
 
-#: The landing page's destination within the publishing integration.
 #:
 #: A constant rather than a slug because the page's public slug is minted by
 #: `landing_service` when the piece is stored, and it is not in the agent state -- so
@@ -363,7 +353,18 @@ class NodeDeps:
     #: resolved, or no `OWNER_NOTICE_FROM` sender identity -- and EXPORT reports that in a
     #: named note rather than skipping silently.
     owner_notice: OwnerNoticeIdentity | None = None
-    channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
+    #: Mints the tracked links and writes the article piece, after approval.
+    #:
+    #: Injected like `actuator_store` and for the same reason: it needs a database and
+    #: the nodes must stay database-free, so every node test stays hermetic. `None`
+    #: means no link minting is wired — EXPORT then says so rather than posting content
+    #: whose call to action points nowhere.
+    #:
+    #: NOT an actuator, deliberately. Minting a link and writing a row are internal
+    #: effects; the landing actuator existed because SERVING a page is an external one.
+    #: Routing an internal write through the actuator ledger would put an idempotency
+    #: key on something the database already makes atomic.
+    publish_distribution: Callable[..., Awaitable[Any]] | None = None
     #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
     #:
     #: Injected like every other dependency rather than read here, because the nodes
@@ -392,7 +393,6 @@ def _implementations(deps: NodeDeps) -> dict[str, ToolImpl]:
         CLAIMS_CHECK: check_claims,
         # Same reasoning: a landing page whose conversion audit was skipped because
         # nobody wired it would look like a page that passed.
-        LANDING_CHECK: check_landing_page,
         # Granted to REPACK since the allowlist was written, and implemented by
         # nothing until now -- so `enforce_hashtags` had never once run inside a run,
         # and the engine's own measured finding (a prompt ending in the literal words
@@ -989,87 +989,90 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         return _with_refusals(state, box, {"draft": args, "_cost": cost, **grounding.updates})
 
     async def convert(state: AgentState) -> dict[str, Any]:
-        """Write the landing page the content converts on, and the ask per channel.
+        """Choose where the clicks land on the business's OWN site, and write the ask.
 
-        This is CONVERSION -- link three of the lead chain in docs/FEATURES.md
-        section 0, and the link competitors skip. A tracked short link pointing at a
-        page that does not exist earns nothing, so this node produces the page the
-        click lands on and the copy that earns the click.
+        This is CONVERSION -- link three of the lead chain in docs/FEATURES.md section 0
+        -- but it no longer produces the page. The founder ruled that we host none
+        (`CLAUDE.md`, 2026-08-21): the business already has a website, so the job is to
+        pick the page there that already answers what the post is about and to write the
+        ask that earns the click.
 
-        It sits BETWEEN GENERATE and VALIDATE deliberately. VALIDATE is where the
-        deterministic verdicts are taken, and the regulated-claim gate must see the
-        landing page before REVIEW: a landing page is the most claim-dangerous
-        artifact in the product ("garantierte Heilung" on a page with a form under
-        it), and REVIEW is where a human can approve. A node placed after VALIDATE
-        would produce copy nothing had checked.
+        It still sits BETWEEN GENERATE and VALIDATE, and for the same reason as before:
+        VALIDATE is where the deterministic verdicts are taken, and the regulated-claim
+        gate must see the CTA copy before REVIEW. Copy produced after VALIDATE would be
+        copy nothing had checked.
 
-        Only the WRITING happens here. Whether the result can convert, and what
-        markup it becomes, are computable and live in ``engines/landing``.
+        **The destination is proposed here and enforced later.** This node reads crawled
+        pages -- text we do not control -- so the URL it returns is untrusted. It is
+        checked against the business's own domain at publish time by
+        `landing_service.publish_distribution`, which refuses anything off-site. Checking
+        it in the node instead would put the guard where a retry could talk past it.
         """
         box = _toolbox("CONVERT", deps)
-        outline = state.get("outline") or {}
         draft = state.get("draft") or {}
-        channels = _cta_channels(deps.channels)
-
-        # Proof points must come from the business's own material, so the node reads
-        # that material rather than trusting the model to remember it. A missing
-        # knowledge base is a normal state: the page is then written from the DNA and
-        # the harvested facts, and the deterministic check will report however many
-        # sourced proof points actually exist.
+        outline = state.get("outline") or {}
+        channels = _cta_channels(channels_of(state))
         grounding = await _retrieved(box, _proof_question(state), "CONVERT", state)
-        passages = grounding.passages
+        passages = _passages(grounding.trace)
 
-        report = state.get("landing_report") or {}
-        retry = ""
-        if report and not report.get("passed", True):
-            hints = [
-                f"- {f.get('fix_hint')}" for f in report.get("findings", []) if f.get("fix_hint")
-            ]
-            retry = (
-                f"\n\nYOUR PREVIOUS LANDING PAGE SCORED {report.get('score')} / 100 AND MUST "
-                "REACH 85. Fix exactly these, and change nothing else:\n" + "\n".join(hints)
-            )
-        # The claim verdict covers the page AND the landing copy as one check, so a
-        # forbidden phrase written HERE is named here too. Without this, only GENERATE
-        # would hear about it and the retry could never fix the offending artifact.
+        # The claim verdict covers the article AND this copy as one check, so a retry
+        # arrives here with the whole verdict rather than a per-artifact one.
         claims = state.get("claim_check") or {}
+        retry = ""
         if claims and not claims.get("passed", True) and claims.get("fix_hint"):
             retry += "\n\n" + str(claims["fix_hint"])
+
+        # The pages the crawl actually found, so the model chooses from what exists
+        # rather than inventing a path. A URL it made up would be refused at publish
+        # time, which is safe but wastes the run.
+        site = (state.get("facts") or {}).get("site") or {}
+        # Every access is type-guarded, because this is a checkpoint read and a reader
+        # does not get to assume its own version wrote it. `pages` has held an integer
+        # count in an older summary shape, and iterating that raised inside the node —
+        # which the graph correctly reported as CONVERT failing, for a reason that had
+        # nothing to do with conversion.
+        raw_pages = site.get("pages") if isinstance(site, Mapping) else None
+        crawled = [
+            str(page["url"])
+            for page in (raw_pages if isinstance(raw_pages, list) else [])
+            if isinstance(page, Mapping) and page.get("url")
+        ][:25]
+        homepage = str((state["dna"] or {}).get("website") or "")
 
         args, cost = await _ask(
             deps,
             box=box,
             task=TaskClass.REPACK,
             role=(
-                "You write the landing page this content converts on: one offer, one "
-                "form, one ask. Every proof point comes from the business's own "
-                "documents or profile and names where it came from; if the evidence "
-                "supports none, you return none rather than inventing one."
+                "You choose which page on the business's own website each post should "
+                "send people to, and you write the ask that earns the click. You never "
+                "invent a URL: you pick one of the pages listed, or the homepage."
             ),
             state=state,
             body=(
-                f"Page title: {draft.get('title')}\n"
+                f"Article title: {draft.get('title')}\n"
                 f"Target keyword: {outline.get('target_keyword')}\n"
-                f"Outline CTA: {outline.get('cta')}\n"
-                f"Page: {str(draft.get('html'))[:1500]}\n\n"
-                f"Channels needing a CTA: {', '.join(channels)}\n\n"
+                f"Outline CTA: {outline.get('cta')}\n\n"
+                f"Their homepage: {homepage}\n"
+                f"Pages we crawled on their site:\n"
+                + ("\n".join(f"- {url}" for url in crawled) or "- (only the homepage)")
+                + f"\n\nChannels needing an ask: {', '.join(channels)}\n\n"
                 f"Business evidence:\n{_evidence(state)}\n"
-                f"{passages}{retry}\n\nCall record_landing_page."
+                f"{passages}{retry}\n\nCall record_distribution."
             ),
-            tool=LANDING_TOOL,
+            tool=DISTRIBUTION_TOOL,
         )
         if not args:
             raise ValueError(
-                "the model did not return a landing page; expected a "
-                "record_landing_page tool call. Without one the tracked links have "
+                "the model did not return a distribution plan; expected a "
+                "record_distribution tool call. Without one the tracked links have "
                 "nowhere to point, so the run has reach and no conversion path."
             )
-        spec = _landing_spec(args)
         return _with_refusals(
             state,
             box,
             {
-                "landing_page": spec.model_dump(mode="json"),
+                "distribution": _distribution(args, homepage=homepage),
                 "_cost": cost,
                 **grounding.updates,
             },
@@ -1094,34 +1097,22 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         title = str(draft.get("title") or "")
         meta = str(draft.get("meta_description") or "")
 
-        # The landing page is audited and claim-checked here too, not in CONVERT.
         # CONVERT writes; this node judges. Keeping both verdicts in one place is what
         # makes "the deterministic half of the pipeline" a place rather than a habit.
-        landing_spec = _stored_landing_spec(state)
-        landing_report: dict[str, Any] | None = None
-        if landing_spec is not None:
-            verdict = await box.call(
-                LANDING_CHECK,
-                LandingCheckRequest(spec=landing_spec, known_channels=sorted(KNOWN_CHANNELS)),
-            )
-            landing_report = verdict.model_dump(mode="json")
-
         # Title and meta are checked alongside the body. They are NOT folded into the
         # assembled HTML document for this: the meta description lives in an
         # attribute, and stripping markup would drop it, so a forbidden claim in the
         # meta description would have gone unnoticed on the one line Google shows.
         #
-        # The landing page's text joins the same check rather than getting its own
-        # verdict, because "may this run be published" has one answer. A landing page
-        # is the most claim-dangerous artifact here -- it makes a promise directly
-        # above a form -- and the graph refuses to carry a failing verdict to REVIEW,
-        # so a banned claim in the conversion copy cannot be approved either.
+        # The per-channel ask joins the same check rather than getting its own verdict,
+        # because "may this run be published" has one answer. The ask is the most
+        # claim-dangerous line in the run -- it is the sentence somebody acts on -- and
+        # the graph refuses to carry a failing verdict to REVIEW, so a banned claim in
+        # the conversion copy cannot be approved either.
         claim_result = await box.call(
             CLAIMS_CHECK,
             ClaimCheckRequest(
-                content="\n".join(
-                    [title, meta, html, landing_spec.claim_text() if landing_spec else ""]
-                ),
+                content="\n".join([title, meta, html, _cta_text(state)]),
                 banned_claims=[str(c) for c in (state["dna"].get("banned_claims") or [])],
                 contains_markup=True,
             ),
@@ -1134,7 +1125,6 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 box,
                 {
                     "claim_check": claim_check,
-                    "landing_report": landing_report,
                     "seo_report": {
                         "score": 0,
                         "passed": False,
@@ -1165,7 +1155,6 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             {
                 "seo_report": result.model_dump(mode="json"),
                 "claim_check": claim_check,
-                "landing_report": landing_report,
             },
         )
 
@@ -1174,7 +1163,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         box = _toolbox("REPACK", deps)
         draft = state.get("draft") or {}
         outline = state.get("outline") or {}
-        wanted = ", ".join(deps.channels)
+        wanted = ", ".join(channels_of(state))
 
         args, cost = await _ask(
             deps,
@@ -1320,15 +1309,63 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             )
 
         business = UUID(state["business_id"])
+        # Read once, here, rather than inside `_actuate`: every action this node takes
+        # belongs to the same run, and a helper that re-derived it per call is a helper
+        # that can be given a state whose id disagrees with the page it just wrote.
+        run = run_uuid(state)
         refs: list[dict[str, Any]] = []
         not_published: list[str] = []
         errors: list[NodeError] = []
+
+        # The links first, and this ordering IS functional even though the page is gone:
+        # every post carries the ask, and `link_service` completes each link's target
+        # with its own code AFTER minting it. A post published before its link exists
+        # carries no trackable URL, so the clicks it earns are attributable to nothing.
+        distribution: dict[str, Any] = {}
+        plan = state.get("distribution")
+        if deps.publish_distribution is None:
+            errors.append(
+                NodeError(
+                    node="EXPORT",
+                    code="links_not_wired",
+                    message=(
+                        "No link minting is configured, so the posts below carry no "
+                        "tracked link and their clicks cannot be attributed."
+                    ),
+                )
+            )
+        elif isinstance(plan, Mapping) and str(plan.get("destination_url") or "").strip():
+            try:
+                distribution = await deps.publish_distribution(
+                    business_id=business,
+                    run_id=run,
+                    plan=dict(plan),
+                    draft=dict(state.get("draft") or {}),
+                    website=str((state["dna"] or {}).get("website") or ""),
+                )
+            except Exception as exc:
+                # Broad on purpose, and the run continues: an off-site destination or a
+                # dead database costs the ATTRIBUTION, not the content. The posts are
+                # still worth publishing, and the owner is told which half failed.
+                logger.warning("export: link minting failed: %s", exc)
+                errors.append(
+                    NodeError(
+                        node="EXPORT",
+                        code="links_failed",
+                        message=(
+                            f"The tracked links could not be created ({exc}). The posts "
+                            "below went out without them, so their clicks are not "
+                            "attributable."
+                        ),
+                    )
+                )
 
         for action_type, target, payload in pieces:
             outcome = await _actuate(
                 box,
                 PUBLISH,
                 business=business,
+                run=run,
                 approver=approver,
                 action_type=action_type,
                 target=target,
@@ -1382,6 +1419,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             await _notify_owner(
                 box,
                 business=business,
+                run=run,
                 approver=approver,
                 identity=deps.owner_notice,
                 published=published,
@@ -1389,6 +1427,13 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 note=str(report["note"]),
             )
         )
+
+        # The links travel on the report, so the review screen can show the owner the
+        # tracked URL per channel — the thing they paste. Absent rather than empty when
+        # minting failed: an empty list reads as "no CTAs", and "we could not create
+        # them" is a different fact the error above already states.
+        if distribution:
+            report["distribution"] = distribution
 
         updates: dict[str, Any] = {"published": report}
         if errors:
@@ -1478,11 +1523,10 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
 def _publishable(state: AgentState) -> list[tuple[str, str, dict[str, Any]]]:
     """What REVIEW approved, as one actuation request per destination.
 
-    **The landing page comes first, and the order is functional rather than tidy.**
-    Every channel post carries the ask that points at that page, so publishing the
-    posts first would put clicks on a page that is not there yet -- and the clicks a
-    tracked link loses in that window are exactly the leads the whole chain exists to
-    capture.
+    **Ordering stopped mattering when we stopped hosting the page.** It used to: every
+    post carried an ask pointing at a page we published in the same pass, so posting
+    first put clicks on a page that was not there yet. The destination is now a page the
+    business already serves, so there is nothing to publish before the posts.
 
     Both shapes of `renderings` are accepted: the current mapping with `body` and
     `hashtags`, and the plain string that checkpoints written before that change hold.
@@ -1490,10 +1534,6 @@ def _publishable(state: AgentState) -> list[tuple[str, str, dict[str, Any]]]:
     nothing migrates a display field.
     """
     pieces: list[tuple[str, str, dict[str, Any]]] = []
-
-    page = state.get("landing_page")
-    if isinstance(page, Mapping) and str(page.get("headline") or "").strip():
-        pieces.append((PAGE_PUBLISH_ACTION, LANDING_TARGET, dict(page)))
 
     for channel, rendering in (state.get("renderings") or {}).items():
         body, hashtags = _rendered_post(rendering)
@@ -1556,6 +1596,7 @@ async def _actuate(
     tool: str,
     *,
     business: UUID,
+    run: UUID | None,
     approver: str,
     action_type: str,
     target: str,
@@ -1572,12 +1613,21 @@ async def _actuate(
     An allowlist refusal is re-raised, exactly as everywhere else in this module: that
     is a wiring fault or an attack, and it must be loud rather than degraded into a
     channel that quietly did not publish.
+
+    `run` is what attributes the effect to its cause. It reaches `actions.run_id`
+    through the ledger and `content_pieces.run_id` through the landing actuator, and
+    without it a published page cannot be joined back to the run that made it -- so a
+    lead count per run is unanswerable however good the click tracking is. It is
+    explicitly `UUID | None` rather than defaulted: a caller that forgot it would
+    silently go back to writing NULLs, which is the state this parameter exists to
+    leave, and a node driven by a test genuinely has no run.
     """
     return await _perform(
         box,
         tool,
         Actuation(
             business_id=business,
+            run_id=run,
             action_type=action_type,
             target=target,
             payload=dict(payload),
@@ -1679,6 +1729,7 @@ async def _notify_owner(
     box: NodeToolbox,
     *,
     business: UUID,
+    run: UUID | None,
     approver: str,
     identity: OwnerNoticeIdentity | None,
     published: Sequence[str],
@@ -1716,6 +1767,7 @@ async def _notify_owner(
         NOTIFY,
         build_owner_notice_actuation(
             business_id=business,
+            run_id=run,
             identity=identity,
             subject=f"Published {len(published)} of {total}",
             approved_by=approver,
@@ -2153,6 +2205,44 @@ def _optional_str(value: Any) -> str | None:
     return text or None
 
 
+def _distribution(args: Mapping[str, Any], *, homepage: str) -> dict[str, Any]:
+    """CONVERT's tool call as the state key, normalised.
+
+    Kept to primitives because this is checkpointed to a JSONB column. The destination
+    falls back to the homepage when the model returned nothing usable — a run with a
+    plan and no target has reach and no conversion path, and the homepage is the one
+    page every business has. It is NOT validated here: the origin check belongs at
+    publish time (`landing_service.publish_distribution`), where a retry cannot talk
+    past it.
+    """
+    raw_ctas = args.get("ctas")
+    ctas: list[dict[str, str]] = []
+    for entry in raw_ctas if isinstance(raw_ctas, list) else []:
+        if not isinstance(entry, Mapping):
+            continue
+        channel = canonical_channel(str(entry.get("channel") or "").strip())
+        text = str(entry.get("text") or "").strip()
+        if channel and text:
+            ctas.append({"channel": channel, "text": text})
+    destination = str(args.get("destination_url") or "").strip() or homepage
+    return {"destination_url": destination, "ctas": ctas}
+
+
+def _cta_text(state: AgentState) -> str:
+    """Every ask, as one block for the claim gate.
+
+    Joined rather than checked per-CTA because "may this run be published" has one
+    answer: a forbidden claim in the LinkedIn ask blocks the run, not just LinkedIn.
+    """
+    distribution = state.get("distribution") or {}
+    ctas = distribution.get("ctas") if isinstance(distribution, Mapping) else None
+    return "\n".join(
+        str(cta.get("text") or "")
+        for cta in (ctas if isinstance(ctas, list) else [])
+        if isinstance(cta, Mapping)
+    )
+
+
 def _cta_channels(channels: tuple[str, ...]) -> tuple[str, ...]:
     """The channels CONVERT writes an ask for: the run's own, plus the bio-link hub.
 
@@ -2198,77 +2288,6 @@ def _passages(trace: Any) -> str:
     return "\nOwn documents (cite these as sources):\n" + fence("\n\n".join(lines))
 
 
-def _landing_spec(args: Mapping[str, Any]) -> LandingPageSpec:
-    """Build a spec from a model's tool arguments, dropping only what is unusable.
-
-    Lenient on purpose, and the leniency is bounded. A form field named something the
-    lead endpoint does not accept, or a CTA with no text, is DROPPED -- the same
-    treatment REPACK gives a malformed post. Rejecting the whole call instead would
-    lose a good page over one bad field, and silently keeping the bad field would
-    produce a form the visitor fills in and the server refuses.
-
-    What is dropped is not swallowed: the deterministic check then reports the
-    consequence ("there is no form", "the form asks for no email address") with a fix
-    hint, so the retry is a correction rather than a guess.
-    """
-    proof = [
-        ProofPoint(text=str(item.get("text", "")), source=str(item.get("source", "")))
-        for item in args.get("proof_points") or []
-        if isinstance(item, Mapping)
-    ]
-    fields: list[FormField] = []
-    for item in args.get("form_fields") or []:
-        if not isinstance(item, Mapping):
-            continue
-        name = str(item.get("name", "")).strip().lower()
-        if name not in _LEGAL_FORM_FIELDS:
-            logger.warning("convert: dropped form field %r, which the lead form refuses", name)
-            continue
-        fields.append(
-            FormField(
-                name=name,  # type: ignore[arg-type]  # narrowed by the membership test above
-                label=str(item.get("label", "")) or name,
-                required=bool(item.get("required", False)),
-            )
-        )
-    ctas = [
-        ChannelCta(
-            channel=str(item.get("channel", "")).strip().lower(),
-            text=str(item.get("text", "")).strip(),
-        )
-        for item in args.get("ctas") or []
-        if isinstance(item, Mapping) and str(item.get("text", "")).strip()
-    ]
-    return LandingPageSpec(
-        headline=str(args.get("headline", "")),
-        subhead=str(args.get("subhead", "")),
-        offer=str(args.get("offer", "")),
-        proof_points=proof,
-        form_fields=fields,
-        primary_cta=str(args.get("primary_cta", "")),
-        consent_text=str(args.get("consent_text", "")),
-        ctas=ctas,
-    )
-
-
-def _stored_landing_spec(state: AgentState) -> LandingPageSpec | None:
-    """The landing page CONVERT stored, or None.
-
-    Read defensively: the state may have come back from a JSONB checkpoint written by
-    an earlier version of this code, and a run whose review screen cannot load is a
-    run nobody can finish. A malformed spec degrades to "there was nothing to audit",
-    which the graph treats as an absent verdict rather than as a pass.
-    """
-    stored = state.get("landing_page")
-    if not isinstance(stored, Mapping):
-        return None
-    try:
-        return LandingPageSpec.model_validate(dict(stored))
-    except Exception as exc:  # broad: any malformed checkpoint, not one shape of it
-        logger.warning("validate: stored landing page could not be read: %s", exc)
-        return None
-
-
 def _seed_queries(dna: Mapping[str, Any]) -> list[str]:
     """Search seeds from the business profile, most commercially useful first."""
     city = str(dna.get("city") or "").strip()
@@ -2290,7 +2309,6 @@ __all__ = [
     "ANALYTICS_GAP",
     "CHANNEL_LIMITS",
     "DEFAULT_CHANNELS",
-    "LANDING_TARGET",
     "NOTHING_TO_PUBLISH_NOTE",
     "NOTICE_FOOTER",
     "NOTIFY_ACTION",

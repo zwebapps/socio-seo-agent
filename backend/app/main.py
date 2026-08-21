@@ -18,8 +18,10 @@ from fastapi.responses import JSONResponse
 from backend.app.api import (
     admin_models,
     auth,
+    automation,
     connections,
     cost,
+    dashboard,
     documents,
     feedback,
     health,
@@ -27,6 +29,7 @@ from backend.app.api import (
     links,
     onboarding,
     pages,
+    posts,
     runs,
 )
 from backend.app.core.body_limit import BodyLimit, BodySizeLimitMiddleware
@@ -130,8 +133,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(admin_models.router)
+    app.include_router(automation.router)
     app.include_router(connections.router)
     app.include_router(cost.router)
+    app.include_router(dashboard.router)
+    app.include_router(posts.router)
     app.include_router(documents.router)
     app.include_router(onboarding.router)
     app.include_router(runs.router)

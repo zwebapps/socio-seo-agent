@@ -57,6 +57,11 @@ class RunRecord(BaseModel):
     id: UUID
     business_id: UUID
     goal: str
+    #: The channels this run targets. Empty means "the caller did not choose", and the
+    #: executor resolves it to the default set -- the resolution deliberately happens
+    #: there and not here, so an empty list stays distinguishable from a chosen one in
+    #: the row.
+    channels: list[str] = Field(default_factory=list)
     state: RunState = "queued"
     current_node: str | None = None
     resumed_count: int = 0
@@ -331,9 +336,17 @@ class RunService:
     def __init__(self, store: RunStore) -> None:
         self._store = store
 
-    async def start(self, *, business_id: UUID, goal: str) -> RunRecord:
+    async def start(
+        self, *, business_id: UUID, goal: str, channels: Sequence[str] | None = None
+    ) -> RunRecord:
         return await self._store.create(
-            RunRecord(id=uuid4(), business_id=business_id, goal=goal, state="queued")
+            RunRecord(
+                id=uuid4(),
+                business_id=business_id,
+                goal=goal,
+                channels=list(channels or []),
+                state="queued",
+            )
         )
 
     async def get(self, run_id: UUID) -> RunRecord | None:

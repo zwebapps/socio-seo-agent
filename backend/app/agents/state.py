@@ -27,12 +27,23 @@ Design notes worth keeping:
   first checkpoint is `NotRequired` and :func:`from_checkpoint` supplies the default.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from pydantic import BaseModel
+
+from backend.app.engines.channel.specs import canonical_channel, has_spec
+
+#: The channels a run renders posts for when nobody chose.
+#:
+#: It lives HERE rather than in `agents.nodes` where it used to, because the channel
+#: set is now per-run state and `state.py` cannot import from `nodes` -- `nodes`
+#: imports this module. `nodes` re-exports the name, so importers of
+#: `agents.nodes.DEFAULT_CHANNELS` are unaffected.
+DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
 
 # From docs/AGENT_RUNTIME.md section 8. Named constants rather than literals at the
 # call sites, so the documented numbers and the enforced ones cannot drift.
@@ -116,6 +127,34 @@ class AgentState(TypedDict):
     business_id: str
     goal: str
     surfaces: list[str]
+    #: The `runs` row this state belongs to, as a STRING -- the same reason
+    #: `business_id` is one: this is checkpointed to a JSONB column and a `UUID` does
+    #: not survive a JSON round trip.
+    #:
+    #: It is here so a side effect can be attributed to the run that caused it.
+    #: `nodes._actuate` puts it on every `Actuation`, which is what fills
+    #: `actions.run_id` and `content_pieces.run_id` -- without it a published page and
+    #: the ledger row that authorised it are both orphans, and "what did this run
+    #: publish, and how many leads did it earn" is not a question the database can
+    #: answer.
+    #:
+    #: `NotRequired` because it postdates checkpoints already written, and a run that
+    #: cannot resume because an ATTRIBUTION field is missing would lose work a customer
+    #: already paid for. `from_checkpoint` supplies `None`; the executor then stamps the
+    #: id it fetched the row by, so a pre-key checkpoint resumes fully attributed.
+    run_id: NotRequired[str | None]
+    #: The channels THIS run renders posts for, chosen by the caller.
+    #:
+    #: It is state rather than a `NodeDeps` field, and that is the point of the key:
+    #: as a dependency it was rebuilt from the default on every resume, so a run
+    #: started for LinkedIn alone came back from a checkpoint targeting all three.
+    #: The channel set is a property of the run, the checkpoint is the run's single
+    #: source of truth, so it belongs in the checkpoint.
+    #:
+    #: `NotRequired` for the same reason as `run_id`: it postdates checkpoints already
+    #: written, and `from_checkpoint` supplies the default rather than letting a run
+    #: fail to resume over a field a default answers correctly.
+    channels: NotRequired[list[str]]
 
     # Set at INTAKE, carried everywhere after.
     dna: dict[str, Any]
@@ -130,11 +169,19 @@ class AgentState(TypedDict):
     opportunity: NotRequired[dict[str, Any] | None]
     outline: NotRequired[dict[str, Any] | None]
     draft: NotRequired[dict[str, Any] | None]
-    #: The landing page CONVERT wrote: headline, offer, sourced proof points, the
-    #: form spec, the primary CTA and one CTA per channel. A `LandingPageSpec`
-    #: dumped to primitives, because this is checkpointed to a JSONB column and a
+    #: What CONVERT wrote: where the CTAs point on the business's OWN site, and the
+    #: ask per channel. `{"destination_url": str, "ctas": [{"channel", "text"}]}`.
+    #:
+    #: It replaced `landing_page` when the founder ruled that we host no page (recorded
+    #: in `CLAUDE.md`, 2026-08-21): the business already has a website, so a run improves
+    #: that site's SEO and drives traffic to it rather than standing up a competitor to
+    #: it. Primitives, not a model, because this is checkpointed to a JSONB column and a
     #: state that cannot serialise cannot resume.
-    landing_page: NotRequired[dict[str, Any] | None]
+    #:
+    #: `landing_page` and `landing_report` are GONE from new states. A checkpoint written
+    #: before this change still holds them; nothing reads them, and nothing migrates a
+    #: JSONB column, so they simply travel unused until that run is finished.
+    distribution: NotRequired[dict[str, Any] | None]
     #: Channel -> the finished post for that channel, as
     #: ``{"body", "hashtags", "hashtags_removed", "hashtags_shortfall", "over_target"}``.
     #:
@@ -157,10 +204,6 @@ class AgentState(TypedDict):
     #: the graph treats an absent verdict as "nothing checked" and a present
     #: failing one as a publication block.
     claim_check: NotRequired[dict[str, Any] | None]
-    #: The deterministic conversion verdict on `landing_page`, written by VALIDATE.
-    #: `None` means there was nothing to audit, which is NOT the same as a pass --
-    #: the graph gates on a present, failing verdict and leaves an absent one alone.
-    landing_report: NotRequired[dict[str, Any] | None]
     #: Who approved publication, and the ONLY thing that lets EXPORT act.
     #:
     #: `None` means nobody has, and EXPORT then publishes nothing and says so. It is
@@ -221,12 +264,24 @@ def new_state(
     dna: dict[str, Any] | None = None,
     remembered: list[str] | None = None,
     caps: RunCaps | None = None,
+    run_id: str | UUID | None = None,
+    channels: Sequence[str] | None = None,
 ) -> AgentState:
-    """A fresh run."""
+    """A fresh run.
+
+    ``run_id`` is optional rather than required, and that is a deliberate compromise
+    with the tests: the graph and its nodes are driven directly by hundreds of them,
+    none of which has a `runs` row, and making the id mandatory would force every one
+    of them to invent one. The executor -- the only caller that runs a real run --
+    always passes it, and `_actuate` reports an absent one as an unattributed
+    actuation rather than guessing.
+    """
     return AgentState(
         business_id=str(business_id),
+        run_id=str(run_id) if run_id is not None else None,
         goal=goal,
         surfaces=surfaces if surfaces is not None else ["google"],
+        channels=normalise_channels(channels),
         dna=dna or {},
         remembered=remembered or [],
         facts={},
@@ -234,11 +289,10 @@ def new_state(
         opportunity=None,
         outline=None,
         draft=None,
-        landing_page=None,
+        distribution=None,
         renderings={},
         seo_report=None,
         claim_check=None,
-        landing_report=None,
         approved_by=None,
         published=None,
         measurement=None,
@@ -253,6 +307,85 @@ def new_state(
         outcome="running",
         finished_reason=None,
     )
+
+
+def parse_run_id(raw: object) -> UUID | None:
+    """``raw`` as a run id, or ``None`` if it cannot be one.
+
+    One parser, so the checkpoint reader and the node that builds an `Actuation` cannot
+    disagree about what counts as a run id. Everything that is not a UUID -- a missing
+    key, a null, a hand-typed word, an integer some UPDATE put in the column -- is
+    `None`, because the alternatives are a crash on the publish path or a foreign key
+    pointing at nothing.
+    """
+    if isinstance(raw, UUID):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        return UUID(raw.strip())
+    except ValueError:
+        return None
+
+
+def _valid_run_id(raw: object) -> str | None:
+    """The checkpoint form of :func:`parse_run_id`: a canonical string, or ``None``."""
+    parsed = parse_run_id(raw)
+    return str(parsed) if parsed is not None else None
+
+
+def normalise_channels(raw: object) -> list[str]:
+    """``raw`` as a usable channel list, or the default set.
+
+    One normaliser, so the API validator, `new_state` and the checkpoint reader cannot
+    disagree about what counts as a channel. Three rules, and each has a reason:
+
+    * **Unknown channels are dropped, not carried.** A channel with no entry in
+      ``engines/channel/specs.py`` cannot be length- or link-checked, which is already
+      why ``actuators/social.py`` refuses one. Carrying it would produce a post nothing
+      could validate.
+    * **Names are canonicalised**, so ``facebook_post`` and ``facebook`` are one
+      channel rather than two renderings of the same post.
+    * **Empty normalises to the default set.** A run targeting nothing would pass
+      VALIDATE, reach REPACK and render zero posts -- a silently empty deliverable.
+      The default is the honest answer to "the caller did not choose".
+
+    Order is the caller's, deduplicated, because it is the order the review screen and
+    the export pack list the posts in.
+
+    Only a list or a tuple is accepted, which is narrower than "iterable" and
+    deliberately so: this value arrives from a JSONB column, where an array is the only
+    thing that legitimately deserialises here, and the two iterables that are NOT
+    arrays both fail interestingly. A bare ``"linkedin"`` would iterate into the
+    channels ``l``, ``i``, ``n``, ...; a ``{"linkedin": true}`` would be key-mined into
+    a real channel and so would look correct while proving nothing about the column.
+    Both are malformed, and malformed reads as "nobody chose".
+    """
+    if not isinstance(raw, list | tuple):
+        return list(DEFAULT_CHANNELS)
+    seen: dict[str, None] = {}
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        channel = canonical_channel(entry.strip())
+        if channel and has_spec(channel):
+            seen[channel] = None
+    return list(seen) if seen else list(DEFAULT_CHANNELS)
+
+
+def channels_of(state: AgentState) -> tuple[str, ...]:
+    """This run's channels, defaulted. The one reader every node uses."""
+    return tuple(normalise_channels(state.get("channels")))
+
+
+def run_uuid(state: AgentState) -> UUID | None:
+    """This run's id, for the one place that needs it as a `UUID`: an `Actuation`.
+
+    A reader, not an assertion. A state with no run id is ordinary -- every test that
+    drives a node directly has one, and `new_state` allows it -- so this answers
+    "attributed or not" and leaves the caller to say so.
+    """
+    return parse_run_id(state.get("run_id"))
 
 
 def step(state: AgentState, node: str) -> AgentState:
@@ -352,6 +485,18 @@ def from_checkpoint(payload: dict[str, Any]) -> AgentState:
         if isinstance(raw_traces, list)
         else []
     )
+    # Same rule for `run_id`, and normalised rather than merely defaulted for a sharper
+    # reason than the traces: this value ends up in `Actuation.run_id`, which is typed
+    # `UUID | None` and lands in a foreign key. A checkpoint holding `7`, `"latest"` or
+    # a truncated id would either crash the publish path or write an unresolvable
+    # reference, so anything that is not a parseable UUID reads as "not attributed" --
+    # which is exactly what a pre-key checkpoint means, and the executor overwrites it
+    # with the id it fetched the row by anyway.
+    restored["run_id"] = _valid_run_id(payload.get("run_id"))
+    # Same rule again for `channels`: a pre-key checkpoint has none, and a stored list
+    # can hold a channel whose spec has since been removed. Normalising on the way in
+    # means a resumed run renders for channels that can actually be validated.
+    restored["channels"] = normalise_channels(payload.get("channels"))
     # The payload came from JSON, so the static type is a promise about what
     # to_checkpoint wrote, not a fact the checker can verify. One cast, named.
     return cast("AgentState", restored)

@@ -14,7 +14,7 @@ The properties worth testing are the boundaries, not the prose:
 
 import json
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -33,8 +33,6 @@ from backend.app.agents.state_graph import run_state_graph
 from backend.app.agents.tools import (
     KB_SEARCH,
     PUBLISH,
-    RECORD_LANDING_PAGE,
-    WEB_SEARCH,
     NodeToolbox,
 )
 from backend.app.engines.seo import SeoFinding, SeoScoreResult
@@ -833,7 +831,7 @@ async def test_memory_that_fails_to_load_degrades_the_run_rather_than_ending_it(
 async def test_harvest_reaches_its_engines_only_through_the_allowlist() -> None:
     """Every source HARVEST uses is one of its granted tools, so the grant list is the
     complete description of what the node can touch."""
-    from backend.app.agents.tools import CRAWL_SITE, KB_SEARCH, NODE_TOOLS, SERP_SEARCH
+    from backend.app.agents.tools import CRAWL_SITE, NODE_TOOLS, SERP_SEARCH
 
     granted = NODE_TOOLS["HARVEST"]
     assert {CRAWL_SITE, SERP_SEARCH, KB_SEARCH} <= granted
@@ -843,7 +841,7 @@ async def test_a_node_asking_for_a_tool_it_does_not_hold_fails_loudly() -> None:
     """The refusal must not be degraded into a fact gap. HARVEST swallows a dead
     provider on purpose, and an allowlist violation must not ride out on that path:
     a dead provider is ordinary, a capability nobody granted is not."""
-    from backend.app.agents.tools import PUBLISH, NodeToolbox, ToolNotAllowedError
+    from backend.app.agents.tools import ToolNotAllowedError
 
     box = NodeToolbox(node="HARVEST", implementations={PUBLISH: lambda: None})
     with pytest.raises(ToolNotAllowedError):
@@ -1091,20 +1089,8 @@ async def test_repack_withholds_a_post_that_makes_a_banned_claim() -> None:
 # information it claims to. Prose quality is an evaluation question, not this one.
 # --------------------------------------------------------------------------- #
 
-LANDING_ARGS: dict[str, Any] = {
-    "headline": "Notdienst-Checkliste für Hauseigentümer in Koblenz",
-    "subhead": "Fünf Prüfungen, bevor Sie den Notdienst rufen.",
-    "offer": "Eine zweiseitige Checkliste mit den fünf Prüfungen bei einem Wasserschaden.",
-    "proof_points": [
-        {"text": "Seit 1998 in Koblenz.", "source": "Leistungsübersicht 2026"},
-        {"text": "24-Stunden-Notdienst.", "source": "mueller-sanitaer.de/notdienst"},
-    ],
-    "form_fields": [
-        {"name": "name", "label": "Ihr Name", "required": True},
-        {"name": "email", "label": "E-Mail", "required": True},
-    ],
-    "primary_cta": "Checkliste anfordern",
-    "consent_text": "Ich bin mit der Kontaktaufnahme einverstanden.",
+DISTRIBUTION_ARGS: dict[str, Any] = {
+    "destination_url": "https://mueller-sanitaer.de/notdienst",
     "ctas": [
         {"channel": "linkedin", "text": "Unsere Notdienst-Checkliste:"},
         {"channel": "facebook", "text": "Wasserschaden? Erst diese fünf Prüfungen:"},
@@ -1120,213 +1106,160 @@ CONVERT_STATE: dict[str, Any] = {
         "meta_description": "d" * 150,
         "html": "<h1>x</h1>",
     },
+    "facts": {
+        "site": {
+            "pages": [
+                {"url": "https://mueller-sanitaer.de/"},
+                {"url": "https://mueller-sanitaer.de/notdienst"},
+            ]
+        }
+    },
 }
 
 
-def _landing_router(args: dict[str, Any] | None = None) -> StubRouter:
-    return StubRouter({TaskClass.REPACK: args if args is not None else LANDING_ARGS})
+def _distribution_router(args: dict[str, Any] | None = None) -> StubRouter:
+    return StubRouter({TaskClass.REPACK: args if args is not None else DISTRIBUTION_ARGS})
 
 
-async def test_convert_writes_a_landing_page_and_charges_the_run() -> None:
-    router = _landing_router()
+async def test_convert_writes_a_distribution_plan_and_charges_the_run() -> None:
+    router = _distribution_router()
 
     updates = await build_nodes(_deps(router))["CONVERT"](_state(**CONVERT_STATE))
 
-    page = updates["landing_page"]
-    assert page["headline"].startswith("Notdienst-Checkliste")
-    assert [f["name"] for f in page["form_fields"]] == ["name", "email"]
-    assert {c["channel"] for c in page["ctas"]} == {
+    plan = updates["distribution"]
+    assert plan["destination_url"] == "https://mueller-sanitaer.de/notdienst"
+    assert {cta["channel"] for cta in plan["ctas"]} == {
         "linkedin",
         "facebook",
         "instagram",
         "link_hub",
     }
-    assert updates["_cost"] == Decimal("0.001")
-    assert router.calls == [TaskClass.REPACK], "conversion copy is short-form, not the strong tier"
+    assert updates["_cost"] > 0
 
 
-async def test_convert_stores_the_page_as_primitives_so_the_checkpoint_survives() -> None:
-    """`landing_page` is checkpointed to a JSONB column, and a state that cannot
-    serialise cannot resume."""
-    updates = await build_nodes(_deps(_landing_router()))["CONVERT"](_state(**CONVERT_STATE))
+async def test_convert_stores_primitives_so_the_checkpoint_survives() -> None:
+    """The state is serialised to JSONB. A model in there either raises on the way out or
+    silently stringifies, and the second is worse: the run resumes with a string where it
+    expects a structure."""
+    import json
 
-    json.dumps(updates["landing_page"])
+    updates = await build_nodes(_deps(_distribution_router()))["CONVERT"](_state(**CONVERT_STATE))
+
+    json.dumps(updates["distribution"])  # must not raise
+
+
+async def test_convert_offers_the_crawled_pages_rather_than_inviting_invention() -> None:
+    """A URL the model made up is refused at publish time by the origin check — safe, and
+    a wasted run. So the pages the crawl actually found are in the prompt."""
+
+    class Capturing(StubRouter):
+        def __init__(self) -> None:
+            super().__init__({TaskClass.REPACK: DISTRIBUTION_ARGS})
+            self.bodies: list[str] = []
+
+        async def complete(self, task: Any, messages: Any, **kw: Any) -> Completion:
+            self.bodies.append(str(messages[-1].content))
+            return await super().complete(task, messages, **kw)
+
+    router = Capturing()
+    await build_nodes(_deps(router))["CONVERT"](_state(**CONVERT_STATE))
+
+    assert "https://mueller-sanitaer.de/notdienst" in router.bodies[0]
 
 
 async def test_convert_always_asks_for_a_bio_link_hub_cta() -> None:
-    """docs/CHANNELS.md section 1: an Instagram feed caption and a TikTok caption
-    cannot carry a clickable link at all, so `/go/{slug}` is the ENTIRE conversion
-    path for those surfaces -- and a hub with no CTA on it is an empty page in
-    somebody's bio."""
+    """An Instagram or TikTok caption cannot carry a clickable link at all, so the hub is
+    the ENTIRE conversion path for those channels — and a hub with no ask on it is an
+    empty page in somebody's bio."""
 
     class Capturing(StubRouter):
         def __init__(self) -> None:
-            super().__init__({TaskClass.REPACK: LANDING_ARGS})
+            super().__init__({TaskClass.REPACK: DISTRIBUTION_ARGS})
             self.bodies: list[str] = []
 
-        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
+        async def complete(self, task: Any, messages: Any, **kw: Any) -> Completion:
             self.bodies.append(str(messages[-1].content))
             return await super().complete(task, messages, **kw)
 
     router = Capturing()
-    await build_nodes(_deps(router, channels=("linkedin",)))["CONVERT"](_state(**CONVERT_STATE))
+    await build_nodes(_deps(router))["CONVERT"](_state(**CONVERT_STATE, channels=["linkedin"]))
 
-    assert "Channels needing a CTA: linkedin, link_hub" in router.bodies[0]
-
-
-async def test_convert_drops_a_form_field_the_lead_endpoint_would_refuse() -> None:
-    """A field named anything else renders, submits, and is refused by the endpoint's
-    closed schema -- so the visitor fills it in and the lead is lost. Dropping it
-    keeps the page usable, and the deterministic check reports the consequence."""
-    args = {**LANDING_ARGS, "form_fields": [{"name": "budget", "label": "Budget"}]}
-
-    updates = await build_nodes(_deps(_landing_router(args)))["CONVERT"](_state(**CONVERT_STATE))
-
-    assert updates["landing_page"]["form_fields"] == [], "an illegal field must not survive"
+    assert "Channels needing an ask: linkedin, link_hub" in router.bodies[0]
 
 
-async def test_convert_keeps_a_good_page_when_one_field_is_illegal() -> None:
-    """Rejecting the whole call would lose a page over one bad field."""
-    args = {
-        **LANDING_ARGS,
-        "form_fields": [{"name": "email", "label": "E-Mail"}, {"name": "iban", "label": "IBAN"}],
-    }
+async def test_convert_falls_back_to_the_homepage_when_the_model_names_no_page() -> None:
+    """A plan with no target has reach and no conversion path. The homepage is the one
+    page every business has, so it is the honest default rather than an error."""
+    args = {**DISTRIBUTION_ARGS, "destination_url": "  "}
 
-    updates = await build_nodes(_deps(_landing_router(args)))["CONVERT"](_state(**CONVERT_STATE))
-
-    assert [f["name"] for f in updates["landing_page"]["form_fields"]] == ["email"]
-    assert updates["landing_page"]["headline"], "the rest of the page still lands"
-
-
-async def test_convert_receives_the_landing_fix_hints_verbatim_on_a_retry() -> None:
-    """Without this the loop is theatre: the model would be asked to try again with
-    no idea what failed."""
-
-    class Capturing(StubRouter):
-        def __init__(self) -> None:
-            super().__init__({TaskClass.REPACK: LANDING_ARGS})
-            self.bodies: list[str] = []
-
-        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
-            self.bodies.append(str(messages[-1].content))
-            return await super().complete(task, messages, **kw)
-
-    router = Capturing()
-    await build_nodes(_deps(router))["CONVERT"](
-        _state(
-            **CONVERT_STATE,
-            landing_report={
-                "score": 62,
-                "passed": False,
-                "findings": [
-                    {"code": "form_fields", "fix_hint": "Add between 1 and 3 form fields."},
-                    {"code": "consent", "fix_hint": "Write one consent sentence."},
-                ],
-            },
-        )
-    )
-
-    body = router.bodies[0]
-    assert "SCORED 62 / 100" in body
-    assert "Add between 1 and 3 form fields." in body
-    assert "Write one consent sentence." in body
-
-
-async def test_convert_receives_the_banned_claim_verbatim_on_a_retry() -> None:
-    """The claim verdict covers the article AND the landing copy as one check, so a
-    forbidden phrase written HERE has to be named here. Without it only GENERATE
-    would hear about it and the retry could never fix the offending artifact."""
-
-    class Capturing(StubRouter):
-        def __init__(self) -> None:
-            super().__init__({TaskClass.REPACK: LANDING_ARGS})
-            self.bodies: list[str] = []
-
-        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
-            self.bodies.append(str(messages[-1].content))
-            return await super().complete(task, messages, **kw)
-
-    router = Capturing()
-    await build_nodes(_deps(router))["CONVERT"](
-        _state(
-            **CONVERT_STATE,
-            claim_check={"passed": False, "fix_hint": 'Remove the forbidden claim "schmerzfrei".'},
-        )
-    )
-
-    assert 'Remove the forbidden claim "schmerzfrei".' in router.bodies[0]
-
-
-async def test_convert_reads_the_business_documents_rather_than_trusting_recall() -> None:
-    """A proof point that is not in the business's own material is an invented claim,
-    so the node retrieves that material -- and asks for PROOF, not for the run's goal,
-    which would return whatever is most on-topic."""
-    asked: list[str] = []
-
-    class _Chunk:
-        document_id = "doc-1"
-        ordinal = 3
-        content = "Seit 1998 betreiben wir den Notdienst in Koblenz."
-
-    class _Trace:
-        chunks: ClassVar[list[_Chunk]] = [_Chunk()]
-
-    async def retrieve(question: str) -> Any:
-        asked.append(question)
-        return _Trace()
-
-    class Capturing(StubRouter):
-        def __init__(self) -> None:
-            super().__init__({TaskClass.REPACK: LANDING_ARGS})
-            self.bodies: list[str] = []
-
-        async def complete(self, task: TaskClass, messages: Any, **kw: Any) -> Completion:
-            self.bodies.append(str(messages[-1].content))
-            return await super().complete(task, messages, **kw)
-
-    router = Capturing()
-    await build_nodes(_deps(router, retrieve=retrieve))["CONVERT"](_state(**CONVERT_STATE))
-
-    assert asked and "notdienst klempner koblenz" in asked[0].lower()
-    assert "more local leads" not in asked[0], "the goal is not a question about proof"
-    assert "Seit 1998" in router.bodies[0]
-    assert "[doc-1#3]" in router.bodies[0], "a passage must be labelled so it can be cited"
-
-
-async def test_convert_survives_a_knowledge_base_that_is_absent_or_broken() -> None:
-    """No knowledge base is a normal state, and a failing one must not cost the page."""
-
-    async def broken(question: str) -> Any:
-        raise RuntimeError("pgvector is down")
-
-    without = await build_nodes(_deps(_landing_router()))["CONVERT"](_state(**CONVERT_STATE))
-    broken_updates = await build_nodes(_deps(_landing_router(), retrieve=broken))["CONVERT"](
+    updates = await build_nodes(_deps(_distribution_router(args)))["CONVERT"](
         _state(**CONVERT_STATE)
     )
 
-    assert without["landing_page"]["headline"]
-    assert broken_updates["landing_page"]["headline"]
+    assert updates["distribution"]["destination_url"] == "https://mueller-sanitaer.de"
 
 
-async def test_convert_fails_loudly_when_the_model_returns_no_landing_page() -> None:
-    """The graph turns this into a recorded degradation and keeps the article. What it
-    must not do is carry on as though a conversion path existed."""
-    with pytest.raises(ValueError, match="record_landing_page"):
-        await build_nodes(_deps(StubRouter()))["CONVERT"](_state(**CONVERT_STATE))
+async def test_convert_canonicalises_a_channel_alias_in_the_ask() -> None:
+    """`facebook_post` and `facebook` are one channel. Two asks for one channel would
+    produce two posts from one rendering."""
+    args = {
+        **DISTRIBUTION_ARGS,
+        "ctas": [{"channel": "facebook_post", "text": "Wasserschaden?"}],
+    }
 
-
-async def test_convert_reaches_its_engines_only_through_the_allowlist() -> None:
-    """CONVERT holds `kb.search` and its own output tool, and nothing else. In
-    particular it cannot publish: it writes the page that a public URL will serve."""
-    box = NodeToolbox(node="CONVERT")
-
-    assert box.allows(KB_SEARCH)
-    assert box.allows(RECORD_LANDING_PAGE)
-    assert not box.allows(PUBLISH)
-    assert not box.allows(WEB_SEARCH), (
-        "a proof point sourced from a page the business does not control is not proof "
-        "of anything about the business"
+    updates = await build_nodes(_deps(_distribution_router(args)))["CONVERT"](
+        _state(**CONVERT_STATE)
     )
+
+    assert [cta["channel"] for cta in updates["distribution"]["ctas"]] == ["facebook"]
+
+
+async def test_convert_drops_an_ask_with_no_text() -> None:
+    """An empty ask is a channel whose post carries no call to action, which is the one
+    thing the node exists to produce."""
+    args = {
+        **DISTRIBUTION_ARGS,
+        "ctas": [
+            {"channel": "linkedin", "text": "   "},
+            {"channel": "facebook", "text": "Wasserschaden?"},
+        ],
+    }
+
+    updates = await build_nodes(_deps(_distribution_router(args)))["CONVERT"](
+        _state(**CONVERT_STATE)
+    )
+
+    assert [cta["channel"] for cta in updates["distribution"]["ctas"]] == ["facebook"]
+
+
+async def test_convert_receives_the_banned_claim_verbatim_on_a_retry() -> None:
+    """The fix hint is the whole value of the retry: a retry that only says "try again"
+    spends a model call to produce the same copy."""
+
+    class Capturing(StubRouter):
+        def __init__(self) -> None:
+            super().__init__({TaskClass.REPACK: DISTRIBUTION_ARGS})
+            self.bodies: list[str] = []
+
+        async def complete(self, task: Any, messages: Any, **kw: Any) -> Completion:
+            self.bodies.append(str(messages[-1].content))
+            return await super().complete(task, messages, **kw)
+
+    router = Capturing()
+    await build_nodes(_deps(router))["CONVERT"](
+        _state(
+            **CONVERT_STATE,
+            claim_check={"passed": False, "fix_hint": "remove 'garantiert schmerzfrei'"},
+        )
+    )
+
+    assert "remove 'garantiert schmerzfrei'" in router.bodies[0]
+
+
+async def test_convert_fails_loudly_when_the_model_returns_no_plan() -> None:
+    """Silence here would leave the run with posts whose links point nowhere."""
+    with pytest.raises(ValueError, match="distribution plan"):
+        await build_nodes(_deps(_distribution_router({})))["CONVERT"](_state(**CONVERT_STATE))
 
 
 # --------------------------------------------------------------------------- #
@@ -1347,54 +1280,33 @@ def _landing_state(**over: Any) -> AgentState:
     )
 
 
-async def test_validate_audits_the_landing_page_with_the_engine_and_calls_no_model() -> None:
-    router = StubRouter()
-    updates = await build_nodes(_deps(router))["VALIDATE"](
-        _landing_state(landing_page=_landing_spec_dict())
-    )
+async def test_a_banned_claim_in_the_ask_alone_fails_the_claim_check() -> None:
+    """The article is clean, so a check over the draft only would pass this run.
 
-    assert updates["landing_report"]["score"] == 100
-    assert updates["landing_report"]["passed"] is True
-    assert router.calls == [], "a deterministic audit must not depend on a model call"
-
-
-async def test_validate_reports_a_landing_page_that_cannot_capture_a_lead() -> None:
+    The ask is the sentence somebody acts on — it goes in a post, in a bio, in an email
+    — so it is checked with the article as ONE verdict, because "may this run be
+    published" has one answer. This is the assertion that stops it.
+    """
     updates = await build_nodes(_deps())["VALIDATE"](
-        _landing_state(landing_page=_landing_spec_dict(form_fields=[]))
-    )
-
-    report = updates["landing_report"]
-    assert report["passed"] is False
-    assert {f["code"] for f in report["findings"] if f["severity"] == "error"} == {
-        "form_fields",
-        "reachability",
-    }
-
-
-async def test_a_banned_claim_on_the_landing_page_alone_fails_the_claim_check() -> None:
-    """The article is clean, so a check over the draft only would pass this run --
-    and the landing page is the artifact that makes a promise directly above a form.
-    This is the assertion that stops it."""
-    updates = await build_nodes(_deps())["VALIDATE"](
-        _landing_state(
-            landing_page=_landing_spec_dict(
-                headline="Schmerzfrei zum neuen Lächeln in Koblenz heute"
-            )
+        _distribution_state(
+            ctas=[{"channel": "linkedin", "text": "Schmerzfrei zum neuen Lächeln, heute"}]
         )
     )
 
-    assert updates["seo_report"]["passed"] in (True, False)  # the article's own verdict, unchanged
+    assert updates["seo_report"]["passed"] in (True, False), "the article's own verdict"
     assert updates["claim_check"]["passed"] is False
     assert updates["claim_check"]["hits"][0]["claim"] == "schmerzfrei"
 
 
-async def test_a_banned_claim_in_a_channel_cta_is_caught_too() -> None:
-    """A CTA is published copy: it goes in a post, in a bio, in an email."""
+async def test_a_banned_claim_in_any_channels_ask_blocks_the_whole_run() -> None:
+    """Not just that channel. A forbidden claim is a compliance gate on the run, and the
+    graph refuses to carry a failing verdict to REVIEW at all."""
     updates = await build_nodes(_deps())["VALIDATE"](
-        _landing_state(
-            landing_page=_landing_spec_dict(
-                ctas=[{"channel": "linkedin", "text": "Die beste Zahnarztpraxis in Koblenz:"}]
-            )
+        _distribution_state(
+            ctas=[
+                {"channel": "linkedin", "text": "Unser Leitfaden für Angstpatienten:"},
+                {"channel": "facebook", "text": "Die beste Zahnarztpraxis in Koblenz:"},
+            ]
         )
     )
 
@@ -1402,49 +1314,22 @@ async def test_a_banned_claim_in_a_channel_cta_is_caught_too() -> None:
     assert updates["claim_check"]["hits"][0]["claim"] == "beste Zahnarztpraxis"
 
 
-async def test_validate_writes_no_landing_report_when_there_is_no_landing_page() -> None:
-    """Absent is not the same as passing: the graph must be able to tell "nothing to
-    audit" from "audited and fine"."""
-    updates = await build_nodes(_deps())["VALIDATE"](_landing_state())
-
-    assert updates["landing_report"] is None
-
-
-async def test_a_malformed_stored_landing_page_degrades_instead_of_crashing() -> None:
-    """The checkpoint is JSONB and can hold whatever an earlier version, or a hand-run
-    statement, put there. A run whose VALIDATE crashes cannot be reviewed at all."""
-    updates = await build_nodes(_deps())["VALIDATE"](
-        _landing_state(landing_page={"headline": 3, "form_fields": "not a list"})
+def _distribution_state(**over: Any) -> AgentState:
+    """A state whose ARTICLE is clean and whose ask is whatever the test supplies."""
+    return _landing_state(
+        distribution={
+            "destination_url": "https://zahnarzt-koblenz.example/erstberatung",
+            **over,
+        }
     )
-
-    assert updates["landing_report"] is None
-    assert updates["claim_check"]["passed"] is True
-
-
-def _landing_spec_dict(**over: Any) -> dict[str, Any]:
-    spec: dict[str, Any] = {
-        "headline": "Angstfreie Zahnbehandlung in Koblenz für Erwachsene",
-        "subhead": "Wie ein erster Termin bei uns abläuft.",
-        "offer": "Ein Leitfaden mit dem Ablauf des ersten Termins und den Kosten.",
-        "proof_points": [
-            {"text": "Seit 2004 in Koblenz.", "source": "Praxisprofil"},
-            {"text": "Eigene Prophylaxe-Abteilung.", "source": "Leistungen 2026"},
-        ],
-        "form_fields": [{"name": "email", "label": "E-Mail", "required": True}],
-        "primary_cta": "Leitfaden anfordern",
-        "consent_text": "Ich bin mit der Kontaktaufnahme einverstanden.",
-        "ctas": [{"channel": "linkedin", "text": "Unser Leitfaden für Angstpatienten:"}],
-    }
-    spec.update(over)
-    return spec
 
 
 # --------------------------------------------------------------------------- #
-# The whole graph, with the real nodes: a banned claim on the LANDING PAGE
+# The whole graph, with the real nodes: a banned claim in the ASK
 #
 # The strongest form of the requirement, and the reason CONVERT sits before
 # VALIDATE. The article is clean, so every SEO gate passes; the forbidden promise
-# is in the conversion copy, which is the artifact with a form under it.
+# is in the conversion copy, which is the line somebody acts on.
 # --------------------------------------------------------------------------- #
 
 
@@ -1515,11 +1400,11 @@ CLEAN_ARTICLE_HTML = (
 )
 
 
-async def test_a_banned_claim_on_the_landing_page_cannot_reach_approval() -> None:
-    """The article never says it; the landing page does. The run still cannot be
-    approved, because VALIDATE checks both artifacts as one compliance verdict and the
-    graph refuses to carry a failing one to REVIEW -- REVIEW being where a human can
-    approve, and EXPORT publishing what was approved.
+async def test_a_banned_claim_in_the_ask_cannot_reach_approval() -> None:
+    """The article never says it; the ask does. The run still cannot be approved, because
+    VALIDATE checks both as one compliance verdict and the graph refuses to carry a
+    failing one to REVIEW -- REVIEW being where a human can approve, and EXPORT
+    publishing what was approved.
 
     This is what makes CONVERT's position in the graph load-bearing rather than
     stylistic: after VALIDATE it would produce this exact copy with nothing checking
@@ -1543,10 +1428,10 @@ async def test_a_banned_claim_on_the_landing_page_cannot_reach_approval() -> Non
                 "meta_description": "d" * 150,
                 "html": CLEAN_ARTICLE_HTML,
             },
-            "record_landing_page": {
-                **LANDING_ARGS,
-                # The forbidden promise, on the page with the form under it.
-                "headline": "Schmerzfrei behandelt in Koblenz",
+            "record_distribution": {
+                **DISTRIBUTION_ARGS,
+                # The forbidden promise, in the line somebody acts on.
+                "ctas": [{"channel": "linkedin", "text": "Schmerzfrei behandelt in Koblenz"}],
             },
             "record_posts": {"posts": [{"channel": "linkedin", "body": "Sanfte Behandlung."}]},
         }
@@ -1571,43 +1456,6 @@ async def test_a_banned_claim_on_the_landing_page_cannot_reach_approval() -> Non
     assert result.state["visited"].count("CONVERT") == 3, (
         "the two documented retries happen first: the gate is not a hair trigger"
     )
-
-
-async def test_a_clean_landing_page_reaches_review_with_its_audit() -> None:
-    """The control for the test above: the same machinery must let a good page through,
-    or the block above would prove nothing."""
-    router = _ToolRouter(
-        {
-            "record_opportunities": {
-                "opportunities": [
-                    {
-                        "title": "Angstpatienten",
-                        "rationale": "r",
-                        "target_keywords": ["zahnarzt koblenz"],
-                        "score": 90,
-                    }
-                ]
-            },
-            "record_outline": {"target_keyword": "zahnarzt koblenz", "headings": ["Ablauf"]},
-            "record_page": {
-                "title": "Angstfreie Zahnbehandlung in Koblenz",
-                "meta_description": "d" * 150,
-                "html": CLEAN_ARTICLE_HTML,
-            },
-            "record_landing_page": LANDING_ARGS,
-            "record_posts": {"posts": [{"channel": "linkedin", "body": "Sanfte Behandlung."}]},
-        }
-    )
-
-    result = await run_graph(
-        _state(dna=BANNED_DNA), nodes=build_nodes(_deps(router, score_page=_passing_seo))
-    )
-
-    assert (result.state["claim_check"] or {})["passed"] is True
-    assert (result.state["landing_report"] or {})["passed"] is True
-    assert (result.state["landing_page"] or {})["primary_cta"] == "Checkliste anfordern"
-    assert result.state.get("publication_blocked") is not True
-    assert "REVIEW" in result.state["visited"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1736,7 +1584,7 @@ def _retrieving_router() -> _ToolRouter:
                 "meta_description": "d" * 150,
                 "html": CLEAN_ARTICLE_HTML,
             },
-            "record_landing_page": LANDING_ARGS,
+            "record_distribution": DISTRIBUTION_ARGS,
             "record_posts": {"posts": [{"channel": "linkedin", "body": "Sanfte Behandlung."}]},
         }
     )

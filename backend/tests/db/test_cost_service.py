@@ -26,7 +26,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from backend.app.db import session as session_module
-from backend.app.services.cost_service import cost_report
+from backend.app.services.cost_service import (
+    MONTHLY_CAP_WINDOW_DAYS,
+    cost_report,
+    monthly_spend_usd,
+)
 
 pytestmark = pytest.mark.db
 
@@ -280,3 +284,98 @@ async def test_an_absurd_window_is_clamped_rather_than_scanning_everything(
     report = await cost_report(mine, window_days=10_000)
 
     assert report.window_days == 365
+
+
+# --------------------------------------------------------------------------- #
+# The per-business ceiling's read (`ARCHITECTURE.md` 7.4)
+#
+# `monthly_spend_usd` is a second, narrower query over the same ledger, and the risk of
+# a second query is that it drifts from the first: the dashboard would show one number
+# while the guard refused runs on another. So the agreement is asserted, not assumed.
+# --------------------------------------------------------------------------- #
+
+
+async def test_monthly_spend_is_the_same_number_the_dashboard_reports(
+    owner_session: AsyncSession, two_businesses: tuple[UUID, UUID]
+) -> None:
+    """The drift pin. One SUM instead of eight queries, and the same figure."""
+    mine, _ = two_businesses
+    for usd in ("0.10000000", "0.20000000"):
+        await _seed_usage(
+            owner_session, mine, run_id=None, model="openai/gpt-4.1", node="GENERATE", usd=usd
+        )
+    await owner_session.commit()
+
+    spent = await monthly_spend_usd(mine)
+    report = await cost_report(mine, window_days=MONTHLY_CAP_WINDOW_DAYS)
+
+    assert spent == Decimal("0.3"), (
+        f"came back {spent!r}; a float in the path would give 0.30000000000000004"
+    )
+    assert isinstance(spent, Decimal), "money is Decimal from the database to the comparison"
+    assert spent == Decimal(report.total_usd), (
+        "the guard's figure and the cost screen's figure must be the same number, or an "
+        "owner is refused on one number and shown another"
+    )
+
+
+async def test_monthly_spend_is_scoped_to_one_tenant_by_the_database(
+    owner_session: AsyncSession, two_businesses: tuple[UUID, UUID]
+) -> None:
+    """Another business's spend must not consume this one's allowance.
+
+    Row-level security is what excludes it -- the query has no `business_id` predicate --
+    so this is also a test that the read goes through `business_session`.
+    """
+    mine, theirs = two_businesses
+    await _seed_usage(
+        owner_session, mine, run_id=None, model="openai/gpt-4.1", node="GENERATE", usd="0.02"
+    )
+    await _seed_usage(
+        owner_session, theirs, run_id=None, model="openai/gpt-4.1", node="GENERATE", usd="99.00"
+    )
+    await owner_session.commit()
+
+    assert await monthly_spend_usd(mine) == Decimal("0.02")
+    assert await monthly_spend_usd(theirs) == Decimal("99.00")
+
+
+async def test_monthly_spend_only_counts_the_window(
+    owner_session: AsyncSession, two_businesses: tuple[UUID, UUID]
+) -> None:
+    """A rolling window, so a ceiling reached today is not forgiven by a calendar page."""
+    mine, _ = two_businesses
+    await _seed_usage(
+        owner_session,
+        mine,
+        run_id=None,
+        model="openai/gpt-4.1",
+        node="GENERATE",
+        usd="9.00",
+        created_at=datetime.now(UTC) - timedelta(days=MONTHLY_CAP_WINDOW_DAYS + 5),
+    )
+    await _seed_usage(
+        owner_session, mine, run_id=None, model="openai/gpt-4.1", node="GENERATE", usd="0.02"
+    )
+    await owner_session.commit()
+
+    assert await monthly_spend_usd(mine) == Decimal("0.02")
+    assert await monthly_spend_usd(mine, window_days=MONTHLY_CAP_WINDOW_DAYS + 30) == Decimal(
+        "9.02"
+    )
+
+
+async def test_an_empty_ledger_reads_as_zero_rather_than_none(
+    owner_session: AsyncSession, two_businesses: tuple[UUID, UUID]
+) -> None:
+    """`SUM` over no rows is SQL NULL, and a guard comparing NULL to a ceiling would
+    raise on the run-start path of every brand-new business.
+
+    Failing OPEN here is deliberate and is documented on the function: a guard cannot tell
+    "spent nothing" from "nothing was recorded", and refusing every fresh account would be
+    the worse of the two mistakes. `CostReport.ledger_wired` is where the unrecorded case
+    is called out.
+    """
+    mine, _ = two_businesses
+
+    assert await monthly_spend_usd(mine) == Decimal("0")

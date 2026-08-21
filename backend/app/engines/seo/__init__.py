@@ -13,12 +13,26 @@ score can be stored, compared across runs, and defended to a customer.
     if not result.passed:
         retry_prompt_hints = result.fix_hints   # fed to GENERATE verbatim
 
+`audit_site` is the other half, and it points the other way: `score_page` grades
+a page the agent just WROTE, `audit_site` grades the pages the customer already
+OWNS. `PROBLEM.md` is why that is the more valuable half -- "the fastest leads
+come from fixing CONVERSION on pages that already get traffic", because new
+Google content takes 6-12 weeks to rank. It reads `crawl.PageFacts` rather than
+HTML, so it costs nothing on top of the crawl HARVEST already runs.
+
 No I/O: `html` arrives as a string because fetching belongs to the `crawl`
 engine, and this module does not import it (or anything else that could reach
 the network, a model, or the database -- `tests/test_engine_boundary.py`
 enforces that).
 """
 
+from backend.app.engines.seo.audit import (
+    THIN_CONTENT_WORDS,
+    AuditFinding,
+    PageAudit,
+    SiteAuditResult,
+    audit_site,
+)
 from backend.app.engines.seo.contract import (
     SeoFinding,
     SeoFindingCode,
@@ -54,6 +68,9 @@ __all__ = [
     "RULE_WEIGHTS",
     "SCHEMA_CONTEXT",
     "SEVERITY_PENALTY",
+    "THIN_CONTENT_WORDS",
+    "AuditFinding",
+    "PageAudit",
     "PageFacts",
     "ReadabilityStats",
     "SeoFinding",
@@ -61,7 +78,9 @@ __all__ = [
     "SeoScoreRequest",
     "SeoScoreResult",
     "SeoSeverity",
+    "SiteAuditResult",
     "analyse_readability",
+    "audit_site",
     "build_article_jsonld",
     "build_faq_jsonld",
     "build_local_business_jsonld",

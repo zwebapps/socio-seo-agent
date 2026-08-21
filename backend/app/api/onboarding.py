@@ -21,7 +21,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
-from backend.app.api.runs import current_business
+from backend.app.api.auth import CurrentUser
+from backend.app.api.runs import business_for_user, current_business
 from backend.app.db.session import business_session
 from backend.app.engines.crawl import fetch_page
 from backend.app.engines.crawl.contract import CrawlError, UnsafeUrlError
@@ -31,6 +32,7 @@ from backend.app.services.onboarding_service import (
     BusinessNotFoundError,
     ThinSiteError,
     draft_dna_from_website,
+    read_onboarding_state,
     save_confirmed_dna,
 )
 
@@ -181,6 +183,65 @@ async def confirm(
         website=str(stored.get("website") or ""),
         services=list(stored.get("services") or []),
         banned_claims=list(stored.get("banned_claims") or []),
+    )
+
+
+class StateResponse(CamelModel):
+    """Whether this account has a business, and whether it has been onboarded."""
+
+    #: False when there is no business row at all. Reported SEPARATELY from
+    #: `onboarded` because the two states need different screens: a business that has
+    #: not been onboarded gets the onboarding form, while an account with NO business
+    #: cannot onboard at all -- `POST /onboarding/confirm` writes to a specific
+    #: business and has none to write to -- so offering it the form would be offering
+    #: a button that 409s.
+    has_business: bool
+    onboarded: bool
+    name: str | None
+    website: str | None
+
+
+@router.get(
+    "",
+    response_model=StateResponse,
+    response_model_by_alias=True,
+    summary="Whether this account has a business, and whether it is onboarded",
+)
+async def state(
+    user: CurrentUser,
+    open_session: Annotated[Any, Depends(get_business_session_opener)],
+) -> StateResponse:
+    """The read the dashboard needs in order to lead with the right thing.
+
+    Nothing exposed this, and the consequence was on the first screen every new owner
+    sees: the homepage led with "Start a run" and listed "Onboard a business" fifth,
+    under a heading called "Elsewhere" -- while a run without a confirmed DNA cannot do
+    anything at all. INTAKE exits immediately with "no business profile", by design
+    ("ask, never guess"). So the product's own first instruction was the one step it
+    could not yet take, and the screen had no way to know.
+
+    **Deliberately NOT behind `current_business`.** That dependency raises 409
+    `no_business` for an account with no business row, which made this read fail in
+    exactly the state that most needs an answer: a platform admin granted the role by
+    `scripts/grant_platform_admin.py`, or an owner whose business was removed, has no
+    business -- so the screen asked "should I show the onboarding prompt?", got a 409,
+    and showed nothing. This route takes the USER and reports the absence as data.
+    """
+    from backend.app.db.session import session as plain_session
+
+    async with plain_session() as db:
+        business_id = await business_for_user(user.id, session=db)
+
+    if business_id is None:
+        return StateResponse(has_business=False, onboarded=False, name=None, website=None)
+
+    async with open_session(business_id) as session:
+        result = await read_onboarding_state(business_id, session=session)
+    return StateResponse(
+        has_business=True,
+        onboarded=result.onboarded,
+        name=result.name,
+        website=result.website,
     )
 
 

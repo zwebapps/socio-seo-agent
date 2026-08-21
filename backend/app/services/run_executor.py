@@ -42,7 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, Final
+from typing import Any, Final, cast
 from uuid import UUID
 
 from sqlalchemy import text
@@ -61,6 +61,7 @@ from backend.app.core.config import get_settings
 from backend.app.db.adapters.action_store import PostgresActionStore
 from backend.app.db.session import session
 from backend.app.engines.nap import extract_nap_listings
+from backend.app.engines.seo import SiteAuditResult, audit_site
 from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
 from backend.app.services.usage_recorder import UsageRecorder
@@ -149,6 +150,8 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
     fail or silently stringify.
     """
     pages = list(getattr(result, "pages", []) or [])
+    start_url = str(getattr(result, "start_url", "") or "")
+    truncated = bool(getattr(result, "truncated", False))
     summarised: list[dict[str, Any]] = []
     for page in pages[:MAX_SUMMARISED_PAGES]:
         text = (getattr(page, "main_text", "") or "").strip()
@@ -172,7 +175,7 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
         "start_url": getattr(result, "start_url", None),
         "page_count": len(pages),
         "pages_summarised": len(summarised),
-        "truncated": bool(getattr(result, "truncated", False)),
+        "truncated": truncated,
         "error_count": len(list(getattr(result, "errors", []) or [])),
         # The NAP the site publishes about itself, extracted HERE because this is the
         # last point at which the full page facts exist. The summary deliberately
@@ -181,7 +184,35 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
         # JSON-LD block would put them in the checkpoint, which is rewritten on every
         # node. A handful of listings is small; the blocks are not.
         "nap_sources": [listing.model_dump(mode="json") for listing in extract_nap_listings(pages)],
+        # The SEO audit of the customer's OWN site, extracted here for exactly the
+        # reason `nap_sources` is: this is the last point at which the full page facts
+        # exist, and the audit reads `images` and `jsonld_blocks`, both of which the
+        # summary above drops. Running it later would mean a second crawl of a site we
+        # have just finished crawling.
+        #
+        # Audited over EVERY page, then trimmed: the cross-page findings are the
+        # valuable half (a title duplicated across 40 pages is invisible in a sample of
+        # 25) so they have to see all of them, while the per-page list is bounded by the
+        # same `MAX_SUMMARISED_PAGES` as the summary because the checkpoint carrying it
+        # is rewritten once per node.
+        "seo_audit": _summarise_audit(audit_site(start_url, pages, truncated=truncated)),
     } | {"pages": summarised}
+
+
+def _summarise_audit(result: SiteAuditResult) -> dict[str, Any]:
+    """A `SiteAuditResult` bounded for the checkpoint.
+
+    `problem_count` and `worst_severity` are computed from the WHOLE audit before the
+    page list is trimmed, so a site whose 30th page is the broken one still reports a
+    problem -- a count taken after trimming would quietly become "problems among the
+    first 25 pages" while still being displayed as the site's total.
+    """
+    payload: dict[str, Any] = result.model_dump(mode="json")
+    payload["problem_count"] = result.problem_count
+    payload["worst_severity"] = result.worst_severity
+    payload["pages_audited"] = len(payload.get("pages") or [])
+    payload["pages"] = (payload.get("pages") or [])[:MAX_SUMMARISED_PAGES]
+    return payload
 
 
 async def _load_revocations() -> Mapping[str, frozenset[str]]:
@@ -253,6 +284,7 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         geo_probe=_build_geo_probe(business_id, router),
         actuator_for=_build_actuator_resolver(),
         actuator_store=PostgresActionStore(),
+        publish_distribution=_build_publish_distribution(),
         owner_notice=await _resolve_owner_notice(business_id),
         # Same rule as `serp_search` and for the same reason: a FAKE search result
         # reaching a draft is worse than no search at all, because afterwards nothing
@@ -260,6 +292,62 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         # not run rather than treating an empty answer as a finding.
         web_search=serp_search,
     )
+
+
+def _build_publish_distribution() -> Callable[..., Awaitable[Any]]:
+    """Mint the tracked links and write the article piece, for EXPORT.
+
+    A closure over the two stores rather than a NodeDeps field per store, so the node
+    stays database-free and the argument list stays about the RUN rather than about
+    persistence.
+
+    The origin check lives inside `publish_distribution`, not here: CONVERT proposes the
+    destination from crawled pages — text we do not control — and the guard belongs at
+    the write, where no retry can talk past it.
+    """
+    from backend.app.db.adapters.content_store import PostgresContentStore
+    from backend.app.db.adapters.lead_store import PostgresLeadStore
+    from backend.app.engines.landing import ChannelCta
+    from backend.app.services.landing_service import publish_distribution
+
+    content_store = PostgresContentStore()
+    link_store = PostgresLeadStore()
+
+    async def publish(
+        *,
+        business_id: UUID,
+        run_id: UUID | None,
+        plan: Mapping[str, Any],
+        draft: Mapping[str, Any],
+        website: str,
+    ) -> dict[str, Any]:
+        ctas = [
+            ChannelCta(channel=str(cta["channel"]), text=str(cta["text"]))
+            for cta in plan.get("ctas", [])
+            if isinstance(cta, Mapping) and cta.get("channel") and cta.get("text")
+        ]
+        result = await publish_distribution(
+            business_id=business_id,
+            destination_url=str(plan.get("destination_url") or ""),
+            website=website,
+            ctas=ctas,
+            article_title=str(draft.get("title") or "Untitled"),
+            article_body_md=str(draft.get("html") or ""),
+            content_store=content_store,
+            link_store=link_store,
+            run_id=run_id,
+        )
+        # Primitives only: this lands in `published`, which is checkpointed to JSONB.
+        return {
+            "content_piece_id": str(result.content_piece_id),
+            "destination_url": result.destination_url,
+            "ctas": [
+                {"channel": cta.channel, "text": cta.text, "url": cta.url, "code": cta.code}
+                for cta in result.ctas
+            ],
+        }
+
+    return publish
 
 
 def _build_actuator_resolver() -> Callable[[str], Actuator | None]:
@@ -762,7 +850,18 @@ class RunExecutor:
         resume: bool,
     ) -> AgentState:
         if not resume:
-            return new_state(business_id=business_id, goal=goal)
+            # Channels come from the ROW, not from a parameter, and deliberately so.
+            # `submit` is also what the scheduled worker calls, and a job payload that
+            # has to carry the channel set is a payload that can disagree with the row
+            # it names. One primary-key read per fresh run buys "the run targets what
+            # the row says it targets", which stays true however the run was started.
+            record = await service.get(run_id)
+            return new_state(
+                business_id=business_id,
+                goal=goal,
+                run_id=run_id,
+                channels=record.channels if record is not None else None,
+            )
 
         restored = await service.restore(run_id)
         if restored is None:
@@ -771,10 +870,17 @@ class RunExecutor:
             # resume that silently restarts has thrown away the work it was meant to
             # preserve.
             logger.warning("run %s has no checkpoint to resume from; starting fresh", run_id)
-            return new_state(business_id=business_id, goal=goal)
+            return new_state(business_id=business_id, goal=goal, run_id=run_id)
 
         await service.mark_resumed(run_id)
-        return restored
+        # Stamped, not read. This is the ONE place that knows the run's identity for
+        # certain -- the checkpoint was fetched BY this id -- and a checkpoint written
+        # before `run_id` existed has none at all. Overwriting rather than defaulting is
+        # what makes those old rows publish attributed: EXPORT runs only on a resume, so
+        # a state restored here is the state that actuates, and a `None` left in place
+        # would put another NULL in `content_pieces.run_id` for every pre-key run
+        # anybody approves from now on.
+        return cast("AgentState", {**restored, "run_id": str(run_id)})
 
     @staticmethod
     async def _drain_events(

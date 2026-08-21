@@ -37,6 +37,7 @@ Postgres adapters are a separate, replaceable thing.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
@@ -45,6 +46,7 @@ from backend.app.core.config import get_settings
 from backend.app.db.adapters.content_store import ContentPieceRecord
 from backend.app.db.adapters.lead_store import ShortLinkRecord
 from backend.app.engines.landing import (
+    ChannelCta,
     LandingCheckRequest,
     LandingCheckResult,
     LandingPageSpec,
@@ -152,6 +154,130 @@ class LandingPageNotPublishableError(Exception):
             f"{problems}. Publishing it would put a URL in somebody's bio that "
             "converts nothing while looking finished."
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedDistribution:
+    """What a run leaves behind when it hosts no page of its own.
+
+    The same shape of result as :class:`PublishedLandingPage` minus the page: an article
+    content piece as the attribution anchor, and one tracked link per channel pointing at
+    a page the BUSINESS owns.
+    """
+
+    content_piece_id: UUID
+    business_id: UUID
+    destination_url: str
+    ctas: tuple[PublishedCta, ...]
+
+
+class DestinationNotOwnedError(Exception):
+    """The destination is not on the business's own site.
+
+    Refused rather than corrected, and this is the load-bearing guard of the whole
+    change. Once we stop hosting the page, the CTA target comes from a MODEL reading a
+    crawled website — attacker-influenceable text — and a run that pointed a business's
+    tracked links at somebody else's domain would be sending their audience away under
+    their own name. So the destination must be same-origin with `dna["website"]`, and
+    anything else is an error rather than a fallback: silently substituting the homepage
+    would hide that the model proposed an off-site target at all.
+    """
+
+
+def _same_origin(candidate: str, website: str) -> bool:
+    """Whether `candidate` is on the same site as `website`.
+
+    Host compared without `www.` and case-folded, because `example.de` and
+    `www.Example.de` are one site and refusing that pair would reject most real
+    homepages. Scheme is NOT compared: a business whose profile says `http://` and whose
+    links say `https://` is the ordinary case, and treating it as a different site would
+    refuse every one of them.
+    """
+    from urllib.parse import urlsplit
+
+    def host(value: str) -> str:
+        return urlsplit(value.strip()).netloc.lower().removeprefix("www.")
+
+    theirs = host(website)
+    return bool(theirs) and host(candidate) == theirs
+
+
+async def publish_distribution(
+    *,
+    business_id: UUID,
+    destination_url: str,
+    website: str,
+    ctas: Sequence[ChannelCta],
+    article_title: str,
+    article_body_md: str,
+    content_store: Any,
+    link_store: LinkStore,
+    campaign: str | None = None,
+    run_id: UUID | None = None,
+    base_url: str | None = None,
+) -> PublishedDistribution:
+    """Mint the tracked links for a run that hosts no page.
+
+    The founder's ruling (recorded in `CLAUDE.md`, 2026-08-21): we do not host a landing
+    page, because the business already has a website — we improve its SEO and promote the
+    business on social. So this replaces `publish_landing_page` on the run path.
+
+    **The article piece is still written, and it is not vestigial.** A tracked link and a
+    queued social post both attribute to a `content_pieces` id; without a row there is
+    nothing for a click to be attributed TO, and "which content earned this" becomes
+    unanswerable. It is `surface='article'`, served nowhere.
+
+    **What is lost, stated so nothing downstream implies otherwise:** the form was ours,
+    so a submission was a `leads` row attributed to a piece. The form is now theirs and
+    invisible to us, so attribution is CLICK-level. `link_clicks` still records channel,
+    piece and campaign — the short link is still ours, which is why a channel we cannot
+    post to is still measurable.
+
+    Raises :class:`DestinationNotOwnedError` before writing anything.
+    """
+    if not _same_origin(destination_url, website):
+        raise DestinationNotOwnedError(f"the destination {destination_url!r} is not on {website!r}")
+
+    base = (base_url or get_settings().public_base_url).rstrip("/")
+    title = (article_title or "Untitled").strip()[:512]
+    campaign_slug = slugify_business_name(campaign or title) or "article"
+
+    piece = await content_store.create_article_piece(
+        business_id, title=title, body_md=article_body_md, run_id=run_id
+    )
+
+    published: list[PublishedCta] = []
+    for cta in ctas:
+        link = await link_store.create_link(
+            business_id,
+            target_url=destination_url,
+            content_piece_id=piece.id,
+            channel=cta.channel,
+            campaign=campaign_slug,
+        )
+        # The code exists only now, so the target is completed with it — the same two-write
+        # shape `publish_landing_page` uses, and for the same reason: `with_ref` needs the
+        # code, and a failure between them leaves a link that still resolves to the
+        # customer's page without per-link attribution.
+        await link_store.retarget_link(
+            business_id, link.id, target_url=with_ref(link.target_url, link.code)
+        )
+        published.append(
+            PublishedCta(
+                channel=cta.channel,
+                text=cta.text,
+                code=link.code,
+                path=f"/l/{link.code}",
+                url=f"{base}/l/{link.code}",
+            )
+        )
+
+    return PublishedDistribution(
+        content_piece_id=piece.id,
+        business_id=business_id,
+        destination_url=destination_url,
+        ctas=tuple(published),
+    )
 
 
 async def publish_landing_page(

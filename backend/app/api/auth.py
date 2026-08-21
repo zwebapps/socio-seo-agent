@@ -185,8 +185,22 @@ class LoginRequest(CamelModel):
 
 class SignupResponse(CamelModel):
     user_id: UUID
-    business_id: UUID
+    #: `None` when no business was named, which is now the ordinary case. Naming a
+    #: business is a separate step the owner takes when ready — see
+    #: `POST /api/v1/business`.
+    business_id: UUID | None
     email: str
+
+
+class CreateBusinessRequest(CamelModel):
+    """Name the business. The step signup used to force before an account existed."""
+
+    name: str = Field(default="", max_length=auth_service.MAX_BUSINESS_NAME_LENGTH)
+
+
+class CreateBusinessResponse(CamelModel):
+    business_id: UUID
+    name: str
 
 
 class UserOut(CamelModel):
@@ -521,7 +535,22 @@ async def login(
         settings,
         issued_at=session_issued_at(user.sessions_valid_from),
     )
-    return UserOut(id=user.id, email=user.email, is_active=user.is_active, role=user.role)
+    # Imported locally, exactly as `/auth/me` does it below: `api.runs` imports from
+    # this module, so a top-level import here would be circular.
+    from backend.app.api.runs import business_for_user
+
+    # `business_id` is populated here for the same reason `/auth/me` populates it: this
+    # is ONE model returned by two routes, and a client reading `businessId` off the
+    # login response was getting `null` for an account that owns a business — the field
+    # defaulting rather than being resolved. A response that means something different
+    # depending on which route produced it is worse than one that omits the field.
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        is_active=user.is_active,
+        role=user.role,
+        business_id=await business_for_user(user.id, session=db),
+    )
 
 
 @router.post(
@@ -587,3 +616,42 @@ async def me(user: CurrentUser, db: Annotated[AsyncSession, Depends(db_session)]
         role=user.role,
         business_id=await business_for_user(user.id, session=db),
     )
+
+
+@router.post(
+    "/business",
+    response_model=CreateBusinessResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create this account's business",
+)
+async def create_business(
+    payload: CreateBusinessRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(db_session)],
+) -> CreateBusinessResponse:
+    """Name the business, after the account exists.
+
+    Signup used to refuse without a business name, so somebody who wanted an account
+    had to decide on a business first — the field stood between them and signing in at
+    all. This is that step, taken when the owner is ready.
+
+    Authenticated, and the owner comes from the SESSION rather than the body: accepting
+    a user id here would be letting the caller choose whose business they create.
+    """
+    try:
+        business_id = await auth_service.create_business(user.id, payload.name, session=db)
+    except auth_service.InvalidBusinessNameError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_error("invalid_business_name", str(exc)),
+        ) from exc
+    except auth_service.BusinessAlreadyExistsError as exc:
+        # 409 rather than returning the existing one: a caller that thinks it is
+        # creating a business and silently receives a different, older one has been
+        # given the wrong answer to the question it asked.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=_error("business_exists", str(exc)),
+        ) from exc
+    return CreateBusinessResponse(business_id=business_id, name=payload.name.strip())

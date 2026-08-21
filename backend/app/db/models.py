@@ -7,8 +7,9 @@ speculative.
 Present here: users, businesses, documents, kb_chunks, crawl_pages, runs,
 run_events, model_usage, actions, opportunities, content_pieces, geo_prompts,
 geo_results, model_routes, provider_settings, sampling_policies, node_tool_policies,
-short_links, link_clicks, leads, feedback, learned_style, platform_connections.
-Still to come: keywords, competitors, social_posts, approvals.
+short_links, link_clicks, leads, feedback, learned_style, platform_connections,
+social_posts, automation_settings.
+Still to come: keywords, competitors, approvals.
 """
 
 from datetime import datetime
@@ -216,6 +217,13 @@ class Run(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "runs"
 
     goal: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The channels this run renders posts for. Stored on the run, not derived at
+    #: execution time, because the answer must not change under a resume -- and
+    #: "which channels did this run target" has to stay answerable in SQL after the
+    #: default set changes.
+    channels: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
     state: Mapped[str] = mapped_column(
         String(32), default="queued", server_default="queued", nullable=False, index=True
     )
@@ -865,10 +873,243 @@ class PlatformConnection(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin)
         # must UPDATE the credential rather than accumulate rows nobody can choose
         # between -- and "which of these three LinkedIn tokens is live" is not a question
         # a publish path should have to answer.
+        # Named explicitly and SHORT. The `uq` naming convention would render
+        # `uq_platform_connections_business_id_platform_external_account_id` here -- 64
+        # characters, one over Postgres's 63-character identifier limit. A convention-
+        # generated name is a `conv` label, which SQLAlchemy silently truncates and
+        # hashes; a name given as a plain string is validated instead, and an over-long
+        # one raises `IdentifierError` before any schema comparison can happen. That is
+        # how this table disabled `alembic check` for the whole project. See
+        # `tests/db/test_schema_identifiers.py`, which now fails at test time instead.
         UniqueConstraint(
             "business_id",
             "platform",
             "external_account_id",
-            name="uq_platform_connections_business_id_platform_external_account_id",
+            name="uq_platform_connections_business_platform_account",
         ),
+        # The publish path asks exactly one question of this table -- "does this business
+        # have a usable connection to this platform" -- so that is the index it gets.
+        # Declared here as well as in `d4f18a6c93b7` because a migration-only index is
+        # drift, and `alembic check` says so now that it can run at all.
+        Index("ix_platform_connections_business_platform", "business_id", "platform"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Scheduling: what publishes when, and the automation that decides
+# --------------------------------------------------------------------------- #
+
+
+class SocialPostStatus(StrEnum):
+    """Where one channel rendering is in its life.
+
+    Six values rather than four, because two pairs that look mergeable answer
+    different questions.
+
+    ``queued`` vs ``scheduled``: a queued post has been rendered and carries no time; a
+    scheduled post has ``scheduled_at`` set and a publisher will pick it up. Collapsing
+    them makes "how much rendered content is sitting untimed" unanswerable, which is the
+    backlog number the review screen exists to show.
+
+    ``failed`` vs ``refused``: ``failed`` is the platform (or the network) saying no,
+    ``refused`` is our own approval policy saying no -- the same distinction
+    ``actions.status`` already draws, and for the same reason. A retry is correct for one
+    and is a policy violation for the other.
+    """
+
+    QUEUED = "queued"
+    SCHEDULED = "scheduled"
+    PUBLISHED = "published"
+    FAILED = "failed"
+    REFUSED = "refused"
+    CANCELLED = "cancelled"
+
+
+class SocialPost(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """One channel rendering of a content piece: the row that actually publishes.
+
+    ``docs/ROADMAP.md`` section 6 specifies the shape. ``business_id`` is added because
+    every business-scoped table carries one, and the publish columns because a row nobody
+    can time or attribute is not a post, it is a draft.
+
+    **The body is denormalised on purpose.** ``REPACK`` writes it after the ``channel``
+    engine has enforced that platform's length and hashtag limits, so it is not
+    derivable from ``content_pieces.body_md``: re-rendering at publish time would publish
+    text no human reviewed and no engine checked.
+
+    ``action_id`` is the join to the idempotency record. The ``actions`` row is inserted
+    BEFORE the external call, so a post still reading ``scheduled`` whose action reads
+    ``in_flight`` is the crash-mid-publish case a reconciler can ask the platform about --
+    rather than an invisible gap a retry would turn into a double post.
+    """
+
+    __tablename__ = "social_posts"
+
+    #: NOT NULL and CASCADE: a channel rendering has no meaning without the piece it
+    #: renders, and a scheduled post pointing at a deleted piece is how something gets
+    #: published for content nobody owns any more.
+    content_piece_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("content_pieces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    #: The channel this rendering targets. Deliberately NOT constrained by a CHECK,
+    #: unlike ``platform_connections.platform``. Three name sets already describe
+    #: channels here -- ``engines/channel.CHANNEL_SPECS``,
+    #: ``services/link_service._CHANNEL_TAGS`` and the connectable-platform list -- and
+    #: they legitimately differ (``instagram_story`` can carry a link; ``x`` has no
+    #: connector at all). A fourth authority in the database would refuse a post the
+    #: renderer correctly produced, and docs/ARCHITECTURE.md section 14 already records
+    #: that a third disagreeing channel table would be worse than none.
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    #: JSONB rather than ``text[]``, matching ``opportunities.target_keywords`` and
+    #: ``platform_connections.scopes``. The ROADMAP writes it ``hashtags[]``; one array
+    #: representation across the schema beats matching the notation.
+    hashtags: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    #: The UTM parameters as built by ``services/link_service.build_utm``. Stored rather
+    #: than rebuilt, because the tag set that was actually published is what the click
+    #: rows have to be read against -- same reasoning as ``leads.utm``.
+    utm: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default=SocialPostStatus.QUEUED,
+        server_default=SocialPostStatus.QUEUED.value,
+        nullable=False,
+    )
+    #: When it should go out, in UTC. NULL is the ``queued`` case: rendered, not timed.
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When it actually went out. Distinct from ``scheduled_at`` because the gap between
+    #: them is the only measure of whether the publisher is keeping up, and distinct from
+    #: ``updated_at`` because any write at all bumps that one.
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: The idempotency record for the publish attempt. SET NULL rather than CASCADE: an
+    #: action is an audit row, and losing the post because its audit row went would
+    #: destroy the more valuable of the two.
+    action_id: Mapped[UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("actions.id", ondelete="SET NULL")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('queued','scheduled','published','failed','refused','cancelled')",
+            name="status_valid",
+        ),
+        # The publisher asks this table exactly one question -- "what is due" -- so that
+        # is the index it gets. Status leads because it is the selective half: everything
+        # ever published stays in the table forever and must not be scanned again.
+        Index("ix_social_posts_status_scheduled_at", "status", "scheduled_at"),
+    )
+
+
+class AutomationMode(StrEnum):
+    """Whether the scheduler acts for a business, and how far it may go.
+
+    ``scheduled_draft`` is the ceiling in this build, and the name is the promise: the
+    automation starts a run and leaves the output in review. There is deliberately no
+    ``scheduled_publish``: publishing without a human is an approval-policy decision, and
+    a value here would let a settings write grant a capability the policy table owns.
+    """
+
+    OFF = "off"
+    SCHEDULED_DRAFT = "scheduled_draft"
+
+
+class Cadence(StrEnum):
+    """How often the scheduler runs.
+
+    The values live beside the CHECK constraint that admits them, and
+    ``services/automation_service`` imports this enum rather than repeating the strings --
+    a cadence the database accepts and the arithmetic does not recognise would be a row
+    that silently never schedules.
+    """
+
+    WEEKLY = "weekly"
+    BIWEEKLY = "biweekly"
+    MONTHLY = "monthly"
+
+
+class AutomationSetting(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
+    """One business's standing instruction to the scheduler. At most one row.
+
+    Configuration in the database rather than the environment, so changing when a
+    business's content goes out is a write and not a redeploy.
+
+    **``day_of_week`` is Monday=0**, matching :meth:`datetime.date.weekday`. Worth saying
+    loudly because both neighbouring conventions differ -- ISO 8601 is Monday=1 and
+    Postgres ``EXTRACT(DOW)`` is Sunday=0 -- and picking the wrong one does not fail, it
+    publishes on the wrong day for as long as nobody checks a calendar.
+
+    ``timezone`` is an IANA key, never an offset, and that is the whole point: "every
+    Tuesday at 09:00" has to stay 09:00 across a daylight-saving change, which a stored
+    offset cannot express. ``next_run_at`` is UTC, because a stored local time is
+    genuinely ambiguous for one hour every autumn.
+
+    ``next_run_at`` is a CACHE of the arithmetic in ``services/automation_service``, not
+    the truth: it exists so the due-work query is an index scan instead of a
+    recomputation across every business. Whatever changes the schedule rewrites it, and
+    the pure function is what decides its value.
+    """
+
+    __tablename__ = "automation_settings"
+
+    mode: Mapped[str] = mapped_column(
+        String(32),
+        default=AutomationMode.OFF,
+        server_default=AutomationMode.OFF.value,
+        nullable=False,
+    )
+    cadence: Mapped[str] = mapped_column(
+        String(16),
+        default=Cadence.WEEKLY,
+        server_default=Cadence.WEEKLY.value,
+        nullable=False,
+    )
+    #: Monday=0 .. Sunday=6. Defaults to Tuesday: Monday is the day a small-business
+    #: owner has the least attention to spare for a review queue.
+    day_of_week: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
+    #: Local hour, 0-23. Minute granularity is deliberately absent -- nothing about
+    #: content publishing is improved by 09:17, and a minute column is a second field to
+    #: keep consistent with the arithmetic.
+    hour: Mapped[int] = mapped_column(Integer, default=9, server_default=text("9"), nullable=False)
+    #: An IANA zone key. Defaults to the market's zone, as ``businesses.locale`` does.
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Europe/Berlin", server_default="Europe/Berlin", nullable=False
+    )
+    #: Which channels an automated run targets, in the vocabulary of ``runs.channels``.
+    #: Empty means "nobody chose", which the executor resolves to the default set -- the
+    #: same reading ``runs.channels`` has.
+    channels: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    #: The goal text an automated run starts with. Nullable, because a business that has
+    #: not written one gets the default goal rather than an invented sentence.
+    goal_template: Mapped[str | None] = mapped_column(Text)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: Why the scheduler stopped by itself -- budget exhausted, no connected channel,
+    #: repeated failures. Distinct from ``mode``: an owner switching automation off and
+    #: the system pausing it are different events, and only one of them needs explaining
+    #: back to the owner.
+    paused_reason: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("mode in ('off','scheduled_draft')", name="mode_valid"),
+        CheckConstraint("cadence in ('weekly','biweekly','monthly')", name="cadence_valid"),
+        # Range CHECKs rather than trust. `day_of_week = 7` is the ISO-vs-Python
+        # off-by-one arriving as data, and without this it is a row that matches no
+        # weekday and therefore silently never runs.
+        CheckConstraint("day_of_week between 0 and 6", name="day_of_week_valid"),
+        CheckConstraint("hour between 0 and 23", name="hour_valid"),
+        # One standing instruction per business. Two rows would be two answers to "when
+        # does this business publish", and the scheduler would honour whichever one the
+        # planner happened to return first.
+        UniqueConstraint("business_id", name="uq_automation_settings_business_id"),
     )

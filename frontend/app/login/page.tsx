@@ -4,6 +4,7 @@
 
 import { useState } from "react";
 import { Pill, SoftButton, SoftCard, SoftInput } from "../components/soft";
+import { landingFor, safeNext } from "../lib/roles";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
@@ -24,7 +25,12 @@ export default function LoginPage() {
 
     const body =
       mode === "signup"
-        ? { email, password, businessName: business }
+        ? // Omitted rather than sent empty. The API reads an absent or blank name as
+          // "not naming one yet" and creates the account alone, which is the point of
+          // the field being optional.
+          business.trim()
+          ? { email, password, businessName: business.trim() }
+          : { email, password }
         : { email, password };
 
     try {
@@ -48,8 +54,17 @@ export default function LoginPage() {
         return;
       }
 
-      const next = new URLSearchParams(window.location.search).get("next");
-      window.location.href = next ?? "/developer/models";
+      // Role-based, and read from the response we already have: `POST /login` returns
+      // `UserOut`, which carries `role`. A signup has no role in its response and is
+      // always a business owner, so it takes the owner landing.
+      const landed: unknown = await response.json().catch(() => null);
+      const role =
+        mode === "signup"
+          ? "owner"
+          : ((landed as { role?: string } | null)?.role ?? null);
+
+      const requested = safeNext(new URLSearchParams(window.location.search).get("next"));
+      window.location.href = requested ?? landingFor(role);
     } catch {
       setState({
         kind: "error",
@@ -88,7 +103,10 @@ export default function LoginPage() {
           </Field>
 
           {mode === "signup" && (
-            <Field label="Business name">
+            <Field
+              label="Business name"
+              hint="Optional — you can add this from your dashboard later"
+            >
               <SoftInput
                 value={business}
                 onChange={setBusiness}

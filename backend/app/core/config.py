@@ -5,15 +5,36 @@ secret is ever exposed to the browser -- see docs/ARCHITECTURE.md section 9.
 """
 
 import os
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: The obviously-unsafe default. Named rather than inlined so `create_app` can
 #: refuse to boot on it outside local development, comparing against the same
 #: constant the field defaults to instead of a duplicated literal that drifts.
 DEFAULT_SESSION_SECRET = "insecure-local-development-secret-change-me"  # noqa: S105
+
+#: Ceiling on what ONE business may spend on model calls inside the reporting
+#: window, in USD. `docs/ARCHITECTURE.md` section 7.4 states a per-business
+#: monthly cap as one of three cap levels; this is the number it is held to.
+#:
+#: A platform-wide default rather than a column on `businesses`, deliberately:
+#: nothing in the product can set a per-business ceiling -- there is no admin
+#: screen and no route for it -- so a column would be an unsettable value that
+#: every read would then have to defend against being NULL. A setting is the
+#: same shape every other tunable here has, and the day a business genuinely
+#: needs its own ceiling, this constant becomes the fallback for the column
+#: rather than being replaced by it.
+#:
+#: $25.00 is fifty runs at the $0.50 per-run ceiling
+#: (`agents.state.DEFAULT_MAX_USD`, not imported here so configuration stays
+#: independent of the agent package) -- comfortably more than a small business
+#: does in a month, and far below a bill anyone would want to discover after
+#: the fact.
+DEFAULT_BUSINESS_MONTHLY_CAP_USD = Decimal("25.00")
 
 Environment = Literal["local", "ci", "staging", "production"]
 
@@ -90,6 +111,43 @@ class Settings(BaseSettings):
     # maintain. If it goes a release without being touched, the builtin driver should
     # go with it.
     agent_runtime: AgentRuntime = "langgraph"
+
+    # The Meta app behind the Facebook/Instagram OAuth adapter
+    # (`services/platform_oauth_meta.py`). BOTH optional, and both absent is the
+    # ordinary state: with either one missing, `get_oauth_provider` returns
+    # `FakeOAuthProvider` and `oauth_status()` says so. There is deliberately no
+    # "enable Meta" flag -- selection is by credential and by nothing else, so a
+    # setting cannot disagree with whether an app exists.
+    #
+    # The app id is not a secret (it travels in the consent-dialog URL, which a
+    # customer's browser shows them). The secret is, so it is `SecretStr`: pydantic
+    # masks it in `repr` and in a JSON dump, which is what stops it reaching a startup
+    # log line or an exception rendering the settings object. Note that the provider
+    # itself reads `os.environ`, not this object -- `asgi.py` calls `load_dotenv`
+    # before importing the app, so a `.env` value is in the environment either way,
+    # and a credential that never enters a settings instance cannot be leaked by
+    # anything that serialises one (the rule `core/token_cipher.py` records for
+    # `PLATFORM_CREDENTIAL_KEY`). These fields exist so the two variables are
+    # declared and typed in the one place configuration is documented.
+    meta_app_id: str | None = None
+    meta_app_secret: SecretStr | None = None
+
+    # LinkedIn, on the same terms and for the same reason: declared and typed here so
+    # the variables are documented in one place, while
+    # `services/platform_oauth_linkedin.py` reads `os.environ` directly so a credential
+    # never enters a settings instance that something might serialise.
+    linkedin_client_id: str | None = None
+    linkedin_client_secret: SecretStr | None = None
+
+    # The per-business ceiling, in USD. `Decimal`, never `float`: this number is
+    # compared against a sum of `Numeric(12, 8)` ledger rows, and a binary float
+    # would make the comparison at the boundary a matter of luck. pydantic parses
+    # the environment string straight into `Decimal`, so no float is ever formed.
+    #
+    # A non-positive value refuses every run. That is intended and is the kill
+    # switch: `BUSINESS_MONTHLY_CAP_USD=0` stops all model spend for every
+    # business without a deploy.
+    business_monthly_cap_usd: Decimal = DEFAULT_BUSINESS_MONTHLY_CAP_USD
 
 
 @lru_cache

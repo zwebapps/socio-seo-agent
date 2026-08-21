@@ -52,6 +52,11 @@ __all__ = [
 #: are the article and the per-channel renderings.
 LANDING_SURFACE: Final = "landing_page"
 
+#: The article surface. `content_pieces.surface` is a plain string, and this is the
+#: second value the product writes into it — named rather than inlined so the writer and
+#: any future reader cannot disagree about the spelling.
+ARTICLE_SURFACE: Final = "article"
+
 #: Where the structured spec sits inside ``content_pieces.meta``. Namespaced rather
 #: than spread across the top level so that another artifact kind can put its own
 #: shape in the same column without colliding.
@@ -161,6 +166,80 @@ class PostgresContentStore:
             slug=slug,
             status=status,
         )
+
+    async def create_article_piece(
+        self,
+        business_id: UUID,
+        *,
+        title: str,
+        body_md: str,
+        run_id: UUID | None = None,
+        status: str = "approved",
+    ) -> ContentPieceRecord:
+        """Store the ARTICLE a run wrote, as the piece everything else attributes to.
+
+        The anchor row, and the reason it has to exist: a tracked short link and a
+        queued social post both point at a `content_pieces` id, and until now the only
+        thing that ever created one was the landing-page actuator. So under the
+        founder's ruling that we host no landing page, nothing would have created the
+        row that attribution hangs off — the clicks and the posts would have had
+        nowhere to attach.
+
+        `status` defaults to `approved` rather than `draft`, and that is safe here in a
+        way it is not for a landing page: a landing page is SERVED, so an unreviewed
+        one being live would make the approval gate optional, which is why
+        `create_landing_page` defaults the other way. An article piece is served
+        nowhere — it is a record of what the run produced and the anchor a post hangs
+        off — and it is only ever created after REVIEW has been passed.
+
+        No slug: nothing routes to an article. A slug on a row nothing serves is a
+        value that would eventually be treated as a URL.
+        """
+        piece_id = uuid4()
+        async with business_session(business_id) as db:
+            await db.execute(
+                _INSERT_PIECE,
+                {
+                    "id": piece_id,
+                    "business_id": business_id,
+                    "opportunity_id": None,
+                    "run_id": run_id,
+                    "surface": ARTICLE_SURFACE,
+                    "title": title,
+                    "slug": None,
+                    "body_md": body_md,
+                    "meta": json.dumps({}),
+                    "status": status,
+                },
+            )
+        return ContentPieceRecord(
+            id=piece_id,
+            business_id=business_id,
+            surface=ARTICLE_SURFACE,
+            title=title,
+            slug=None,
+            status=status,
+        )
+
+    async def article_for_run(self, business_id: UUID, run_id: UUID) -> UUID | None:
+        """The article piece this run already has, if any.
+
+        So queueing a run's posts twice reuses the anchor rather than creating a second
+        one — two anchors would split the same run's clicks across two pieces and make
+        "which content earned this" unanswerable.
+        """
+        async with business_session(business_id) as db:
+            found = (
+                await db.execute(
+                    text(
+                        "SELECT id FROM content_pieces "
+                        "WHERE run_id = :run_id AND surface = :surface "
+                        "ORDER BY created_at ASC LIMIT 1"
+                    ),
+                    {"run_id": run_id, "surface": ARTICLE_SURFACE},
+                )
+            ).scalar_one_or_none()
+        return found
 
     async def resolve_landing_page(self, piece_id: UUID) -> LandingPageTarget | None:
         """Find a landing page by its id, with no tenant context.

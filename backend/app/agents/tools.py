@@ -60,7 +60,6 @@ GEO_PROBE: Final = "geo.probe"
 NAP_AUDIT: Final = "nap.audit"
 SEO_SCORE: Final = "seo.score"
 CLAIMS_CHECK: Final = "claims.check"
-LANDING_CHECK: Final = "landing.check"
 CHANNEL_VALIDATE: Final = "channel.validate"
 MEMORY_LOAD: Final = "memory.load"
 WEB_SEARCH: Final = "web_search"
@@ -74,7 +73,7 @@ NOTIFY: Final = "notify"
 RECORD_OPPORTUNITIES: Final = "record_opportunities"
 RECORD_OUTLINE: Final = "record_outline"
 RECORD_PAGE: Final = "record_page"
-RECORD_LANDING_PAGE: Final = "record_landing_page"
+RECORD_DISTRIBUTION: Final = "record_distribution"
 RECORD_POSTS: Final = "record_posts"
 
 #: Every tool name the runtime recognises. An allowlist entry outside this set is
@@ -90,7 +89,6 @@ KNOWN_TOOLS: Final[frozenset[str]] = frozenset(
         NAP_AUDIT,
         SEO_SCORE,
         CLAIMS_CHECK,
-        LANDING_CHECK,
         CHANNEL_VALIDATE,
         MEMORY_LOAD,
         WEB_SEARCH,
@@ -100,7 +98,7 @@ KNOWN_TOOLS: Final[frozenset[str]] = frozenset(
         RECORD_OPPORTUNITIES,
         RECORD_OUTLINE,
         RECORD_PAGE,
-        RECORD_LANDING_PAGE,
+        RECORD_DISTRIBUTION,
         RECORD_POSTS,
     }
 )
@@ -126,16 +124,16 @@ NODE_TOOLS: Final[Mapping[str, frozenset[str]]] = {
     "OPPORTUNITY": frozenset({KB_SEARCH, RECORD_OPPORTUNITIES}),
     "PLAN": frozenset({KB_SEARCH, RECORD_OUTLINE}),
     "GENERATE": frozenset({KB_SEARCH, WEB_SEARCH, RECORD_PAGE}),
-    # The conversion surface: a landing page and the per-channel ask that points at
-    # it. `kb.search` because a proof point that is not in the business's own
-    # material is an invented claim, so the node needs to read that material; no
-    # `web_search`, because a proof point sourced from a page the business does not
-    # control is not proof of anything about the business.
-    "CONVERT": frozenset({KB_SEARCH, RECORD_LANDING_PAGE}),
-    # Deterministic verdicts only. No model, so no output tool. `landing.check` is
-    # the conversion audit -- "is there a form, and can it be answered" is set
-    # membership, which is arithmetic, not judgement.
-    "VALIDATE": frozenset({SEO_SCORE, CLAIMS_CHECK, LANDING_CHECK, KB_VERIFY}),
+    # The conversion surface: where the clicks land on the business's OWN site, and
+    # the per-channel ask that earns them. `kb.search` because the ask has to be
+    # grounded in the business's own material; no `web_search`, because a claim
+    # sourced from a page the business does not control is not proof of anything
+    # about the business.
+    "CONVERT": frozenset({KB_SEARCH, RECORD_DISTRIBUTION}),
+    # Deterministic verdicts only. No model, so no output tool. `landing.check` was
+    # here while we hosted a page and audited its form; the page went (`CLAUDE.md`,
+    # 2026-08-21) and the audit went with it.
+    "VALIDATE": frozenset({SEO_SCORE, CLAIMS_CHECK, KB_VERIFY}),
     # `claims.check` as well as the output tool: a social rendering is separate
     # content, so a forbidden claim can appear in a post even when the page it was
     # derived from is clean, and REPACK is the only node that sees the post.
@@ -339,13 +337,12 @@ __all__ = [
     "KB_SEARCH",
     "KB_VERIFY",
     "KNOWN_TOOLS",
-    "LANDING_CHECK",
     "MEMORY_LOAD",
     "NAP_AUDIT",
     "NODE_TOOLS",
     "NOTIFY",
     "PUBLISH",
-    "RECORD_LANDING_PAGE",
+    "RECORD_DISTRIBUTION",
     "RECORD_OPPORTUNITIES",
     "RECORD_OUTLINE",
     "RECORD_PAGE",

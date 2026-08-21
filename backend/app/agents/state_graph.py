@@ -191,8 +191,8 @@ def _wrap(name: str, node: Node, sink: EventSink | None) -> Any:
                 return {**merged, **exit_updates}
 
         if name == "VALIDATE":
-            blocked, weak_draft, weak_landing = verdicts(here)
-            if weak_draft or weak_landing:
+            blocked, weak_draft = verdicts(here)
+            if weak_draft:
                 try:
                     looped = enter_validate_loop(here)
                 except CapExceededError:
@@ -309,9 +309,11 @@ def _router(
 
     It never decides an outcome -- the wrapper has already written one if there is one
     -- so this reads ``outcome`` and gets out of the way. The one branch it does own
-    is the retry target, and that is genuinely a routing question: the shortest edge
-    that can fix what failed, which is CONVERT when only the landing page is weak
-    (the article passed, and GENERATE is the strong-tier node) and GENERATE otherwise.
+    is the retry target, and it is GENERATE. It used to choose between GENERATE and
+    CONVERT — the shortest edge that could fix what failed, since a landing page could
+    be weak while the article passed. The page went (`CLAUDE.md`, 2026-08-21) and with
+    it the second failing artifact, so there is one destination rather than a condition
+    that can only take one value.
     """
 
     def route(state: AgentState) -> str:
@@ -321,9 +323,9 @@ def _router(
             # Test hook standing in for a worker that died mid-run.
             return END
         if name == "VALIDATE":
-            _, weak_draft, weak_landing = verdicts(state)
-            if weak_draft or weak_landing:
-                return "GENERATE" if weak_draft else "CONVERT"
+            _, weak_draft = verdicts(state)
+            if weak_draft:
+                return "GENERATE"
         if name == "REVIEW":
             # Through the gate, never around it. `_next_unvisited` would answer EXPORT
             # here, which is the same destination one edge earlier -- and that edge is

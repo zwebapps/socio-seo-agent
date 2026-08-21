@@ -72,6 +72,7 @@ class PostgresRunStore:
                     id=run.id,
                     business_id=run.business_id,
                     goal=run.goal,
+                    channels=list(run.channels),
                     state=run.state,
                     current_node=run.current_node,
                     checkpoint=run.checkpoint,
@@ -88,6 +89,7 @@ class PostgresRunStore:
             id=row.id,
             business_id=row.business_id,
             goal=row.goal,
+            channels=list(row.channels or []),
             state=row.state,  # type: ignore[arg-type]
             current_node=row.current_node,
             resumed_count=row.resumed_count,

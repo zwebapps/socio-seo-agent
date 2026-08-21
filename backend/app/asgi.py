@@ -1,7 +1,13 @@
-"""Process entry point. The ONLY place that touches the environment.
+"""The API's process entry point. One of the two places that touch the environment.
 
 `uvicorn backend.app.asgi:app` starts here; the test suite imports
 `backend.app.main` instead and therefore never loads a `.env`.
+
+**This was the ONLY such place until the scheduler shipped as a second process.** The
+rule it stated is unchanged and is what `worker/__main__.py` follows: *every process
+entry point loads `.env`, and nothing below one does* — a worker that skipped it would
+connect to the default database rather than the configured one, which looks exactly like
+an empty queue. Importing a module must still never mutate the environment.
 
 Why the split exists, because it cost a debugging round to find:
 

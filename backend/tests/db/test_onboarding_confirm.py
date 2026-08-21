@@ -27,6 +27,7 @@ from backend.app.db.session import business_session
 from backend.app.services.onboarding_service import (
     BusinessDnaDraft,
     BusinessNotFoundError,
+    read_onboarding_state,
     save_confirmed_dna,
 )
 
@@ -183,3 +184,99 @@ async def test_an_unknown_business_raises_rather_than_creating_one(
     with pytest.raises(BusinessNotFoundError):
         async with business_session(ghost) as s:
             await save_confirmed_dna(ghost, dna=_draft(), source_url="https://x.example", session=s)
+
+
+# --------------------------------------------------------------------------- #
+# read_onboarding_state — the read the dashboard needs to lead with the right thing
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_business_with_no_confirmed_profile_reads_as_not_onboarded(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The state the homepage was unable to detect.
+
+    It led with "Start a run" and listed onboarding fifth under "Elsewhere", while a run
+    without a profile stops at INTAKE and says the business profile is missing.
+    """
+    async with business_session(business_a) as s:
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.onboarded is False
+    assert state.website is None
+
+
+async def test_a_confirmed_profile_reads_as_onboarded(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    async with business_session(business_a) as s:
+        await save_confirmed_dna(
+            business_a, dna=_draft(), source_url="https://mueller.example", session=s
+        )
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.onboarded is True
+    assert state.website == "https://mueller.example"
+    assert state.name == "Müller Sanitär GmbH"
+
+
+async def test_a_taught_preference_alone_does_not_count_as_onboarded(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """Why the flag is keyed on `website` and not on "is `dna` non-empty".
+
+    `memory_service.remember` writes `dna["preferences"]` for a business that has never
+    been onboarded, so a non-empty `dna` is not evidence of a confirmed profile. Keying
+    on emptiness would tell a brand-new owner who happened to add a preference that
+    their setup was done, and their first run would then stop at INTAKE.
+    """
+    # Imported locally, the same way `test_confirming_does_not_delete_what_the_agent_was
+    # _taught` does it above.
+    from backend.app.services.memory_service import remember
+
+    async with business_session(business_a) as s:
+        await remember(business_a, rule="Never mention discounts", session=s)
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.onboarded is False
+
+
+async def test_a_named_but_unonboarded_business_reports_its_name(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The bug this closes, seen on the /business screen.
+
+    `dna` is `{}` until onboarding, so reading the name only from there reported a
+    business the owner had just named as "Not set". `businesses.name` is what they
+    typed when they created it, and it is the right answer until a confirmed DNA
+    supplies a better one.
+    """
+    async with business_session(business_a) as s:
+        # No explicit commit: `business_session` owns the transaction, and committing
+        # inside it closes the context manager out from under the read below.
+        await s.execute(
+            text("UPDATE businesses SET name = :n WHERE id = :i"),
+            {"n": "Robot Aircraft", "i": business_a},
+        )
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.onboarded is False, "naming a business is not onboarding it"
+    assert state.name == "Robot Aircraft"
+
+
+async def test_a_confirmed_dna_name_wins_over_the_typed_one(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """They are different facts: the column is what the owner typed, the DNA name is
+    the trading name the crawl extracted and they then confirmed."""
+    async with business_session(business_a) as s:
+        await s.execute(
+            text("UPDATE businesses SET name = :n WHERE id = :i"),
+            {"n": "typed-name-gmbh", "i": business_a},
+        )
+        await save_confirmed_dna(
+            business_a, dna=_draft(), source_url="https://mueller.example", session=s
+        )
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.name == "Müller Sanitär GmbH"

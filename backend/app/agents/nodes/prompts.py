@@ -210,101 +210,37 @@ GENERATE_TOOL = ToolSpec(
     },
 )
 
-LANDING_TOOL = ToolSpec(
-    name="record_landing_page",
+DISTRIBUTION_TOOL = ToolSpec(
+    name="record_distribution",
     description=(
-        "Record the landing page this content should convert on, and the ask that "
-        "points at it from each channel. Every proof point must name the document, "
-        "page or profile field it came from; if the evidence supports no proof point, "
-        "return none rather than inventing one."
+        "Record where each channel's call to action should send the reader ON THE "
+        "BUSINESS'S OWN WEBSITE, and the ask that earns the click. We do not host a page "
+        "for them: they already have a site, and the job is to send traffic to it. Choose "
+        "the page that already answers what the post is about -- a service page, not the "
+        "homepage, unless nothing better exists."
     ),
     parameters={
         "type": "object",
-        "required": [
-            "headline",
-            "offer",
-            "proof_points",
-            "form_fields",
-            "primary_cta",
-            "consent_text",
-            "ctas",
-        ],
+        "required": ["destination_url", "ctas"],
         "additionalProperties": False,
         "properties": {
-            "headline": {
-                "type": "string",
-                "description": "25-70 characters. Names the offer and who it is for.",
-            },
-            "subhead": {
-                "type": "string",
-                "description": ("One sentence: what the visitor gets, and what it costs them."),
-            },
-            "offer": {
+            "destination_url": {
                 "type": "string",
                 "description": (
-                    "At least 40 characters. What the visitor actually receives in "
-                    "exchange for their details, in concrete terms."
-                ),
-            },
-            "proof_points": {
-                "type": "array",
-                "description": (
-                    "Two or three reasons to believe the offer, each taken from the "
-                    "business's own documents or profile."
-                ),
-                "items": {
-                    "type": "object",
-                    "required": ["text", "source"],
-                    "additionalProperties": False,
-                    "properties": {
-                        "text": {"type": "string"},
-                        "source": {
-                            "type": "string",
-                            "description": (
-                                "The document, page or profile field this came from, "
-                                "named as it appears in the evidence. Never empty."
-                            ),
-                        },
-                    },
-                },
-            },
-            "form_fields": {
-                "type": "array",
-                "description": (
-                    "One to three fields. Every additional field costs conversions, "
-                    "and one of email or phone is required or the enquiry cannot be "
-                    "answered."
-                ),
-                "items": {
-                    "type": "object",
-                    "required": ["name", "label"],
-                    "additionalProperties": False,
-                    "properties": {
-                        # Closed on purpose: these are the only names the public lead
-                        # endpoint accepts, so anything else would be a field the
-                        # visitor fills in and the server refuses.
-                        "name": {"type": "string", "enum": ["name", "email", "phone", "message"]},
-                        "label": {"type": "string", "description": "In the business's language."},
-                        "required": {"type": "boolean"},
-                    },
-                },
-            },
-            "primary_cta": {
-                "type": "string",
-                "description": (
-                    "The button label, at most 40 characters, as an action the visitor takes."
-                ),
-            },
-            "consent_text": {
-                "type": "string",
-                "description": (
-                    "One sentence beside the consent checkbox: what the business will "
-                    "do with the details. In the business's language."
+                    "An absolute URL on the business's own domain, taken from the pages "
+                    "that were crawled. It MUST be on that domain -- a link to anywhere "
+                    "else is refused and the run reports it, because sending a "
+                    "business's own audience to another site under their name is the one "
+                    "mistake this field can make. When no page fits, use the homepage."
                 ),
             },
             "ctas": {
                 "type": "array",
-                "description": "Exactly one per requested channel, in that channel's register.",
+                "description": (
+                    "One ask per channel named in the request, in that channel's "
+                    "register. The ask is what earns the click; the link is added by "
+                    "code, so do not write a URL into the text."
+                ),
                 "items": {
                     "type": "object",
                     "required": ["channel", "text"],
@@ -314,8 +250,8 @@ LANDING_TOOL = ToolSpec(
                         "text": {
                             "type": "string",
                             "description": (
-                                "At most 200 characters. The link is added by the "
-                                "system -- do not write a URL."
+                                "Under 120 characters. One instruction, in the second "
+                                "person, naming what the reader gets."
                             ),
                         },
                     },

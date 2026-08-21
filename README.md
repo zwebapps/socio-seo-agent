@@ -65,7 +65,15 @@ make install          # uv sync + pnpm install
 make up               # postgres :5435, redis :6381
 make api              # terminal 1 — FastAPI on :8100
 make web              # terminal 2 — Next.js on :3100
+make worker           # terminal 3 — the scheduler (only needed for scheduled runs)
 ```
+
+**Three processes, and the third one is not optional if you use `/automation`.** The
+scheduler is what turns a cadence into a run: without it the setting saves, the screen
+shows a next run, and nothing ever starts it. That failure would be silent, so the
+automation screen derives it — a slot still sitting in the past long after it was due is
+reported as overdue, naming this command, rather than being rendered as a schedule that
+works. The API and the web app do not need it.
 
 Open http://localhost:3100 and walk it in this order — it is the customer journey,
 and each step is a thing the agent will use:
@@ -89,10 +97,18 @@ and each step is a thing the agent will use:
    `PLATFORM_CREDENTIAL_KEY` is set, and that with only the fake provider configured an
    authorisation cannot complete at all, because its address is a reserved domain that
    can never resolve.
-6. **Start a run from the dashboard**, then watch `/runs/{id}`: the timeline names every
+6. **Start a run from `/dashboard`**, then watch `/runs/{id}`: the timeline names every
    node, what each one cost, and any source that failed. Open the review tabs for the
    draft, the deterministic SEO findings, the per-channel posts and the AI answer blocks.
-7. **`/leads`** — a captured lead, named against the content piece that earned it.
+7. **`/content`** — the approved posts per channel, and the calendar they are placed on.
+8. **`/automation`** — hand the previous step to the scheduler: a cadence, a day, an hour,
+   the channels, and the goal each run should aim for. A scheduled run is checked against
+   the business's monthly spending ceiling before it starts and reaches exactly the same
+   review gate as one you started yourself — nothing is published unattended.
+9. **`/leads`** — a captured lead, named against the content piece that earned it.
+
+`/` is the public front page. The owner's home is `/dashboard`, and the sidebar is how you
+move between screens.
 
 **With no model key in `.env` everything still runs**, on deterministic fake providers,
 and every surface says so — the run timeline names the fake, the review screen lists
@@ -326,7 +342,7 @@ channel worth having.
 ```
 backend/                     everything Python
 ├─ app/
-│  ├─ asgi.py                process entry point — the ONLY place that loads .env
+│  ├─ asgi.py                the API's entry point — one of two places that load .env
 │  ├─ main.py                app factory (no import-time side effects)
 │  ├─ api/                   FastAPI routes (thin)
 │  ├─ agents/                the graph: state, both drivers, nodes, tool allowlist
@@ -334,7 +350,8 @@ backend/                     everything Python
 │  ├─ db/                    models, migrations, adapters
 │  ├─ engines/               deterministic computation — guarded by a test
 │  ├─ llm/                   model router, providers, pricing
-│  └─ services/              impure orchestration over engines + router
+│  ├─ services/              impure orchestration over engines + router
+│  └─ worker/                the scheduler — the second process, and the second .env load
 └─ tests/                    pytest; every external call faked, no network in CI
 
 frontend/                    Next.js 16 · React 19 · Tailwind 4

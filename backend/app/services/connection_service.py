@@ -19,9 +19,16 @@ token" is answerable with grep instead of with a review.
 whose truth changes without anybody writing a row: a token with ``expires_at`` five
 minutes ago is expired whether or not a sweep has noticed. So
 :meth:`ConnectionView.unusable_reason` is the authority every surface asks — the actuator
-included — and :func:`mark_expired_if_stale` exists only so SQL-level reads agree with
-it. If those two ever disagree the pure function wins, which is the same discipline the
-rest of this codebase applies to derived state.
+included — and :func:`mark_expired_if_stale` / :func:`sweep_expired_connections` exist
+only so SQL-level reads agree with it. If those two ever disagree the pure function wins,
+which is the same discipline the rest of this codebase applies to derived state.
+
+The consequence is the invariant that makes the sweep safe to ship with no scheduler
+behind it: **every screen, API response and publish refusal is already correct on a
+database the sweep has never touched**, because each of them folds the clock on read. The
+sweep is reconciliation for reports and for the operator's eye — it is a convenience, not
+a dependency, and nothing may be written that makes a surface depend on it having run.
+``tests/services/test_connection_sweep.py`` asserts exactly that.
 
 **A refusal to store is the correct outcome when there is no cipher.** With no
 ``PLATFORM_CREDENTIAL_KEY`` the cipher refuses (``core/token_cipher``), so
@@ -40,7 +47,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -63,11 +70,13 @@ __all__ = [
     "ConnectionStatus",
     "ConnectionStore",
     "ConnectionView",
+    "SweepOutcome",
     "begin_connect",
     "complete_connect",
     "mark_expired_if_stale",
     "refresh_connection",
     "revoke_connection",
+    "sweep_expired_connections",
 ]
 
 #: How long before the stated expiry a credential is treated as due for renewal. A token
@@ -146,6 +155,31 @@ class ConnectionView:
             return False
         moment = now if now is not None else datetime.now(UTC)
         return (_as_utc(self.expires_at) - moment).total_seconds() <= RENEW_BEFORE
+
+    def status_is_stale(self, *, now: datetime | None = None) -> bool:
+        """Whether the stored ``status`` column now disagrees with the clock.
+
+        The write decision, and the only one — :func:`mark_expired_if_stale` and
+        :func:`sweep_expired_connections` both ask this, so a single connection swept by
+        hand and a thousand swept by the script cannot reach different conclusions about
+        the same row.
+
+        Deliberately narrow in two directions, and both are what makes the sweep
+        idempotent rather than merely repeatable:
+
+        * only ``connected`` is a candidate. A row already saying ``expired`` is already
+          in agreement and must not be rewritten — a sweep that touched it would churn
+          ``updated_at`` on every run, and ``updated_at`` is what an operator reads to
+          find out when a connection actually died.
+        * ``revoked`` is never a candidate. It is terminal and stronger than expired:
+          overwriting it would say a credential we have already forgotten is merely stale,
+          and invite somebody to try renewing it.
+
+        This is not a second authority on usability. :meth:`unusable_reason` remains the
+        one every surface asks; this answers the narrower question of whether the cached
+        column needs a write to catch up with it.
+        """
+        return self.status is ConnectionStatus.CONNECTED and self.is_expired(now=now)
 
     def unusable_reason(self, *, now: datetime | None = None) -> str | None:
         """Why nothing may be published on this connection, or ``None`` if it may.
@@ -421,15 +455,99 @@ async def mark_expired_if_stale(
     surface is already correct without this — the pure function folds the clock — so this
     never has to run for the product to behave; it runs so a report does not disagree with
     a screen.
+
+    One connection. :func:`sweep_expired_connections` is the same decision applied to
+    every connection a set of businesses holds, and both defer to
+    :meth:`ConnectionView.status_is_stale` so they cannot drift apart.
     """
     current = await store.view(business_id=business_id, platform=platform)
     if current is None:
         return None
-    if current.status is not ConnectionStatus.CONNECTED or not current.is_expired(now=now):
+    if not current.status_is_stale(now=now):
         return current
     return await store.set_status(
         business_id=business_id, platform=platform, status=ConnectionStatus.EXPIRED
     )
+
+
+@dataclass(frozen=True, slots=True)
+class SweepOutcome:
+    """What one sweep looked at and what it changed.
+
+    Carries :class:`ConnectionView` objects rather than ids because the caller wants to
+    print which connection died and when — and a view is the one shape that can be logged
+    without checking first whether it holds a credential.
+    """
+
+    #: Connections read, across every business swept. The denominator.
+    examined: int
+    #: The rows written, as they now read. Empty on an idempotent second run, which is the
+    #: normal steady state and not a sign that anything failed.
+    expired: tuple[ConnectionView, ...]
+
+
+async def sweep_expired_connections(
+    *,
+    store: ConnectionStore,
+    business_ids: Iterable[UUID],
+    now: datetime | None = None,
+) -> SweepOutcome:
+    """Write ``expired`` on every connection the clock has already passed.
+
+    A sweep rather than an endpoint, deliberately. The row has to converge whether or not
+    anybody asks, and a route only converges the connections some client remembered to
+    name — which is the same shape of bug as the status column itself: state that is right
+    only when somebody thinks to look.
+
+    **This must never become load-bearing.** Every surface folds the clock on read
+    (:meth:`ConnectionView.unusable_reason`), so a database this has never run against
+    still refuses the right publishes and still shows the right badges. What it fixes is
+    narrower and real: a ``SELECT status FROM platform_connections`` — a report, a support
+    query, a dashboard built in SQL rather than through the API — otherwise reads
+    ``connected`` on a connection every line of application code already treats as dead.
+    If a screen ever starts *needing* this to have run, the screen is the bug.
+
+    **Tenancy is the store's, not this function's.** It iterates business ids and asks the
+    store for each one's connections, so the real adapter opens one ``business_session``
+    per business and row-level security decides what is visible — the same path the
+    settings screen reads through. There is no privileged connection here and no
+    cross-tenant query: ids come in, and the only rows touched are the ones a tenant-scoped
+    read returned. A business id that has no connections, or that does not exist, simply
+    contributes nothing.
+
+    **No network.** Expiry is a clock comparison against the stored ``expires_at``; nothing
+    here asks a platform anything. Renewing a credential is :func:`refresh_connection`,
+    which is a different job with a different failure mode — a rate-limited refresh must
+    leave the row alone, and folding that into a bulk sweep would either swallow the
+    distinction or let one platform's outage stall the reconciliation of every other.
+    """
+    examined = 0
+    expired: list[ConnectionView] = []
+
+    for business_id in business_ids:
+        for view in await store.views(business_id=business_id):
+            examined += 1
+            if not view.status_is_stale(now=now):
+                continue
+            written = await store.set_status(
+                business_id=business_id,
+                platform=view.platform,
+                status=ConnectionStatus.EXPIRED,
+            )
+            if written is None:
+                # The row was read a moment ago and is gone now -- a concurrent revoke
+                # that deleted it, or a store that disagrees with its own read. Nothing to
+                # report and nothing to fix: the next sweep sees whatever is there now.
+                continue
+            logger.info(
+                "connection marked expired: business=%s platform=%s expires_at=%s",
+                business_id,
+                view.platform,
+                view.expires_at.isoformat() if view.expires_at is not None else "unknown",
+            )
+            expired.append(written)
+
+    return SweepOutcome(examined=examined, expired=tuple(expired))
 
 
 def _as_utc(moment: datetime) -> datetime:

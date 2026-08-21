@@ -26,10 +26,28 @@ Four properties, each of which is easy to get wrong in a way that still renders:
 Aggregation is done in SQL rather than in Python on purpose: pulling every usage row
 into the process to sum it would move the cost of this screen from the database's
 indexes to the API's memory, and the numbers are the only thing we want back.
+
+The same ledger also answers a question that is not a dashboard question: **may this
+business start another run at all.** :func:`monthly_spend_usd` and
+:func:`over_monthly_cap` are the read and the boundary behind the per-business ceiling of
+`docs/ARCHITECTURE.md` section 7.4, and :func:`monthly_cap_state` is the ONE place that
+puts them together — the ledger read, the configured ceiling, and the sentence that
+states both figures.
+
+**Why that composition is here and not at each caller.** It used to be assembled inside
+``api/runs.py``, which was correct while the API was the only way a run could begin. Then
+the scheduler started runs too, called ``RunService.start`` directly, and spent past a
+ceiling a human pressing the same button was refused at — the ceiling existed and one
+caller simply did not know about it. So the *decision* lives here and every entry point
+asks it. What to DO about a breached ceiling still belongs to the caller, and genuinely
+differs: an HTTP request is refused 409 and an automation pauses itself with a stated
+reason, because a scheduler has nobody to return a status code to.
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -42,6 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from backend.app.agents.state import DEFAULT_MAX_USD
+from backend.app.core.config import get_settings
 from backend.app.db.models import ModelUsage, Run
 from backend.app.db.session import business_session
 from backend.app.llm.pricing import format_usd, is_priced
@@ -57,6 +76,21 @@ MAX_WINDOW_DAYS: Final = 365
 #: How many rows each breakdown returns. A long tail of one-call models is noise on a
 #: dashboard; the totals still account for it.
 BREAKDOWN_LIMIT: Final = 20
+
+#: The window the per-business ceiling is measured over, in days.
+#:
+#: The SAME window the dashboard reports, and that is the point of aliasing it rather
+#: than writing 30 again: an owner who is refused a run reads the reason, opens the cost
+#: screen, and must find the number they were just quoted. A calendar month would put a
+#: different figure on each surface and make every refusal a support ticket -- and it
+#: would also hand a business at its ceiling a full allowance again at midnight on the
+#: 1st, which is a reset rather than a control.
+MONTHLY_CAP_WINDOW_DAYS: Final = DEFAULT_WINDOW_DAYS
+
+#: Reads one business's spend over the ceiling's window. Named here rather than in each
+#: caller so the API's dependency override and the scheduler's test double are the same
+#: shape as the real function they stand in for.
+type SpendReader = Callable[[UUID], Awaitable[Decimal]]
 
 
 class _Wire(BaseModel):
@@ -323,13 +357,147 @@ async def cost_report(business_id: UUID, *, window_days: int = DEFAULT_WINDOW_DA
     )
 
 
+async def monthly_spend_usd(
+    business_id: UUID, *, window_days: int = MONTHLY_CAP_WINDOW_DAYS
+) -> Decimal:
+    """This business's model spend over the ceiling's window, as a ``Decimal``.
+
+    The same number as :attr:`CostReport.total_usd` for the same window, from the same
+    table through the same tenant-scoped session -- but ONE ``SUM`` rather than the
+    report's eight queries. :func:`cost_report` exists to render a screen: four
+    breakdowns, a per-day series and a join against ``runs``. This is a guard on the path
+    of every run start, and it needs exactly one figure. ``test_cost_service`` asserts the
+    two agree, so the cheap read cannot drift away from the number the dashboard shows.
+
+    Returned as ``Decimal`` rather than the report's display string: the caller compares
+    it against a ceiling, and a comparison is arithmetic. Formatting for a human happens
+    at the surface that shows it, through :func:`~backend.app.llm.pricing.format_usd`, so
+    the refusal and the dashboard quote the figure identically.
+
+    An empty ledger reads as zero here, and that is the deliberate direction of failure.
+    :attr:`CostReport.ledger_wired` exists because "$0.00" and "nothing was recorded" are
+    different statements -- but a guard cannot act on that difference: refusing every run
+    on a business whose ledger is simply empty would stop a brand-new account from ever
+    running anything. So an unrecorded ledger means an unenforceable ceiling, the
+    dashboard is where that alarm is raised, and this function fails open.
+    """
+    _, since = _window(window_days)
+
+    async with business_session(business_id) as s:
+        spent: Decimal | None = (
+            await s.execute(
+                select(func.coalesce(func.sum(ModelUsage.usd), Decimal("0"))).where(
+                    ModelUsage.created_at >= since
+                )
+            )
+        ).scalar_one()
+
+    return spent if spent is not None else Decimal("0")
+
+
+@dataclass(frozen=True, slots=True)
+class MonthlyCapState:
+    """One business's standing against its monthly ceiling, as every caller sees it.
+
+    A value object rather than a bare bool, because both callers need the FIGURES and
+    not just the verdict: "over budget" with no numbers gives the owner nothing to act
+    on and gives support nothing to check, and the two things anybody asks next are what
+    was spent and what the limit is.
+
+    Not a pydantic model: this is not a wire shape. It reaches the owner as an HTTP
+    refusal body composed in ``api/runs.py`` and as an automation's ``paused_reason``,
+    both of which state it in words.
+    """
+
+    spent_usd: Decimal
+    cap_usd: Decimal
+    window_days: int
+
+    @property
+    def exceeded(self) -> bool:
+        """Whether the ceiling is used up. :func:`over_monthly_cap` owns the boundary."""
+        return over_monthly_cap(self.spent_usd, self.cap_usd)
+
+    @property
+    def sentence(self) -> str:
+        """The shared statement of fact, with no consequence attached.
+
+        Deliberately stops before "so ...": the consequence differs by caller (a refused
+        request, a paused automation) and each appends its own. What must NOT differ is
+        how the money is quoted — both figures go through
+        :func:`~backend.app.llm.pricing.format_usd`, the same formatter the cost screen
+        uses, so a refusal and the dashboard cannot give two opinions about one ledger.
+
+        A `str`, never a `Decimal` on the wire: FastAPI encodes an exception's `detail`
+        with `jsonable_encoder`, which turns a `Decimal` into a JSON float — binary
+        floating point in the one code path that exists to talk about money accurately.
+        """
+        return (
+            f"This business has spent ${format_usd(self.spent_usd)} of its "
+            f"${format_usd(self.cap_usd)} ceiling for the last {self.window_days} days"
+        )
+
+
+async def monthly_cap_state(
+    business_id: UUID,
+    *,
+    spend: SpendReader | None = None,
+    cap_usd: Decimal | None = None,
+    window_days: int = MONTHLY_CAP_WINDOW_DAYS,
+) -> MonthlyCapState:
+    """Read the ledger and the ceiling, and report where this business stands.
+
+    **Every path that can begin a run calls this before anything that can reach a
+    provider**, and that ordering is the whole control: `llm/router.py` — "checking spend
+    after the tokens are gone is accounting, not control". The per-run guard applies that
+    to one call; this applies it to a whole run, which is the level
+    `docs/ARCHITECTURE.md` section 7.4 states the ceiling at.
+
+    `spend` is a seam so the guard is testable without a Postgres — a refusal that could
+    only be asserted by seeding a ledger is a test nobody runs often enough to be worth
+    having. `cap_usd` defaults to the configured ceiling, read HERE rather than at each
+    caller so two entry points cannot enforce two different numbers.
+    """
+    reader = spend if spend is not None else monthly_spend_usd
+    ceiling = cap_usd if cap_usd is not None else get_settings().business_monthly_cap_usd
+    return MonthlyCapState(
+        spent_usd=await reader(business_id),
+        cap_usd=ceiling,
+        window_days=window_days,
+    )
+
+
+def over_monthly_cap(spent_usd: Decimal, cap_usd: Decimal) -> bool:
+    """Whether ``spent_usd`` has used up the ceiling.
+
+    **Exactly AT the ceiling counts as over.** Three reasons, all pointing the same way:
+    ``BudgetState.can_afford`` already works this way for the per-run cap (an estimate
+    only fits while ``remaining_usd`` is still positive, so a run with zero remaining
+    affords nothing) and two cap levels that disagree at their boundary is a bug waiting
+    to be reported; :attr:`RunSpend.at_cap` reports ``>=`` too, so a business the
+    dashboard shows at its cap would otherwise still be started; and the next run's first
+    call is a call whose cost is not yet known -- a ceiling you may begin a run at is a
+    ceiling that gets crossed by definition. The run budget errs towards refusing a call
+    it could have afforded, and this errs the same way one level up.
+
+    Pure, so the boundary is settled in one place rather than at each call site.
+    """
+    return spent_usd >= cap_usd
+
+
 __all__ = [
     "BREAKDOWN_LIMIT",
     "DEFAULT_WINDOW_DAYS",
     "MAX_WINDOW_DAYS",
+    "MONTHLY_CAP_WINDOW_DAYS",
     "CostReport",
     "DailySpend",
+    "MonthlyCapState",
     "RunSpend",
+    "SpendReader",
     "SpendRow",
     "cost_report",
+    "monthly_cap_state",
+    "monthly_spend_usd",
+    "over_monthly_cap",
 ]

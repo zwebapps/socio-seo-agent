@@ -196,36 +196,24 @@ def node_failure(state: AgentState, node: str) -> str | None:
     return None
 
 
-def _quality_reason(
-    *,
-    report: Mapping[str, Any],
-    landing: Mapping[str, Any],
-    loops: int,
-    weak_draft: bool,
-    weak_landing: bool,
-) -> str:
-    """Why a run ran out of retries, naming each artifact that is still short.
+def _quality_reason(*, report: Mapping[str, Any], loops: int) -> str:
+    """Why a run ran out of retries.
 
-    Two artifacts can fail independently now, so one sentence about "the draft"
-    would be wrong half the time -- and this string is what the owner reads to
-    decide what to edit.
+    One artifact again. It briefly named two, because a landing page could fail its
+    conversion audit independently of the draft's SEO score — and the founder's ruling
+    that we host no page removed the second artifact along with the audit. The sentence
+    is back to the shape it had before, and this is what the owner reads to decide what
+    to edit.
     """
-    parts: list[str] = []
-    if weak_draft:
-        parts.append(f"the draft scored {report.get('score')} of 100")
-    if weak_landing:
-        parts.append(f"the landing page scored {landing.get('score')} of 100")
-    subject = "they are" if len(parts) > 1 else "it is"
     return (
-        f"After {loops} revisions "
-        + " and ".join(parts)
-        + f", and still needs human edit. Returned with its findings, so {subject} "
-        "editable rather than lost. Nothing was blocked from publication."
+        f"After {loops} revisions the draft scored {report.get('score')} of 100, "
+        "and still needs human edit. Returned with its findings, so it is editable "
+        "rather than lost. Nothing was blocked from publication."
     )
 
 
-def verdicts(state: AgentState) -> tuple[bool, bool, bool]:
-    """VALIDATE's three verdicts as ``(blocked, weak_draft, weak_landing)``.
+def verdicts(state: AgentState) -> tuple[bool, bool]:
+    """VALIDATE's two verdicts as ``(blocked, weak_draft)``.
 
     Pure, and shared by both drivers, because "is this run publication-blocked" is
     exactly the kind of question that must not have two implementations -- this repo
@@ -233,22 +221,22 @@ def verdicts(state: AgentState) -> tuple[bool, bool, bool]:
     one decides whether content a human could approve reaches the approval screen.
 
     A regulated claim is a HARD gate, not a score. It routes back to GENERATE like a
-    failing score does, but when the retries run out the outcomes differ: a weak page
-    is returned for a human to edit, while a page making a forbidden claim must not
+    failing score does, but when the retries run out the outcomes differ: a weak draft
+    is returned for a human to edit, while a draft making a forbidden claim must not
     reach REVIEW at all, because REVIEW is where a human can approve it and EXPORT
     publishes what was approved.
 
-    An ABSENT landing report is not a failure: a run whose CONVERT node produced
-    nothing has already recorded that as an error, and there is no verdict to gate on.
+    It returned three verdicts while a landing page could fail its conversion audit
+    independently. That audit went with the page (`CLAUDE.md`, 2026-08-21), so the
+    third is gone rather than left returning a constant — a tuple element nobody can
+    ever set is a branch that looks live and is not.
     """
     report = state.get("seo_report") or {}
     claims = state.get("claim_check") or {}
-    landing = state.get("landing_report") or {}
 
     blocked = bool(claims) and claims.get("passed") is False
-    weak_landing = bool(landing) and landing.get("passed") is False
     weak_draft = blocked or not report.get("passed", False)
-    return blocked, weak_draft, weak_landing
+    return blocked, weak_draft
 
 
 def opportunity_exit(state: AgentState) -> dict[str, Any] | None:
@@ -306,8 +294,6 @@ def validate_exit(state: AgentState, *, blocked: bool) -> dict[str, Any]:
     """The terminal updates for a run that has run out of revisions."""
     report = state.get("seo_report") or {}
     claims = state.get("claim_check") or {}
-    landing = state.get("landing_report") or {}
-    _, weak_draft, weak_landing = verdicts(state)
 
     if blocked:
         found = ", ".join(sorted({str(hit.get("claim")) for hit in claims.get("hits", [])}))
@@ -323,13 +309,7 @@ def validate_exit(state: AgentState, *, blocked: bool) -> dict[str, Any]:
 
     return {
         "outcome": "partial",
-        "finished_reason": _quality_reason(
-            report=report,
-            landing=landing,
-            loops=state["validate_loops"],
-            weak_draft=weak_draft,
-            weak_landing=weak_landing,
-        ),
+        "finished_reason": _quality_reason(report=report, loops=state["validate_loops"]),
     }
 
 
@@ -381,8 +361,8 @@ async def run_graph(
                     )
 
             if name == "VALIDATE":
-                blocked, weak_draft, weak_landing = verdicts(state)
-                if weak_draft or weak_landing:
+                blocked, weak_draft = verdicts(state)
+                if weak_draft:
                     try:
                         state = enter_validate_loop(state)
                     except CapExceededError:
@@ -395,7 +375,11 @@ async def run_graph(
                     # The shortest edge that can fix what failed. See the module
                     # docstring: a landing page that failed on its own does not need
                     # the article rewritten, and GENERATE is the strong-tier node.
-                    index = ORDER.index("GENERATE" if weak_draft else "CONVERT")
+                    # Always GENERATE. It used to branch: a landing page that failed
+                    # its own audit needed only CONVERT re-run, because the draft was
+                    # fine. That artifact is gone, so a single destination is the honest
+                    # shape rather than a condition that can only take one value.
+                    index = ORDER.index("GENERATE")
                     continue
 
             if name == "REVIEW":

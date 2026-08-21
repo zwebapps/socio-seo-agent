@@ -108,7 +108,7 @@ __all__ = [
     "Draft",
     "ExportChannel",
     "ExportCta",
-    "ExportLandingPage",
+    "ExportDistribution",
     "ExportPack",
     "ExportProofPoint",
     "Opportunity",
@@ -190,7 +190,7 @@ _NO_RETRIEVAL: Final = (
 )
 
 _NO_LANDING: Final = (
-    "No landing page was written, so there is nothing for a click to land on. The page, "
+    "No destination was chosen, so the posts in this pack carry no link. The plan, "
     "its offer and its per-channel asks come from the CONVERT node, which has not "
     "completed for this run."
 )
@@ -205,7 +205,7 @@ _NO_LANDING: Final = (
 #: only when a run genuinely published nothing. A sentence naming the missing node would
 #: have gone stale on the day it landed.
 _NO_TRACKED_LINK: Final = (
-    "No tracked short link is in this pack. A short link is minted when a landing page is "
+    "No tracked short link is in this pack. A short link is minted when a run is "
     "published to a public address, and that has not happened for this run — so put your "
     "own destination address in the posts that can carry one, and use the bio-link hub for "
     "the channels that cannot."
@@ -1063,15 +1063,16 @@ class ExportCta(_Wire):
     text: str
 
 
-class ExportLandingPage(_Wire):
-    """The page a click is supposed to land on, as CONVERT wrote it."""
+class ExportDistribution(_Wire):
+    """Where the clicks are meant to land, as CONVERT chose it.
 
-    headline: str
-    subhead: str | None
-    offer: str
-    primary_cta: str
-    consent_text: str | None
-    proof_points: tuple[ExportProofPoint, ...]
+    It replaced `ExportLandingPage` when the founder ruled that we host no page
+    (`CLAUDE.md`, 2026-08-21): there is no headline, offer, form or consent line to
+    export, because there is no page — only the address on the business's OWN site and
+    the ask that earns the click.
+    """
+
+    destination_url: str
     channel_ctas: tuple[ExportCta, ...]
 
 
@@ -1105,8 +1106,8 @@ class ExportPack(_Wire):
     notice: str
     channels: tuple[ExportChannel, ...]
     channels_note: str | None
-    landing_page: ExportLandingPage | None
-    landing_page_note: str | None
+    distribution: ExportDistribution | None
+    distribution_note: str | None
     ai_blocks: AiBlocks | None
     ai_blocks_note: str | None
     #: The bio-link hub for this business. Real and permanent (``GET /go/{id}``), which is
@@ -1245,38 +1246,23 @@ def _export_channels(checkpoint: Mapping[str, Any]) -> tuple[ExportChannel, ...]
     return tuple(out)
 
 
-def _landing_page(checkpoint: Mapping[str, Any]) -> ExportLandingPage | None:
-    """The landing page CONVERT stored, read defensively.
+def _distribution(checkpoint: Mapping[str, Any]) -> ExportDistribution | None:
+    """What CONVERT chose, read defensively.
 
-    Not ``LandingPageSpec.model_validate``: a checkpoint written by an earlier version of
-    the state, or half-written by a run that died, would raise — and a pack that 500s is
-    a pack nobody can export. A page with no headline and no offer is treated as absent
-    rather than reported as an empty page.
+    Never `model_validate`: a checkpoint written by an earlier version of the state, or
+    half-written by a run that died, would raise — and a pack that 500s is a pack nobody
+    can export. A plan with no destination is treated as absent rather than reported as
+    an empty one.
     """
-    raw = _mapping(checkpoint.get("landing_page"))
-    headline = _text(raw.get("headline")).strip()
-    offer = _text(raw.get("offer")).strip()
-    if not headline and not offer:
+    raw = _mapping(checkpoint.get("distribution"))
+    destination = _text(raw.get("destination_url")).strip()
+    if not destination:
         return None
 
-    proof: list[ExportProofPoint] = []
-    points = raw.get("proof_points")
-    if isinstance(points, Sequence) and not isinstance(points, str | bytes):
-        for item in points:
-            entry = _mapping(item)
-            text = _optional_text(entry.get("text"))
-            source = _optional_text(entry.get("source"))
-            # Both or neither. A proof point whose source did not survive the round trip
-            # is an unsourced claim about the customer's business, and this module will
-            # not put one in a file they are about to paste under their own name.
-            if text is None or source is None:
-                continue
-            proof.append(ExportProofPoint(text=text, source=source))
-
     ctas: list[ExportCta] = []
-    stored_ctas = raw.get("ctas")
-    if isinstance(stored_ctas, Sequence) and not isinstance(stored_ctas, str | bytes):
-        for item in stored_ctas:
+    stored = raw.get("ctas")
+    if isinstance(stored, Sequence) and not isinstance(stored, str | bytes):
+        for item in stored:
             entry = _mapping(item)
             channel = _optional_text(entry.get("channel"))
             text = _optional_text(entry.get("text"))
@@ -1284,15 +1270,7 @@ def _landing_page(checkpoint: Mapping[str, Any]) -> ExportLandingPage | None:
                 continue
             ctas.append(ExportCta(channel=channel, text=text))
 
-    return ExportLandingPage(
-        headline=headline,
-        subhead=_optional_text(raw.get("subhead")),
-        offer=offer,
-        primary_cta=_text(raw.get("primary_cta")).strip(),
-        consent_text=_optional_text(raw.get("consent_text")),
-        proof_points=tuple(proof),
-        channel_ctas=tuple(ctas),
-    )
+    return ExportDistribution(destination_url=destination, channel_ctas=tuple(ctas))
 
 
 def _published_addresses(
@@ -1378,8 +1356,8 @@ def project_export_pack(
             notice=_NOTHING_PUBLISHED,
             channels=(),
             channels_note=_NO_CHECKPOINT,
-            landing_page=None,
-            landing_page_note=_NO_CHECKPOINT,
+            distribution=None,
+            distribution_note=_NO_CHECKPOINT,
             ai_blocks=None,
             ai_blocks_note=_NO_CHECKPOINT,
             hub_url=hub_url,
@@ -1392,17 +1370,17 @@ def project_export_pack(
         )
 
     channels = _export_channels(checkpoint)
-    landing = _landing_page(checkpoint)
+    distribution = _distribution(checkpoint)
     ai_blocks, ai_note = _ai_blocks(checkpoint)
     page_url, tracked = _published_addresses(checkpoint)
 
     return ExportPack(
-        has_pack=bool(channels or landing or (ai_blocks and ai_blocks.blocks)),
+        has_pack=bool(channels or distribution or (ai_blocks and ai_blocks.blocks)),
         notice=_NOTHING_PUBLISHED,
         channels=channels,
         channels_note=None if channels else _NO_SOCIAL,
-        landing_page=landing,
-        landing_page_note=None if landing else _NO_LANDING,
+        distribution=distribution,
+        distribution_note=None if distribution else _NO_LANDING,
         ai_blocks=ai_blocks,
         ai_blocks_note=ai_note,
         hub_url=hub_url,
@@ -1490,25 +1468,17 @@ def render_export_markdown(pack: ExportPack) -> str:
     else:
         lines += [pack.channels_note or "No channel copy was rendered.", ""]
 
-    lines += ["## Landing page", ""]
-    page = pack.landing_page
-    if page is None:
-        lines += [pack.landing_page_note or "No landing page was written.", ""]
+    lines += ["## Where the clicks go", ""]
+    plan = pack.distribution
+    if plan is None:
+        lines += [pack.distribution_note or "No destination was chosen.", ""]
     else:
-        lines += [f"**{page.headline}**", ""]
-        if page.subhead:
-            lines += [page.subhead, ""]
-        lines += [f"Offer: {page.offer}", f"Button: {page.primary_cta}"]
-        if page.consent_text:
-            lines.append(f"Consent line: {page.consent_text}")
-        lines.append("")
-        if page.proof_points:
-            lines += ["Proof points, each with the source it came from:", ""]
-            lines += [f"- {p.text} — source: {p.source}" for p in page.proof_points]
-            lines.append("")
-        if page.channel_ctas:
+        # The destination is on the business's OWN site, so it is stated plainly rather
+        # than described: it is a URL the owner recognises and can check.
+        lines += [f"Destination: {plan.destination_url}", ""]
+        if plan.channel_ctas:
             lines += ["The ask, per channel:", ""]
-            lines += [f"- {cta.channel}: {cta.text}" for cta in page.channel_ctas]
+            lines += [f"- {cta.channel}: {cta.text}" for cta in plan.channel_ctas]
             lines.append("")
 
     lines += ["## Answer blocks for AI engines", ""]

@@ -7,8 +7,13 @@ Derived from [docs/BUILD_ORDER.md](docs/BUILD_ORDER.md), which holds the reasoni
 for the ordering. This file holds only the state. Where they disagree, BUILD_ORDER
 is the argument and this is the record.
 
-Legend: `[x]` done · `[ ]` open · `⛔` needs a human (money, secrets, irreversible
-infra, or legal copy — `/next` must stop and ask, never proceed)
+Legend: `[x]` done · `[ ]` open · `[~]` superseded, do NOT build (the decision that
+retired it is named in the entry, and its original text is kept so the reasoning is not
+lost) · `⛔` needs a human (money, secrets, irreversible infra, or legal copy — `/next`
+must stop and ask, never proceed)
+
+`[~]` is deliberately not `[x]`: ticking a task nobody did would make this file lie about
+what was built, and leaving it `[ ]` would make `/next` pick up work the founder cancelled.
 
 ---
 
@@ -576,7 +581,8 @@ infra, or legal copy — `/next` must stop and ask, never proceed)
   `documentTone` alone turns 3 of 19 red. Note for whoever folds them — `statusTone` has
   no caller outside `documentTone` and the test file today, so the "real case" it is kept
   for is still hypothetical
-- [ ] **The Docker `images` CI job is unverified against the new frontend test files.**
+- [x] **The Docker `images` CI job is unverified against the new frontend test files.**
+  → verified 2026-08-21 in CI (green on `main`); see the §B entry.
   `docker build -f frontend/Dockerfile` ran past 15 minutes locally and was killed. Local
   `pnpm build` exercises the same compile-and-typecheck path with the test files present
   and `--frozen-lockfile` is verified, so the risk is low — but low is not verified, and CI
@@ -626,20 +632,24 @@ repo-wide grep for `oauth|access_token|graph.facebook|linkedin.com/v2` returned 
   Resend's documented error envelope and exercised through `MockTransport`; what a key
   would prove is the actual status codes, that a 200 always carries `id`, and that
   `List-Unsubscribe` survives delivery.
-- [ ] **No connect/callback/disconnect API routes** for platform connections. The store,
+- [x] **No connect/callback/disconnect API routes** for platform connections. The store,
   the cipher and the OAuth seam are done and tested; nothing exposes them, so a business
   cannot connect an account even to the fake provider. **→ superseded by A3 in the finish
   plan below; work that entry, not this line.**
-- [ ] **`nodes._notify_owner` builds a `notify.email` the email actuator refuses** — no
+- [x] **`nodes._notify_owner` builds a `notify.email` the email actuator refuses** — no
   sender, no body, no unsubscribe, no consent basis. Either that node supplies them or
   owner notifications get their own action type with transactional rules. Widening
   `CONSENT_BASES` to make it pass would throw away the point of the check. **→ superseded by
   A4 + A4b below, which settle the ruling and name two further defects.**
-- [ ] **`publish.page` is simulated even though the page is served by this app.**
+- [x] **`publish.page` is simulated even though the page is served by this app.**
   `publish_landing_page` exists with no caller, so "publishing" a landing page is a status
   change nobody makes. This is the cheapest real publish left and it needs no credential.
-  **→ superseded by A1a + A1b below. The audit found it is much more than "the cheapest
+  **→ closed by A1a + A1b below. The audit found it is much more than "the cheapest
   publish left": it is the reason the lead chain is unreachable from a run at all.**
+  **Overtaken a second time, 2026-08-21 (`69a18f9`):** the founder ruled we host no page, so
+  `PAGE_PUBLISH_ACTION` is no longer in `EXPORT_ACTIONS` and a run publishes no page at all.
+  The actuator and `GET /p/{piece_id}` stay for pieces already published — real rows exist —
+  so this line is closed by both halves: it was built, and then it left the run.
 - [ ] **MEASURE reports the attribution PATH, not lead counts.** Real counts need a
   lead-store read, which is outside its documented grants (`geo.probe`,
   `analytics.fetch`), so it states `leads_measured: false` with the reason. **→ superseded by
@@ -648,7 +658,7 @@ repo-wide grep for `oauth|access_token|graph.facebook|linkedin.com/v2` returned 
   implemented; it needs a cross-run ledger read the node cannot make hermetically today.
   **→ superseded by A6 below. That stated reason is STALE: `NodeDeps.actuator_store` is
   already the injected-store pattern this needs.**
-- [ ] ⛔ **The Docker `images` CI job is still unverified** against the new frontend test
+- [x] ⛔ **The Docker `images` CI job is still unverified** against the new frontend test
   files — the local build ran past 15 minutes twice and was killed. **→ reclassified ⛔ in
   §B below: verifying it needs a push, which is outward-facing.**
 
@@ -668,6 +678,159 @@ was checked against the code, not against its commit message.
 
 Dependencies are stated. Do not reorder A1 below A4/A5: both of those count things that
 A1 is the first code to create.
+
+### N · Found by the 2026-08-21 audit, after the autonomous-operation work landed
+
+Twenty-seven commits landed on `feat/autonomous-operation-seo-audit` without this file
+being touched, so these were found by reading the tree rather than by planning it. Audit
+basis, re-measured 2026-08-21: backend **2988 tests green** (`pytest -q`, exit 0, real
+Postgres on :5435), frontend **259 tests green** (17 files), `ruff` clean, `mypy --strict`
+clean on 278 files, `tsc --noEmit` clean. Topmost first, and N1 is first because it is the
+one an owner can see.
+
+- [x] **N1 · Automation can be RUN but not TURNED ON — nothing writes `automation_settings`**
+  — the exact inverse of the bug the scheduler commit (`e410d9c`) set out to fix, and the same
+  shape: a capability that is complete on one side of the wire and unreachable from the other.
+  The worker reads `automation_settings` (cadence, `channels`, `goal_template`, `next_run_at`),
+  claims a slot conditionally, starts the run and advances the cadence — all tested. But
+  `grep -rn automation backend/app/api/` is EMPTY, and so is the frontend: there is no route
+  and no screen, so a row can only come into existence by hand in SQL. So the honest current
+  claim is "the scheduler executes automations", NOT "a business can automate its marketing" —
+  and `CRITERIA_MAP.md`'s autonomy row must not say the second while this is open.
+  **done = an owner reads and writes their own automation from the UI (on/off, cadence,
+  channels, goal), the row is tenant-scoped by RLS like every other write, `next_run_at` is
+  computed by `automation_service.compute_next_run` and never by the route (one authority for
+  the arithmetic, so the screen and the worker cannot disagree), turning it OFF stops the
+  worker picking it up, and the screen states when the next run is due rather than implying
+  it already happened.**
+  **CLOSED, both halves.**
+  - **Backend** — `GET`/`PUT /api/v1/automation` (`api/automation.py`) over
+    `services/automation_settings_service.py`, business derived from the session, PUT a full
+    replacement, `nextRunAt` computed on every save and read-only on the wire, off clears the
+    slot as well as the mode, an explicit enable clears a system pause, and the channel rule is
+    now literally the same function `POST /runs` validates against
+    (`specs.canonicalise_known`). 20 tests on real SQL asserting through `due_automations()`
+    itself + 19 hermetic route tests; verified by hand against the dev database.
+  - **Screen** — `frontend/app/automation/page.tsx` + `lib/automation-api.ts`, in the sidebar
+    under Work. The form's whole vocabulary (channels, cadences, goal length, poll interval) is
+    read off the response rather than restated, so a picker cannot offer what the API refuses;
+    `nextRunAt` is rendered and never recomputed from the cadence, which is the reason the API
+    returns it at all; `pausedReason` is rendered verbatim, because the platform's own sentence
+    (with the budget figures in it) beats any summary of it.
+  - **One thing found while building the screen and worth keeping: `isOverdue`.** The worker
+    advances `next_run_at` BEFORE starting a run, so a due timestamp still sitting in the past
+    five poll intervals later means nothing is claiming it — in practice `make worker` is not
+    running. So the panel says "overdue, and here is why" instead of confidently printing a next
+    run that no process will honour. Grace derived from the server's own reported interval, and
+    suppressed while paused (the pause is already the explanation). 20 unit tests on the derived
+    answers, including that a stale timestamp on a PAUSED automation is not reported as overdue.
+  - Honest note on verification: the route was driven end to end against the dev database with a
+    real session, the pure client logic is unit-tested, and the page was loaded in a browser —
+    where it renders and correctly shows the signed-out refusal. The **signed-in** rendering was
+    not verified by me: doing so needs a password entered into the login form, which is not mine
+    to type.
+
+- [x] **N2 · A SCHEDULED run is not subject to the monthly USD cap** — found while verifying
+  A7, and it is a money hole rather than a tidy-up. `_require_monthly_headroom` lives in
+  `api/runs.py` and guards the two HTTP routes; the scheduler calls `RunService.start` +
+  `submit(...)` directly (`worker/scheduler._start_run`), so an automation on a weekly cadence
+  spends past the ceiling that a human pressing the same button is refused for. The cap being
+  in the API module was correct when the API was the only way a run could begin; a second
+  caller makes that placement the bug. Note this is the same lesson as `publish.page` going
+  through `actuate()` and never around it: a guarantee belongs where every caller must pass,
+  not where the first caller happened to be.
+  **done = the ceiling is enforced in ONE place both callers reach (the executor or a service
+  the executor calls), before any provider call; a scheduled run over the ceiling does not
+  start and says why in the run's own record rather than only in a log; the API's 409 body is
+  unchanged; a test starts a scheduled run for an over-cap business and asserts no provider
+  call was made.**
+  **CLOSED, with ONE deliberate deviation from that criterion, recorded rather than quietly
+  taken.** `cost_service.monthly_cap_state` is now the single decision — the ledger read, the
+  configured ceiling (read there, so two entry points cannot enforce two different numbers),
+  and one `sentence` stating both figures. Every entry point asks it: `POST /runs` and
+  `/runs/{id}/resume` refuse 409 with the body **byte-identical** to before (the sentence stops
+  before the consequence and each caller appends its own), and the scheduler asks BEFORE
+  claiming the slot. `approve` stays exempt for the reason already documented at its call site.
+  - **The deviation: a scheduled refusal is recorded on the AUTOMATION, not "in the run's own
+    record".** Writing it to a run means creating one — and `api/runs.py` already argues, at
+    length, that a `partial` row with no events appears in the runs list, in the dashboard's
+    run count and in the timeline as work it never did. So the refusal is written to
+    `automation_settings.paused_reason`, which is the column whose model docstring already
+    names "budget exhausted" as its example, and which the owner sees on their own screen. The
+    original wording was written before that column was in view; this is the better answer and
+    the criterion was wrong, not the code.
+  - **The guard is not enforced by review.** `tests/test_run_start_guard.py` walks the AST of
+    every module under `backend/app` and fails the build if one hands a run to the executor
+    without referencing `monthly_cap_state` — module level, not per call site, because a
+    per-function exemption list for `approve` would make the test a rubber stamp. It carries a
+    second assertion pinning the set of run-starting modules, so it cannot start passing
+    vacuously when `submit` is renamed or a route file is split. Verified by deleting the guard:
+    three scheduler tests and this one go red, which is exactly the shipped bug reproduced.
+  - Also: `BUSINESS_MONTHLY_CAP_USD=0` is documented as stopping all model spend for every
+    business, and now actually does — it has to stop the spend nobody is watching as well as
+    the spend somebody just clicked. `ARCHITECTURE.md` §7.4 rewritten to describe this, and to
+    stop stating the weekly published-pieces cap as fact (A6 is still open).
+
+- [ ] **N3 · The connection-expiry sweep has no caller** — see A3-ii, sharpened rather than
+  duplicated: the function is written and tested, and the scheduler is now the obvious home.
+
+- [x] **N5 · The `Web — types, tests, build` CI job had NEVER passed, and it failed in a way
+  that reported failure without running anything** — found 2026-08-21 by pushing. Every run on
+  `main` since 2026-08-20 is red, and the same three steps are red every time: `pnpm/action-setup@v4`
+  fails in six seconds and `setup-node`, `pnpm install`, `typecheck`, `test` and `build` are all
+  SKIPPED. So the frontend's type check, its 279 tests and its production build have never once
+  been verified by CI — they were only ever green on a laptop. Cause: the job sets
+  `defaults.run.working-directory: frontend`, which applies to `run` steps only; an ACTION does
+  not see it, so the setup looked for `packageManager` in a root `package.json` this repo does
+  not have (the web app lives in `frontend/` — see the README's "Why anything is at the repo
+  root"). The workflow's own comment asserted it "reads `packageManager` from
+  frontend/package.json", which is now true rather than merely intended: `with:
+  package_json_file: frontend/package.json`. **Worth naming as a pattern, because this is the
+  third instance in this file** — CI was green on work nobody ran (P1: `ENVIRONMENT: ci` with no
+  `SESSION_SECRET` meant pytest never collected), and a 64-character constraint name had
+  disabled `alembic check` entirely. A gate that cannot fail is worse than no gate, because it
+  is *reported* as a gate.
+
+- [x] **N4 · Three documents describe the frontend as it was yesterday** — a fresh drift, not a
+  reopening of A8-i (which correctly closed for the tree that existed when it was written).
+  `30a57b2` moved the owner's home to `/dashboard` and put a marketing front page at `/`, and
+  `09cf3c3` / `c21ebfa` added `content/`, `business/` and the post calendar. So:
+  `ARCHITECTURE.md` §10's route block still calls `page.tsx` "owner's home" and omits
+  `dashboard/`, `business/` and `content/` — while asserting in its own prose that `ls
+  frontend/app` turns up nothing that is not in it, which makes the omission a falsifiable
+  claim rather than a stale line; `CRITERIA_MAP.md` §1's route list has the same three gaps;
+  and `README.md`'s quickstart names only `make api` and `make web`, so a reader who follows
+  it runs no scheduler and sees automation do nothing — the very failure `e410d9c` fixed.
+  **done = §10's block, §1's list and the README's quickstart match `ls frontend/app` and the
+  Makefile; the README says a third process exists and what breaks without it.**
+  **CLOSED.** §10's block and §1's list now match `ls frontend/app` exactly (five screens were
+  missing: `dashboard/`, `automation/`, `content/`, `business/`, and `page.tsx` was described as
+  the owner's home); §10 gained a paragraph on why `/` is public and `/dashboard` is the home;
+  §1's interactions row gained scheduling and the calendar; the README's quickstart names
+  `make worker` as terminal 3 and says plainly what silently does not happen without it, and its
+  journey now walks `/dashboard` → `/content` → `/automation`.
+  - **And it is now a TEST, because this drifted twice in two days.**
+    `backend/tests/test_docs_frontend_tree.py` parses §10's ASCII block and fails the build on
+    any entry in `ls frontend/app` that is missing from it (or documented and absent), and
+    checks that `CRITERIA_MAP.md` §1 names every screen — matched on the backticked path token,
+    so the row stays free to write `developer/{models,runtime,tools,cost}` the way a person
+    would. A third assertion pins the premise that `components/`, `lib/`, `globals.css` and
+    `layout.tsx` are not screens, so the exemption cannot rot into a hidden hole if one of them
+    ever gains a `page.tsx`. Verified by deleting a row from the block: red. It cannot check
+    that a DESCRIPTION is accurate — no test can — only that the enumeration is complete.
+  - **Three further claim defects found while doing it, all fixed here rather than filed:**
+    (1) `asgi.py` documented itself as "the ONLY place that touches the environment" while
+    `worker/__main__.py` also loads `.env` — both docstrings now state the rule as *every process
+    entry point loads it, nothing below one does*, and the README's layout block agreed with the
+    stale version. (2) The README's layout block had no `worker/` at all. (3) **Bigger, and the
+    reason this entry grew: `ARCHITECTURE.md` §12 and `DIAGRAMS.md` §12 both draw a deployment
+    that does not exist** — `worker-content` / `worker-harvest` pools pulling jobs from Redis.
+    There is no job queue: a graph run executes in the API process and the scheduler scans
+    `next_run_at`. Both are now labelled PLANNED with a "what ships today" note carrying the
+    reason (ARQ is uninstallable against this project's `redis` pin, and the database is already
+    an adequate queue for a weekly cadence). Left as annotation rather than a rewrite: the target
+    topology is still the target, and `CRITERIA_MAP.md` §7 asks that a claim be true, not that an
+    intention be deleted.
 
 - [x] **A1a · A real `publish.page` actuator, so a run actually creates the landing page**
   — `c3a5dab`. `backend/app/actuators/landing.py`, wired in `run_executor`. `fake` is
@@ -704,7 +867,14 @@ A1 is the first code to create.
   `replayed`. `Outcome.fake` is False on this action while `social.post` stays True in the
   same run, so the Delivery tab tells the two apart.**
 
-- [ ] **A1a-i · Nothing attributes a published page to the run that made it** — found by
+- [~] **A1a-i · SUPERSEDED 2026-08-21 (FOUNDER) — there is no published page to attribute.**
+  `CONVERT` now picks a destination on the business's own site and `PAGE_PUBLISH_ACTION` has
+  left `EXPORT_ACTIONS` (`69a18f9`), so no run creates a `content_pieces` row and the null
+  join column this described cannot occur for a new run. **The underlying gap is real and
+  narrower than this entry: `AgentState` still has no run-id key, so every `actions` row a run
+  writes loses its link to the run.** That half is now carried by A5 (which wants the join) and
+  by N2 below (which needs the executor to be the place a cap is enforced). Original text, kept
+  because the `AgentState` analysis is still accurate: — found by
   A1a and deliberately NOT folded into it. `AgentState` has no run-id key at all, so
   `nodes._actuate` builds every `Actuation` without `run_id`, and therefore every page a run
   publishes lands with `content_pieces.run_id = NULL` and every `actions` row loses its link
@@ -876,7 +1046,17 @@ A1 is the first code to create.
   cap; a business under it publishes; the count is per business (a test proves A's
   publishes do not consume B's allowance); and a `refused` row lands in `actions`.**
 
-- [ ] **A7 · The per-business monthly USD cap** — not previously listed. `ARCHITECTURE.md`
+- [x] **A7 · The per-business monthly USD cap** — DONE, verified 2026-08-21 against the code
+  rather than a commit message. `core/config.py:DEFAULT_BUSINESS_MONTHLY_CAP_USD` ($25, and
+  `BUSINESS_MONTHLY_CAP_USD=0` is the kill switch), `cost_service.monthly_spend_usd` +
+  `over_monthly_cap`, enforced by `api/runs._require_monthly_headroom` on BOTH the start and
+  the resume route, before anything that could reach a provider, refusing 409
+  `monthly_cap_exceeded` with the spend and the ceiling both stated as strings (a `Decimal` in
+  an exception `detail` would leave as a JSON float, in the one path that exists to talk about
+  money accurately). Tested in `tests/api/test_runs_api.py`.
+  **Residual, and it is a MONEY hole rather than a tidy-up: the guard lives in the API module,
+  so the scheduler — which starts runs through `RunService.start` directly — does not run it.**
+  See N2 below. Original text: — not previously listed. `ARCHITECTURE.md`
   §7.4 states three cap levels as fact; only the **per-run** one exists (`llm/contract.py:BudgetState`
   is documented "remaining spend for a run"). `services/cost_service.cost_report(business_id,
   window_days=...)` already computes windowed spend, so the read exists.
@@ -965,7 +1145,15 @@ A1 is the first code to create.
   **done = the SERVICE decides what an unreadable credential means for revocation, so every
   caller gets it right rather than each one catching separately; the route's workaround folds
   into it.**
-- [ ] **A3-ii · Nothing writes `expired` to a platform connection** — `refresh_connection` and
+- [ ] **A3-ii · Nothing writes `expired` to a platform connection** — NARROWED 2026-08-21: the
+  sweep asked for here has since been WRITTEN. `connection_service.sweep_expired_connections`
+  exists with tests on real SQL (`tests/db/test_connection_sweep.py`,
+  `tests/services/test_connection_sweep.py`) — and has **no caller anywhere in `backend/app`**,
+  so it has never run. What is left is wiring, not design, and the place is now obvious: the
+  scheduler tick, beside `_sweep_stranded`, in the same one-tenant's-failure-costs-that-tenant
+  posture. **done = the worker sweeps stale connections every tick; a failure in the sweep
+  cannot stop the automations half of the same tick; a test asserts a stale connection is
+  `expired` after one tick.** Original text: `refresh_connection` and
   `mark_expired_if_stale` exist and are unexposed. No SCREEN is wrong (usability is derived by
   the pure `unusable_reason` on every read, which is why the settings view and the publish
   refusal cannot disagree), but a SQL-level report would disagree with the API. This wants a
@@ -981,7 +1169,11 @@ A1 is the first code to create.
   **done = a settings screen lists connections with their derived usability, starts a connect,
   and disconnects; the secret is never rendered beyond its mask.**
 
-- [ ] **A8-i · Two documents describe a frontend route tree that does not exist** — found by A8
+- [x] **A8-i · Two documents describe a frontend route tree that does not exist** — CLOSED for
+  the tree as it stood on 2026-08-20: `CRITERIA_MAP.md` §1 and `ARCHITECTURE.md` §10 both now
+  describe the flat tree and §10 says out loud that `ls frontend/app` should turn up nothing
+  that is not in its block. **Re-staled the next day by the autonomous-operation work — see N4
+  below, which is a fresh drift and not a reopening of this one.** Original text: — found by A8
   and correctly left alone as a third, separate claim rather than folded in. `CRITERIA_MAP.md`
   §1's "User interactions" row points at `frontend/app/(app)/`, and `ARCHITECTURE.md` §10's
   route tree describes `(marketing)/`, `(auth)/`,
@@ -1002,7 +1194,16 @@ A1 is the first code to create.
   `OAuthError` as the contract today. Worth doing only when a real provider client is written —
   which is itself gated on App Review, so this waits on §B.
 
-- [ ] **A3-vi · A connect flow cannot COMPLETE, and the screen is the thing that proves it**
+- [x] **A3-vi · A connect flow cannot COMPLETE, and the screen is the thing that proves it**
+  — OBSOLETE 2026-08-21, and by the first of the two exits it named rather than by the
+  test-only bypass it refused to choose: two real adapters now exist behind the seam —
+  `platform_oauth_meta` for `facebook`/`instagram` (`1bcc2ab`) and `platform_oauth_linkedin`
+  for `linkedin` (`604fe81`). `get_oauth_provider` selects by CREDENTIAL and by nothing else,
+  so a machine with no app configured still gets `FakeOAuthProvider` and still says so, while a
+  machine with `META_APP_ID`/`META_APP_SECRET` (or the LinkedIn pair) reaches a real
+  authorization URL a browser can complete. **Note what this does NOT unblock: publishing.**
+  Tier 1 direct publish is still gated on App Review in §B, so a connected account can be
+  connected and still not be posted to. Original text:
   — surfaced by A3-iv, which is why it is filed rather than hidden. `get_oauth_provider` returns
   `FakeOAuthProvider` for every platform and its authorization URL is
   `https://fake-oauth.invalid/…` — RFC 2606 reserved, so no browser can ever reach the callback
@@ -1016,7 +1217,12 @@ A1 is the first code to create.
   un-completable end to end by a human — which is worth saying out loud rather than leaving a
   reader to discover by clicking.
 
-- [ ] **A10 · THE HUMAN DECISION HAS NO BUTTON — a run can be reviewed and never published**
+- [x] **A10 · THE HUMAN DECISION HAS NO BUTTON — a run can be reviewed and never published**
+  — CLOSED by A10a (approve control), A10b (the ruling) and A10c (reject control + the
+  `rejected` terminal state): both defects this entry named are fixed, and a reviewer at the
+  gate can now say yes or no from the screen. Its follow-ons keep their own boxes and are NOT
+  covered by this tick: A10d and A10d-i are superseded (there is no draft page to persist),
+  while A10d-ii and A10e remain genuinely open. Original text:
   (founder-reported 2026-08-20, verified same day; this is ahead of A4–A7 in value because it is
   the step the whole product is built around). The founder described the intended flow — onboard →
   analyse → generate → "bring to publish dashboard so the user can read and publish or reject" —
@@ -1064,9 +1270,12 @@ A1 is the first code to create.
     rejection is recorded on the run itself — `state` + `finished_reason` — and that is the whole
     record. *Filed, and deliberately NOT part of A10b's done:* the day a run persists its draft as
     a `content_pieces` row, a REVIEW rejection can carry piece-level feedback into `distil` and the
-    loop `DIAGRAMS.md` §4 describes closes for real. That wants its own item; today it would be a
-    fabrication, and `distil`'s theme table is style-specific while a gate rejection can be about
-    anything.
+    loop `DIAGRAMS.md` §4 describes closes for real. That wants its own item — **it is A10d below,
+    ruled and specced 2026-08-20 on the founder's decision to build it** — and the ordering was the
+    point: inside A10b it would have been a fabrication. The caveat survives into A10d rather than
+    being answered by it: `distil`'s theme table is style-specific while a gate rejection can be
+    about anything, so the honest claim is that a gate rejection FEEDS distillation, not that it
+    reliably produces a rule.
   - **(3) A reason is REQUIRED** — `min_length=10`, `max_length=240`, measured after whitespace
     collapse, refused 422 before anything is written. Required because a reasonless rejection is
     the one input this product can do nothing with, and the reviewer is the only person who will
@@ -1168,6 +1377,192 @@ A1 is the first code to create.
   the review tabs stay MOUNTED so the refused draft is still readable — a rejected draft is
   evidence, and hiding it would withhold work the owner already paid for.**
 
+- [~] **A10d · SUPERSEDED 2026-08-21 (FOUNDER) — there is no draft landing page to persist.**
+  The whole task was scaffolding for a page the run created; with pages out of the run
+  (`69a18f9`) its six rulings answer questions that no longer arise. **What must NOT be lost
+  with it:** the thing A10d existed to enable — a rejection attaching to the piece it refused,
+  so `DIAGRAMS.md` §4's `rejected, reason feeds the feedback loop` is real — survives as
+  A10d-ii, whose subject is now the social renderings rather than a page. Original text:
+  **A rejection has something to ATTACH to: the draft landing page is persisted before
+  the gate, and EXPORT flips it instead of creating a second one** — RULED 2026-08-20 (architect)
+  on the founder's decision to build it; no longer a decision. This is the item A10b filed and
+  refused to do inside itself, and it REVERSES A10b's ruling (2) — conditionally, and only because
+  the condition A10b named is exactly what this task creates. Once a `content_pieces` row exists at
+  REVIEW, a rejection can carry piece-level feedback into `distil`, and `DIAGRAMS.md` §4's
+  `REVIEW --> [*]: rejected, reason feeds the feedback loop` stops being a drawing of something the
+  code cannot do. **What A10b forbade and what stays forbidden:** `feedback.content_piece_id` stays
+  NOT NULL, `feedback` gets no `run_id` column, and no `ContentPiece` is EVER created in order to
+  have something to reject. The inversion is the whole point — the piece is created because a
+  reviewer is about to review it, and the rejection attaches to it only if it happens to be there.
+  Six rulings, each answering a question the implementation cannot dodge.
+  - **(1) WHERE the draft is persisted: in `run_executor._execute`, at the park boundary — NOT a new
+    graph node, NOT inside CONVERT/REPACK, and NOT a new actuator.** Both drivers converge on
+    `GraphResult(interrupted=True)` and the executor's `if result.interrupted: await
+    service.await_approval(run_id)` is the ONE line they share, so persisting there holds in the
+    builtin driver and in LangGraph with **zero changes to `agents/`** — no `nodes/__init__.py`, no
+    `state.py`, no `graph.ORDER`, no driver. Ruled out, with reasons, so they are not re-proposed:
+    *a node* is a database write inside the graph, which is the objection that made A1a an actuator
+    in the first place and `tests/test_engine_boundary.py` is not the only reason it is wrong;
+    *CONVERT* is reachable twice (`VALIDATE --> CONVERT` on a landing-only failure), so persisting
+    there writes a piece per retry; *REPACK* is the last node before REVIEW and would work, but it
+    is a model-calling node and the write has nothing to do with repacking. *A new actuator with a
+    `publish.draft` action type* is the interesting near-miss and is REFUSED on two specific costs:
+    `actuate()` requires a non-empty `approved_by`, so a pre-gate write would have to carry
+    `"policy:…"` — putting a synthetic approver into a ledger whose `approved_by` exists to answer
+    "which human authorised this outward publish"; and it would land an `actions` row that reads as
+    a succeeded publish for something nobody can reach, on the Delivery tab whose entire job is
+    telling a real publish from a simulated one. The actuator layer buys idempotency, audit and
+    approval; this write needs the first, must not fake the third, and is actively harmed by the
+    second. So it is a service call from the composition root: `landing_service`, unchanged,
+    invoked at `status="draft"` — the mode its own docstring was written for ("approving the page
+    lights them up without touching them"). `RunService` is deliberately NOT the caller either: it
+    owns the `runs` table through a store abstraction, and handing it `content_pieces` widens it for
+    nothing.
+  - **The draft write is NON-FATAL and gated on the same audit as a publish.** It runs only when
+    `state["landing_page"]` is a mapping with a non-empty `headline` — the same guard `_publishable`
+    uses, so the two cannot disagree about whether there is a page — and `publish_landing_page`'s
+    `LandingPageNotPublishableError` is CAUGHT: a page that cannot capture a lead persists nothing
+    and the run still parks, exactly as `_resolve_owner_notice` already degrades. A run whose page
+    fails the audit therefore has no piece, and per ruling (4) its rejection carries no feedback.
+    That is the correct direction: no row, rather than a row for a page that could never be served.
+  - **(2) HOW EXPORT stops double-creating: `publish.page` LOOKS FOR the draft belonging to THIS
+    run and flips it; only when there is none does it create.** Precisely — the actuator stays thin
+    and the branch lives in `landing_service`, so it is testable with no database: a new
+    `promote_landing_draft(...) -> PublishedLandingPage | None` returns `None` when no draft exists
+    and the actuator falls through to today's `publish_landing_page`. What promotion does: re-run
+    `check_landing_page` FIRST (the refusal must not become bypassable by having pre-persisted — a
+    page that cannot convert must be refused whether or not a row exists for it), then
+    `mark_published(business_id, piece_id, url)` — a new store method rather than the existing
+    `set_status`, because it also stamps `published_at` and `published_url`, two columns that are
+    NULL on every row in the product today while `_LIST_HUB` orders by `cp.published_at DESC NULLS
+    LAST`, i.e. by nothing — then READ BACK that piece's existing `short_links` through a new
+    `links_for_piece(business_id, piece_id)` and return them as the `ctas`. **No link is minted at
+    promotion.** The `Outcome.detail` shape is unchanged (`content_piece_id`, `path`, `status`,
+    `score`, `ctas` with `channel/text/code/path/url`) so A1b's export pack keeps working, plus one
+    new key naming which branch ran, because "created" and "promoted a draft" are different facts
+    about this run even when they are the same fact about the world — the same distinction
+    `Outcome.replayed` already draws.
+  - **The lookup key is `content_pieces.run_id` via `actuation.run_id`, and NOTHING ELSE.** Not
+    "the most recent draft landing page for this business", which would flip a different run's
+    draft on a business with two parked runs — that is a wrong-page publish, not a near miss. Not a
+    piece id threaded through `AgentState`, which would be a SECOND run-attribution mechanism built
+    beside the one A1a-i is building, and would change the checkpoint shape twice. This is why A10d
+    is BLOCKED on A1a-i (ruling 6) and it is a hard dependency, not merge hygiene: until
+    `actuation.run_id` is populated the actuator cannot find the draft, so it would create a second
+    piece and a second link set — shipping the bug this ruling exists to prevent.
+  - **On a RESUME that retries EXPORT, nothing happens twice, and it is already guaranteed.**
+    `actuate()` claims the content-derived key before calling, so a second attempt with the same
+    spec is `replayed` and `perform` is never entered. What CHANGES is only what the key protects:
+    it used to mean "do not create a second page", it now means "do not flip twice" — and the flip
+    is idempotent anyway, so the two layers agree rather than depend on each other. Two adjacent
+    behaviours are pre-existing, verified, and deliberately NOT changed here: `claim` replays a
+    REFUSED row too, so a page refused by the audit cannot be retried under the same spec (it needs
+    an edited spec, which is a different effect — correct, if surprising); and a run that crashes
+    between the draft write and `await_approval` leaves an inert `draft` row nothing will promote,
+    which is residue rather than a defect, because a draft is unreachable by construction (ruling
+    4). **Re-parking is believed unreachable** — `arm_interrupt="REVIEW" not in state["visited"]`
+    means a run parks at most once — so the draft write is create-if-absent keyed on
+    `(run_id, surface='landing_page')` and, if a row already exists, it logs and creates nothing
+    rather than updating. That ordering is chosen so that if re-parking ever DOES become reachable
+    the failure is one stale draft, not duplicate pieces with duplicate link sets.
+  - **(3) A draft row is SAFE to exist, verified in code 2026-08-20 rather than assumed.**
+    `api/pages.py` `LIVE_STATUSES` and `api/leads.py` `LIVE_FORM_STATUSES` are both
+    `{"approved", "published"}`, so `GET /p/{id}` is the same 404 as a typo and the public form
+    POST is refused; `lead_store.HUB_VISIBLE_STATUSES` is the same pair, so a draft's CTAs are
+    never advertised on the link hub. `resolve_short_link` deliberately does NOT filter on status,
+    so a draft's `/l/{code}` DOES resolve and redirects to a 404 page — that is the honest
+    degradation and **must not be "fixed"**: the code is unguessable, unadvertised, and the
+    alternative is a redirect that lies. So a draft piece is visible to: nobody. Not the public,
+    not the hub, and not the owner either — there is no content-listing route and `review_service`
+    projects the review tabs from `runs.checkpoint`, so **the piece is an ANCHOR, not a new
+    surface.** Do NOT wire the export pack or the review tabs to it; the A1b invariant ("no short
+    link may appear unless a `short_links` row backs it") is satisfied by the pack reading
+    `checkpoint["published"]["refs"]`, and re-pointing it at `content_pieces` would start printing
+    a `/p/{id}` for a run that has published nothing.
+  - **(4) WHAT a rejection attaches to: the piece, with `verdict="rejected"`, `axes = {}` and the
+    reason already stored on the run — and the piece is marked `status="rejected"`, not deleted.**
+    `content_pieces.status`'s CHECK constraint already permits `'rejected'`, so this needs NO
+    migration and invents no vocabulary; and it is the right answer over leaving it `draft` (which
+    says "awaiting a decision" about something decided) and over deleting it (the refused draft is
+    evidence of work the owner paid for — the same reason A10c keeps the review tabs mounted). This
+    also gives `content_store.set_status` its first application caller: today only tests call it.
+    **`axes` is EMPTY and no code path may populate it.** `feedback_service.record` accepts a
+    partial rubric by design ("someone saying 'the voice is wrong' should not have to invent an SEO
+    score"), and `distil` reads ONLY `reject_reason` — so the four-axis rubric is satisfied by
+    omission, and a reviewer at the gate is never asked for a rating they did not give. Whether the
+    gate should ASK for the axes is a founder call, recorded below, not the loop's.
+  - **One rejection writes at most ONE feedback row, and the guard is `status='rejected'` on the
+    piece.** Not a new unique index: the existing state already answers the question. This matters
+    beyond tidiness — `distil` proposes at three occurrences, so one rejection counted twice is a
+    third of a fabricated pattern. Ordering: the piece-side writes (mark rejected → insert feedback
+    → `distil`) run FIRST, inside one `business_session` so they cannot half-apply, and
+    `service.finish(outcome="rejected")` runs LAST. If the piece side raises, nothing is written and
+    the run is still `awaiting_approval`, so the reviewer presses reject again and it converges; the
+    reverse order would leave a terminally rejected run — un-retryable, since every other state is
+    409 — with no feedback and no way to add it. A10b's guarantee is preserved: a run with NO piece
+    is still rejectable and still 200, and writes no feedback at all.
+  - **(5) The rejecter is still NOT recorded.** `Feedback.user_id` is nullable and stays NULL, and
+    the reject route still takes no `CurrentUser` — A10b's reasoning is unchanged by this task
+    (`approved_by` authorises an outward publish; a rejection authorises nothing, and with one user
+    per business a rejecter column stores what `business_id` implies).
+  - **(6) SEQUENCING. A10d-i is blocked on A1a-i — hard, per ruling (2) — and collides with
+    NEITHER A5 nor A6.** A5 touches `measure`, A6 touches `_export_refusal`, both inside
+    `nodes/__init__.py`, and A10d touches no file under `agents/` at all; the only shared file with
+    A1a-i is `run_executor.py`, and the two edits are in different functions (`_initial_state` vs
+    the park branch of `_execute`). A6 is worth landing before or after without preference, but note
+    the interaction and do not let it surprise anyone: a business at the weekly cap has EXPORT refuse
+    before actuating, so its draft stays `draft` — correct, and it is why the piece must never be
+    treated as evidence of publication.
+  - **Claims discipline.** After this lands, `CRITERIA_MAP.md`'s "the agent updates persistent
+    business preferences from explicit feedback" is true of the rejection path and is reachable from
+    a screen (A10c's control) for the first time. It must not be written up as more than that: the
+    gate rejection PROPOSES a rule, only at three occurrences, only after the owner approves the
+    proposal does anything reach `businesses.dna`, and `distil`'s theme table is style-specific — a
+    gate rejection about a wrong price falls through to exact-repeat grouping and needs three
+    identically-phrased rejections. The honest sentence is "a gate rejection is recorded against the
+    piece it refused and feeds the same distillation as a content rating", never "the agent learns
+    from rejections".
+- [~] **A10d-i · SUPERSEDED 2026-08-21 (FOUNDER)** with its parent A10d — nothing is persisted
+  at the park boundary because nothing drafts a page. Original text: — backend
+  only, no migration, no new action type. **Depends on A1a-i.** Atomic on purpose: persisting
+  without the promotion branch ships a duplicate-piece bug, so the two halves may not be split.
+  Touches `run_executor._execute` (park branch), `landing_service` (`promote_landing_draft`),
+  `actuators/landing.py` (the two-branch `perform`), `content_store` (`mark_published`,
+  `landing_page_for_run`) and `lead_store` (`links_for_piece`).
+  **done = a run parked at REVIEW has exactly ONE `content_pieces` row, `status='draft'`, with its
+  `run_id` set and its spec in `meta['landing']`, plus one `short_links` row per channel CTA, each
+  `?ref=<code>`-retargeted; `GET /p/{id}` on that draft is 404 and a POST to its form endpoint is
+  refused, asserted rather than assumed; approving that run PROMOTES that row — the piece count is
+  still 1 after EXPORT, no second link set exists, the row reads `status='published'` with
+  `published_at` and `published_url` stamped, and the `publish.page` `Outcome.detail.ctas` carries
+  the SAME codes the draft minted, so A1b's pack is unchanged; a run whose actuation carries no
+  draft still publishes by the create path (asserted with the promotion lookup finding nothing); a
+  landing page that fails `check_landing_page` persists NO draft and the run still parks; a second
+  EXPORT attempt is `replayed` and promotes nothing twice; and a test asserts `review_service`'s
+  pack still prints no `/p/` and no `/l/` for a run that has not published, because it still reads
+  `checkpoint['published']['refs']` and never `content_pieces`.**
+- [ ] **A10d-ii · A gate rejection is recorded against the piece it refused, and feeds `distil`** —
+  backend only, no migration. **Depends on A10d-i.** One service function so the route stays a
+  route and the three writes are one transaction; the response gains an additive
+  `proposedRules: list[str]` (camelCase, empty by default) so the loop's output is reportable
+  without A10c's screen changing.
+  **done = rejecting a run that has a draft piece leaves that piece `status='rejected'` and exactly
+  ONE `feedback` row against it, with `verdict='rejected'`, `axes == {}` and `reject_reason` equal
+  to the reason stored on the run; three rejections carrying the same themed reason produce a
+  `learned_style` row with `status='proposed'` and a test reads `businesses.dna` to assert it is
+  untouched; rejecting a run with NO piece is still 200, writes no feedback and raises nothing;
+  a second reject is still 409 `run_not_awaiting_approval` and the feedback row count is asserted to
+  be 1, because at a three-occurrence threshold one rejection counted twice is a fabricated pattern;
+  a failure injected into the piece-side writes leaves the run `awaiting_approval` and rejectable
+  rather than rejected-with-no-record; and `axes` is asserted EMPTY, with no code path and no test
+  fixture supplying a rating a reviewer did not give.**
+- [ ] **A10e · The reviewer sees what their "no" proposed** — UI only, depends on A10d-ii. The
+  rejection panel renders `proposedRules` as "we noticed a pattern" with a link to the proposals
+  panel, and renders NOTHING when the list is empty — which is the normal answer and must not read
+  as a failure. Filed separately so A10d-ii cannot grow a screen.
+  **done = a rejection that proposed a rule says so and links to where it waits; one that proposed
+  nothing shows no empty state; asserted in both cases.**
+
 - [ ] **A2c · A node that raises loses its retrieval trace along with everything else** — found
   by A2a, pre-existing, and deliberately not changed there. `GENERATE` and `CONVERT` raise
   `ValueError` when the model returns no tool call; the driver converts that to a `NodeError` and
@@ -1218,7 +1613,12 @@ A1 is the first code to create.
   may be refused and cannot land inside this timeline?"* No real `OAuthProvider` or
   `SocialPublisher` should be written before an approval exists — untested code pretending
   to be a feature is worse than a stated gap.
-- [ ] ⛔ **The Docker `images` CI job is unverified** — the local build ran past 15 minutes
+- [x] ⛔ **The Docker `images` CI job is unverified** — RESOLVED 2026-08-21 by the push, which
+  is exactly what §C said this one needed. It has been running on every `main` push since
+  2026-08-20 and **passing**: run 32381757702 reports `Docker — build both images: success`
+  alongside `Python — lint, types, tests: success`. So both images build in CI; only the local
+  15-minute build was the problem, and CI's cache is why it is not CI's problem. Original text:
+  — the local build ran past 15 minutes
   twice and was killed. Verifying it properly means a push, which is outward-facing. Ask:
   *"Push the branch so the `images` job runs, or authorise an unbounded local `docker build`?"*
   Fold it into the next PR the human pushes anyway. **Packaging note for the safe-html
