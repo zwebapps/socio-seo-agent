@@ -581,7 +581,8 @@ what was built, and leaving it `[ ]` would make `/next` pick up work the founder
   `documentTone` alone turns 3 of 19 red. Note for whoever folds them — `statusTone` has
   no caller outside `documentTone` and the test file today, so the "real case" it is kept
   for is still hypothetical
-- [ ] **The Docker `images` CI job is unverified against the new frontend test files.**
+- [x] **The Docker `images` CI job is unverified against the new frontend test files.**
+  → verified 2026-08-21 in CI (green on `main`); see the §B entry.
   `docker build -f frontend/Dockerfile` ran past 15 minutes locally and was killed. Local
   `pnpm build` exercises the same compile-and-typecheck path with the test files present
   and `--frozen-lockfile` is verified, so the risk is low — but low is not verified, and CI
@@ -657,7 +658,7 @@ repo-wide grep for `oauth|access_token|graph.facebook|linkedin.com/v2` returned 
   implemented; it needs a cross-run ledger read the node cannot make hermetically today.
   **→ superseded by A6 below. That stated reason is STALE: `NodeDeps.actuator_store` is
   already the injected-store pattern this needs.**
-- [ ] ⛔ **The Docker `images` CI job is still unverified** against the new frontend test
+- [x] ⛔ **The Docker `images` CI job is still unverified** against the new frontend test
   files — the local build ran past 15 minutes twice and was killed. **→ reclassified ⛔ in
   §B below: verifying it needs a push, which is outward-facing.**
 
@@ -772,6 +773,23 @@ one an owner can see.
 
 - [ ] **N3 · The connection-expiry sweep has no caller** — see A3-ii, sharpened rather than
   duplicated: the function is written and tested, and the scheduler is now the obvious home.
+
+- [x] **N5 · The `Web — types, tests, build` CI job had NEVER passed, and it failed in a way
+  that reported failure without running anything** — found 2026-08-21 by pushing. Every run on
+  `main` since 2026-08-20 is red, and the same three steps are red every time: `pnpm/action-setup@v4`
+  fails in six seconds and `setup-node`, `pnpm install`, `typecheck`, `test` and `build` are all
+  SKIPPED. So the frontend's type check, its 279 tests and its production build have never once
+  been verified by CI — they were only ever green on a laptop. Cause: the job sets
+  `defaults.run.working-directory: frontend`, which applies to `run` steps only; an ACTION does
+  not see it, so the setup looked for `packageManager` in a root `package.json` this repo does
+  not have (the web app lives in `frontend/` — see the README's "Why anything is at the repo
+  root"). The workflow's own comment asserted it "reads `packageManager` from
+  frontend/package.json", which is now true rather than merely intended: `with:
+  package_json_file: frontend/package.json`. **Worth naming as a pattern, because this is the
+  third instance in this file** — CI was green on work nobody ran (P1: `ENVIRONMENT: ci` with no
+  `SESSION_SECRET` meant pytest never collected), and a 64-character constraint name had
+  disabled `alembic check` entirely. A gate that cannot fail is worse than no gate, because it
+  is *reported* as a gate.
 
 - [x] **N4 · Three documents describe the frontend as it was yesterday** — a fresh drift, not a
   reopening of A8-i (which correctly closed for the tree that existed when it was written).
@@ -1595,7 +1613,12 @@ one an owner can see.
   may be refused and cannot land inside this timeline?"* No real `OAuthProvider` or
   `SocialPublisher` should be written before an approval exists — untested code pretending
   to be a feature is worse than a stated gap.
-- [ ] ⛔ **The Docker `images` CI job is unverified** — the local build ran past 15 minutes
+- [x] ⛔ **The Docker `images` CI job is unverified** — RESOLVED 2026-08-21 by the push, which
+  is exactly what §C said this one needed. It has been running on every `main` push since
+  2026-08-20 and **passing**: run 32381757702 reports `Docker — build both images: success`
+  alongside `Python — lint, types, tests: success`. So both images build in CI; only the local
+  15-minute build was the problem, and CI's cache is why it is not CI's problem. Original text:
+  — the local build ran past 15 minutes
   twice and was killed. Verifying it properly means a push, which is outward-facing. Ask:
   *"Push the branch so the `images` job runs, or authorise an unbounded local `docker build`?"*
   Fold it into the next PR the human pushes anyway. **Packaging note for the safe-html

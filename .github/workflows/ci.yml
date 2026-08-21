@@ -100,10 +100,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No version pin here on purpose: the action reads `packageManager`
-      # from frontend/package.json, so CI, the Docker build and the host all
-      # use the same pnpm and therefore the same supply-chain policy.
+      # No version pin here on purpose: the action reads `packageManager` from
+      # frontend/package.json, so CI, the Docker build and the host all use the same
+      # pnpm and therefore the same supply-chain policy.
+      #
+      # `package_json_file` is REQUIRED and its absence is why this job had never once
+      # passed. `defaults.run.working-directory` applies to `run` steps only — an action
+      # does not see it — so the setup looked for `packageManager` in a root
+      # `package.json` that does not exist in this repo (the web app lives in
+      # `frontend/`, see README "Why anything is at the repo root"). The action failed in
+      # six seconds and every step after it was skipped, so the web job reported failure
+      # without ever running a type check, a test, or a build.
       - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
 
       - uses: actions/setup-node@v4
         with:
