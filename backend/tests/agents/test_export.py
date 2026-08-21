@@ -916,3 +916,118 @@ async def test_neither_node_charges_the_run_budget(node: str) -> None:
     updates = await build_nodes(deps)[node](_state(published=_published()))
 
     assert "_cost" not in updates
+
+
+# --------------------------------------------------------------------------- #
+# EXPORT: the weekly volume cap
+# --------------------------------------------------------------------------- #
+#
+# `ARCHITECTURE.md` 7.4's third ceiling, and the only one that is not about money:
+# `ROADMAP.md` 10 offers a per-business volume cap as the mitigation against scaled
+# content abuse, so a cap that is documented and not enforced makes that claim false.
+#
+# The cap is PARTIAL by design, which is where the interesting failures are: a cap that
+# refused all four pieces because there was room for two would throw away work an owner
+# approved, and one that published all four would not be a cap.
+
+
+def _counter(published: int) -> Any:
+    """A publish counter that reports `published` pieces already out this week."""
+
+    async def count(_business: Any) -> int:
+        return published
+
+    return count
+
+
+async def test_under_the_cap_everything_approved_goes_out() -> None:
+    """The direction that keeps this a cap rather than a blocker. Without it, an inverted
+    comparison would pass every test below."""
+    deps, ledger = _wired(FakeActuator(SOCIAL_POST_ACTION), published_this_week=_counter(0))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+
+    assert [row["status"] for row in updates["published"]["refs"]] == ["succeeded"] * 2
+    assert updates["published"]["not_published"] == []
+    assert "weekly_cap_reached" not in _codes(updates)
+    assert len(ledger.claimed) == 2
+
+
+async def test_at_the_cap_nothing_is_published_and_the_ledger_is_never_touched() -> None:
+    """The strongest form: not "it refused" but "it never asked". A key claimed for a
+    capped piece is a key that can never publish it later -- `claim` returns a stored
+    refusal forever -- so the cap has to be decided BEFORE the ledger sees the piece."""
+    deps, ledger = _wired(FakeActuator(SOCIAL_POST_ACTION), published_this_week=_counter(10))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+
+    assert ledger.claimed == []
+    assert updates["published"]["attempted"] == 0
+    assert sorted(updates["published"]["not_published"]) == ["facebook", "linkedin"]
+    assert "weekly_cap_reached" in _codes(updates)
+
+
+async def test_partial_headroom_publishes_what_fits_and_names_the_rest() -> None:
+    """Room for one, two approved. The one that goes out is the first REVIEW showed, so
+    which channel publishes is deterministic rather than dict-order luck."""
+    deps, ledger = _wired(FakeActuator(SOCIAL_POST_ACTION), published_this_week=_counter(9))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+
+    assert updates["published"]["attempted"] == 1
+    assert [claim.target for claim in ledger.claimed] == ["linkedin"]
+    assert updates["published"]["not_published"] == ["facebook"]
+    assert "weekly_cap_reached" in _codes(updates)
+
+
+async def test_the_cap_refusal_states_the_count_the_cap_and_the_channels() -> None:
+    """A volume refusal with no figures gives an owner nothing to act on, and one that
+    reads as a failure sends them looking for a broken integration."""
+    deps, _ = _wired(FakeActuator(SOCIAL_POST_ACTION), published_this_week=_counter(10))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+    message = next(
+        error.message for error in updates["errors"] if error.code == "weekly_cap_reached"
+    )
+
+    assert "10 of its 10" in message
+    assert "7 days" in message
+    assert "linkedin" in message and "facebook" in message
+    assert "deliberate volume cap, not a failure" in message
+    assert "unchanged" in message
+
+
+async def test_a_capped_run_still_reports_its_publish_note_honestly() -> None:
+    """`Published 0 of 0` would be true and useless. The note has to carry the channels
+    that did not go out, because that line is what the runs list renders."""
+    deps, _ = _wired(FakeActuator(SOCIAL_POST_ACTION), published_this_week=_counter(10))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+
+    assert "nothing was published to" in updates["published"]["note"]
+
+
+async def test_with_no_counter_wired_the_cap_does_not_block_a_publish() -> None:
+    """`published_this_week=None` means "not enforced", which is a test's choice and never
+    a deployment's: `test_run_start_guard` asserts the executor wires it. Pinned here so
+    the many node tests that ignore the cap keep working for a stated reason rather than
+    by accident."""
+    deps, ledger = _wired(FakeActuator(SOCIAL_POST_ACTION))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+
+    assert len(ledger.claimed) == 2
+    assert "weekly_cap_reached" not in _codes(updates)
+
+
+async def test_a_cap_lowered_below_what_is_already_published_refuses_rather_than_inverting() -> (
+    None
+):
+    """`headroom` is clamped at zero, so `pieces[:headroom]` cannot become `pieces[:-4]` --
+    which would publish everything except the last four, the exact opposite of the cap."""
+    deps, ledger = _wired(FakeActuator(SOCIAL_POST_ACTION), published_this_week=_counter(40))
+
+    updates = await build_nodes(deps)["EXPORT"](_state())
+
+    assert ledger.claimed == []
+    assert sorted(updates["published"]["not_published"]) == ["facebook", "linkedin"]

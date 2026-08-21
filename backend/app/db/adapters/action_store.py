@@ -17,10 +17,12 @@ row is, is row-level security's question, not an `if`'s.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.actuators.contract import Actuation, Outcome, OutcomeStatus
@@ -120,6 +122,44 @@ class PostgresActionStore:
                     error=outcome.error,
                 )
             )
+
+    async def published_since(
+        self, business_id: UUID, *, action_types: Collection[str], since: datetime
+    ) -> int:
+        """How many publishes this business has committed to since `since`.
+
+        Satisfies `services.publish_cap.PublishLedger`. Counted in SQL rather than by
+        pulling rows and measuring the list, for the reason `cost_service` gives about
+        its own sums: the number is the only thing we want back.
+
+        **`in_flight` counts as well as `succeeded`, and that is the conservative
+        direction on purpose.** A cap exists to prevent over-publishing, so where the
+        count is uncertain it must err towards refusing: an attempt that is mid-call will
+        almost certainly land, and counting only settled rows would let two concurrent
+        publishes both find room for the last slot. The cost of the choice is bounded and
+        self-healing — a row abandoned `in_flight` by a dead process holds one slot, and
+        only until it ages out of the rolling window.
+
+        `refused` and `failed` are NOT counted: nothing was published, so nothing was
+        produced, and counting a refusal would let a rejected post consume the allowance
+        that would have let its replacement out.
+        """
+        if not action_types:
+            return 0
+
+        async with business_session(business_id) as session:
+            counted = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Action)
+                    .where(
+                        Action.action_type.in_(list(action_types)),
+                        Action.status.in_(("succeeded", "in_flight")),
+                        Action.created_at >= since,
+                    )
+                )
+            ).scalar_one()
+        return int(counted or 0)
 
     async def recent(self, business_id: UUID, *, limit: int = 50) -> list[Action]:
         """This business's actions, newest first. For the audit view."""

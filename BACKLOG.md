@@ -1034,7 +1034,7 @@ one an owner can see.
   `NODE_TOOLS` are updated together (`test_tool_allowlist.py` parses the doc, so a
   one-sided change fails the build).**
 
-- [ ] **A6 · The weekly published-pieces-per-business cap** (`ARCHITECTURE.md` §7.4) —
+- [x] **A6 · The weekly published-pieces-per-business cap** (`ARCHITECTURE.md` §7.4) —
   depends on A1a. **The recorded reason for it being blocked is stale:** `NodeDeps` already
   carries `actuator_store`, which is the same injected-store pattern, and the `actions`
   table already holds precisely what needs counting (`status='succeeded'`,
@@ -1045,6 +1045,44 @@ one an owner can see.
   **done = a business at the cap gets a refusal that states the count, the window and the
   cap; a business under it publishes; the count is per business (a test proves A's
   publishes do not consume B's allowance); and a `refused` row lands in `actions`.**
+  **CLOSED, with ONE deliberate deviation from that criterion — the last clause is wrong and
+  the code is right.** `services/publish_cap.py` owns the decision: a rolling seven-day count
+  of `actions` rows in `PUBLISHABLE_ACTIONS`, against `BUSINESS_WEEKLY_PUBLISH_CAP`
+  (default 10 — six channels × one weekly run, plus headroom for manual publishes, and short
+  of two full runs in a week; `0` is the kill switch, like the USD cap).
+  - **Why no `actions` row: recording the refusal there would poison the idempotency key.**
+    `actions.idempotency_key` is uniquely indexed and `claim` returns the outcome a key
+    already holds, so a stored cap refusal would replay forever — the same post could never
+    be published in ANY later week. The cap says *not this week*; a mechanism that turned
+    that into *not ever* would be the opposite of a quality control. `actions` is the ledger
+    of ATTEMPTED side effects and a capped publish attempts nothing, so the check sits
+    BEFORE the claim and the refusal is reported where the project already reports what
+    happened to finished content: a `weekly_cap_reached` NodeError on the run (which the
+    review screen renders) and the `error` on the `PublishResult` the button gets back.
+    Note this is the reverse of `actuate()`'s approval check, which is deliberately AFTER
+    the claim precisely so it leaves a row — the asymmetry is the point, and both docstrings
+    now say so.
+  - **PARTIAL rather than all-or-nothing**, following this node's own rule instead of
+    inventing one: per-destination failure is already per destination and "a run that
+    published three of four says which one it did not". Room for one and two approved
+    publishes the first (the order REVIEW showed) and names the other. Refusing both because
+    there was room for one would discard work an owner approved.
+  - **BOTH publish paths ask, which is the N2 lesson applied before it bit.** EXPORT and the
+    calendar's publish button are the two ways a piece reaches a platform; a cap on one is
+    advisory. `tests/test_run_start_guard.py` grew a second structural assertion — any module
+    calling `actuate()` must name `weekly_publish_state`, with the known callers pinned — plus
+    a third asserting `run_executor` wires `published_this_week`, since `None` means "not
+    enforced" and one deleted keyword argument would otherwise disable the cap in production
+    while every node test stayed green.
+  - Verified by deleting each half: five EXPORT tests and two calendar tests go red. 9 more on
+    real SQL pin what counts (`succeeded` and `in_flight` yes — the conservative direction;
+    `refused`/`failed` no, or a rejected post would consume its replacement's allowance;
+    another action type no; outside the rolling window no; and A's publishes do not consume
+    B's, through RLS as the restricted role). 16 pure tests pin the arithmetic, including that
+    a cap LOWERED below what is already published clamps to zero rather than slicing
+    `pieces[:-4]`, which would publish everything except the last four.
+  - `ARCHITECTURE.md` §7.4 rewritten: the "not implemented yet" marker is gone and the
+    ordering rule above is recorded.
 
 - [x] **A7 · The per-business monthly USD cap** — DONE, verified 2026-08-21 against the code
   rather than a commit message. `core/config.py:DEFAULT_BUSINESS_MONTHLY_CAP_USD` ($25, and

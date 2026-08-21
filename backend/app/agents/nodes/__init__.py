@@ -118,6 +118,7 @@ from backend.app.engines.serp import (
     expand_keywords,
 )
 from backend.app.llm import Message, Role, TaskClass, ToolCall, ToolSpec
+from backend.app.services.publish_cap import PublishCounter, weekly_publish_state
 
 logger = logging.getLogger(__name__)
 
@@ -365,6 +366,18 @@ class NodeDeps:
     #: Routing an internal write through the actuator ledger would put an idempotency
     #: key on something the database already makes atomic.
     publish_distribution: Callable[..., Awaitable[Any]] | None = None
+    #: How many pieces this business has published inside the rolling week.
+    #:
+    #: `ARCHITECTURE.md` §7.4's third cap, and a callable for the same reason
+    #: `publish_distribution` is one: it needs a database and the nodes must stay
+    #: database-free, so every node test stays hermetic.
+    #:
+    #: `None` means the cap is NOT enforced — deliberately, and safely, because there is
+    #: exactly one place that builds these deps for a real run (`services/run_executor`)
+    #: and a guard test asserts that it wires this. So "unwired" is a test's choice rather
+    #: than a deployment's, and a node test that does not care about volume does not have
+    #: to fake a ledger in order to publish two posts.
+    published_this_week: PublishCounter | None = None
     #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
     #:
     #: Injected like every other dependency rather than read here, because the nodes
@@ -1316,6 +1329,35 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         refs: list[dict[str, Any]] = []
         not_published: list[str] = []
         errors: list[NodeError] = []
+
+        # The weekly cap (`ARCHITECTURE.md` §7.4), applied BEFORE any key is claimed --
+        # see `services/publish_cap` for why one step later would poison the idempotency
+        # key and turn "not this week" into "not ever".
+        #
+        # PARTIAL, not all-or-nothing, and that follows this node's existing rule rather
+        # than inventing one: per-destination failure is already per destination, and "a
+        # run that published three of four says which one it did not". Refusing four
+        # pieces because there was room for two would throw away work an owner approved.
+        # The order is the order REVIEW showed them in, so which channels go out is
+        # deterministic rather than dict-order luck.
+        if deps.published_this_week is not None:
+            allowance = await weekly_publish_state(business, count=deps.published_this_week)
+            if len(pieces) > allowance.headroom:
+                capped = [target for _, target, _ in pieces[allowance.headroom :]]
+                pieces = pieces[: allowance.headroom]
+                not_published.extend(capped)
+                errors.append(
+                    NodeError(
+                        node="EXPORT",
+                        code="weekly_cap_reached",
+                        message=(
+                            f"{allowance.sentence}, so nothing was published to "
+                            f"{', '.join(capped)}. This is a deliberate volume cap, not a "
+                            "failure: the drafts are unchanged and can go out once the "
+                            "week rolls forward."
+                        ),
+                    )
+                )
 
         # The links first, and this ordering IS functional even though the page is gone:
         # every post carries the ask, and `link_service` completes each link's target

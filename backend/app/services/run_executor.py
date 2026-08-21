@@ -54,7 +54,7 @@ from backend.app.actuators.owner_notice import (
     owner_notice_sender,
 )
 from backend.app.agents.graph import GraphResult, run_graph
-from backend.app.agents.nodes import NodeDeps, build_nodes
+from backend.app.agents.nodes import PUBLISHABLE_ACTIONS, NodeDeps, build_nodes
 from backend.app.agents.state import AgentState, new_state
 from backend.app.agents.state_graph import run_state_graph
 from backend.app.core.config import get_settings
@@ -63,6 +63,7 @@ from backend.app.db.session import session
 from backend.app.engines.nap import extract_nap_listings
 from backend.app.engines.seo import SiteAuditResult, audit_site
 from backend.app.llm.router import ModelRouter, UsageSink
+from backend.app.services.publish_cap import counter_for
 from backend.app.services.run_service import RunService
 from backend.app.services.usage_recorder import UsageRecorder
 
@@ -285,6 +286,12 @@ async def build_real_deps(business_id: UUID, usage_sink: UsageSink | None = None
         actuator_for=_build_actuator_resolver(),
         actuator_store=PostgresActionStore(),
         publish_distribution=_build_publish_distribution(),
+        # The weekly volume cap's counter. Wired unconditionally, unlike `serp_search`:
+        # there is no fake to fall back to and no credential to be missing, so an
+        # unwired counter here would silently mean an unenforced cap — and a cap that is
+        # documented and not enforced is the defect this wiring exists to prevent. One
+        # store instance is fine; each call opens its own tenant-scoped session.
+        published_this_week=counter_for(PostgresActionStore(), action_types=PUBLISHABLE_ACTIONS),
         owner_notice=await _resolve_owner_notice(business_id),
         # Same rule as `serp_search` and for the same reason: a FAKE search result
         # reaching a draft is worse than no search at all, because afterwards nothing

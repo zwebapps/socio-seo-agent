@@ -532,3 +532,92 @@ async def test_a_post_from_another_business_is_not_found(
                 store=_Store(),
                 session=session,
             )
+
+
+# --------------------------------------------------------------------------- #
+# The weekly volume cap, on the second publish path
+# --------------------------------------------------------------------------- #
+#
+# EXPORT is the first path and `tests/agents/test_export.py` covers it. This button is the
+# second, and a cap enforced on one of two paths is advisory — which is exactly how the
+# per-business USD ceiling came to be enforced on the HTTP routes and invisible to the
+# scheduler, which then spent past it.
+
+
+def _counter(published: int) -> Any:
+    async def count(_business: UUID) -> int:
+        return published
+
+    return count
+
+
+async def test_the_button_refuses_at_the_cap_without_attempting_a_send(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """`_Publisher` records what it was asked to do, so "never asked" is assertable rather
+    than inferred — and it has to be never asked: a claimed idempotency key holding a
+    refusal can never publish that post later."""
+    post_id = await _one_post(business_a)
+    publisher = _Publisher(_outcome(OutcomeStatus.SUCCEEDED))
+    store = _Store()
+
+    async with business_session(business_a) as session:
+        result = await svc.publish_post(
+            post_id,
+            business_id=business_a,
+            approved_by="user-1",
+            actuator=publisher,
+            store=store,
+            session=session,
+            count_published=_counter(10),
+        )
+
+    assert publisher.calls == []
+    assert result.external_ref is None
+    assert result.error is not None
+    assert "10 of its 10" in result.error
+    assert "deliberate volume cap" in result.error
+
+
+async def test_a_capped_post_stays_on_the_calendar(scoped_sessions: None, business_a: UUID) -> None:
+    """The same rule a simulated send follows, for the same reason: a cap says "not this
+    week", and consuming the post would turn a delay into a loss."""
+    post_id = await _one_post(business_a)
+
+    async with business_session(business_a) as session:
+        result = await svc.publish_post(
+            post_id,
+            business_id=business_a,
+            approved_by="user-1",
+            actuator=_Publisher(_outcome(OutcomeStatus.SUCCEEDED)),
+            store=_Store(),
+            session=session,
+            count_published=_counter(10),
+        )
+
+    assert result.status == SocialPostStatus.QUEUED.value
+    assert result.post.published_at is None
+    assert result.simulated is False, "nothing was simulated; nothing was attempted"
+
+
+async def test_under_the_cap_the_button_still_publishes(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The direction of the guard, without which an inverted comparison passes both tests
+    above."""
+    post_id = await _one_post(business_a)
+    publisher = _Publisher(_outcome(OutcomeStatus.SUCCEEDED, ref="urn:li:share:9"))
+
+    async with business_session(business_a) as session:
+        result = await svc.publish_post(
+            post_id,
+            business_id=business_a,
+            approved_by="user-1",
+            actuator=publisher,
+            store=_Store(),
+            session=session,
+            count_published=_counter(9),
+        )
+
+    assert result.status == SocialPostStatus.PUBLISHED.value
+    assert len(publisher.calls) == 1
