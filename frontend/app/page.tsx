@@ -45,6 +45,7 @@ import { DashboardTiles } from "@/app/components/dashboard-tiles";
 import { Shell } from "@/app/components/page-shell";
 import { RunRows, useRuns } from "@/app/components/run-rows";
 import { Pill, SoftButton, SoftCard, SoftInput } from "@/app/components/soft";
+import { useSession } from "@/app/components/session-context";
 import { StartRunForm } from "@/app/components/start-run";
 import {
   ApiError,
@@ -95,6 +96,11 @@ export default function Home() {
 
   const needsOnboarding = setup !== null && setup.hasBusiness && !setup.onboarded;
   const hasNoBusiness = setup !== null && !setup.hasBusiness;
+  // `loading` counts as neither: rendering the signed-out notice for one round trip
+  // would flash "sign in" at somebody who is signed in, which reads as a logout.
+  const { state: session } = useSession();
+  const signedIn = session.kind === "signed-in";
+  const anonymous = session.kind === "anonymous";
 
   return (
     <Shell className="py-14">
@@ -117,12 +123,21 @@ export default function Home() {
           which is the question an owner opens a dashboard with — and they sit ABOVE the
           two-column split rather than inside it because a tile row squeezed into a
           26rem column is six stacked cards, which is a list, not a row. */}
-      {/* `hasBusiness` is passed rather than left to the tiles to discover: the endpoint
-          409s for an account with no business, and the tiles would render that refusal
-          as a red alert above the panel that fixes it. `setup === null` means the read is
-          still in flight, and defaulting to true there keeps the tiles' own loading
-          state visible instead of flashing them out and back in. */}
-      <DashboardTiles hasBusiness={setup === null ? true : setup.hasBusiness} />
+      {/* Two gates, and both exist because an unreadable number must not be dressed as
+          a failure the reader can act on.
+
+          `signedIn`: an anonymous visitor was being shown THREE red alerts — the tiles,
+          the runs panel and the health card all reporting "Please sign in to continue."
+          — while the session bar above already offered the one useful action. Red text
+          announced assertively is for something broken; not being signed in is not.
+
+          `hasBusiness`: the endpoint 409s for an account owning no business, and the
+          tiles rendered that refusal above the very panel that fixes it. `setup === null`
+          means the read is still in flight, so it defaults to true to keep the tiles'
+          own loading state rather than flashing them out and back in. */}
+      {signedIn && <DashboardTiles hasBusiness={setup === null ? true : setup.hasBusiness} />}
+
+      {anonymous && <SignedOutNotice />}
 
       {/* Two columns from `lg`, and the right-hand list gets the extra room at `xl`
           rather than the form growing: a goal input does not read better at 800px, and
@@ -209,7 +224,10 @@ export default function Home() {
         </div>
 
         {/* Right: what has already happened. */}
-        <section aria-labelledby="recent-runs-heading">
+        {/* Hidden signed out for the same reason the tiles are: the runs read is
+            authenticated, so it reported the same 401 in red beside a Refresh button
+            that could not help. */}
+        <section aria-labelledby="recent-runs-heading" hidden={anonymous}>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <h2 id="recent-runs-heading" className="text-sm font-semibold">
               Recent runs
@@ -303,6 +321,37 @@ function OnboardFirst() {
  * the role by `scripts/grant_platform_admin.py` — signup creates a user and a business
  * in one transaction, so an ordinary owner always has one.
  */
+/**
+ * What an anonymous visitor sees instead of three red failures.
+ *
+ * Every panel on this page reads an authenticated endpoint, so signed out they all
+ * reported the same 401 in `--err` red with a "Try again" button that could never
+ * succeed. One quiet explanation replaces them; the session bar above carries the
+ * action.
+ */
+function SignedOutNotice() {
+  return (
+    <SoftCard className="mt-10 p-6" size="lg">
+      <h2 className="text-sm font-semibold">Sign in to see your dashboard</h2>
+      <p className="mt-2 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
+        Your numbers, your content and your runs all belong to a business, so there is
+        nothing to show until we know whose they are.
+      </p>
+      <Link
+        href="/login"
+        className="soft-edge mt-4 inline-flex items-center px-4 py-2 text-xs font-semibold"
+        style={{
+          borderRadius: "var(--r-pill)",
+          background: "var(--primary)",
+          color: "var(--primary-ink)",
+        }}
+      >
+        Sign in or create an account
+      </Link>
+    </SoftCard>
+  );
+}
+
 function NoBusiness({ onCreated }: { onCreated: () => void }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);

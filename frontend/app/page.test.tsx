@@ -27,8 +27,24 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import Home from "@/app/page";
+import { SessionProvider } from "@/app/components/session-context";
 import { normalizeSummary, topChannel } from "@/app/lib/dashboard-api";
+import Home from "@/app/page";
+
+/**
+ * The page inside the provider the real root layout gives it.
+ *
+ * Without it `useSession` returns the default `loading` context forever, the dashboard
+ * stays gated, and every assertion about a tile fails for a reason that has nothing to
+ * do with what it is testing.
+ */
+function Providers() {
+  return (
+    <SessionProvider>
+      <Home />
+    </SessionProvider>
+  );
+}
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
 
@@ -99,6 +115,15 @@ beforeEach(() => {
     if (url.includes("/api/v1/runs")) {
       return Promise.resolve(response({ body: { runs: [], nextCursor: null } }));
     }
+    if (url.includes("/api/v1/auth/me")) {
+      // The dashboard is gated on being signed in — an anonymous visitor gets one quiet
+      // notice instead of three red alerts — so every test here needs a session.
+      return Promise.resolve(
+        response({
+          body: { id: "u1", email: "owner@example.test", role: "owner", businessId: "b1" },
+        }),
+      );
+    }
     if (url.includes("/api/v1/health")) {
       return Promise.resolve(
         response({
@@ -123,7 +148,7 @@ async function tile(label: string): Promise<HTMLElement> {
 describe("an unmeasured metric", () => {
   it("explains itself in words and never renders a zero", async () => {
     dashboard = { body: nothingMeasured() };
-    render(<Home />);
+    render(<Providers />);
 
     // Each tile says what the missing number means, rather than showing a figure.
     expect(await tile("Tracked clicks")).toHaveTextContent(
@@ -150,7 +175,7 @@ describe("an unmeasured metric", () => {
 
   it("marks the tile as unmeasured as well as explaining it", async () => {
     dashboard = { body: nothingMeasured() };
-    render(<Home />);
+    render(<Providers />);
 
     // The sentence is the explanation; the pill is what a skim-reader sees. Colour is
     // not carrying it — the words "not measured" are in the DOM.
@@ -163,7 +188,7 @@ describe("an unmeasured metric", () => {
     // renders it as "Request failed (404)" — which sends an owner to check their network
     // for a route that was never deployed.
     dashboard = { ok: false, status: 404, body: null };
-    render(<Home />);
+    render(<Providers />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /no dashboard summary endpoint/,
@@ -175,7 +200,7 @@ describe("an unmeasured metric", () => {
 
   it("re-reads on demand after a failure", async () => {
     dashboard = { ok: false, status: 503, body: null };
-    render(<Home />);
+    render(<Providers />);
     await screen.findByRole("alert");
 
     dashboard = { body: summary() };
@@ -189,7 +214,7 @@ describe("an unmeasured metric", () => {
 
 describe("a measured metric", () => {
   it("names the top channel beside the click count", async () => {
-    render(<Home />);
+    render(<Providers />);
     const clicks = await tile("Tracked clicks");
     expect(clicks).toHaveTextContent("1,240");
     // LinkedIn has 900 to Facebook's 340, so ordering by array position rather than by
@@ -199,7 +224,7 @@ describe("a measured metric", () => {
   });
 
   it("says how many runs await approval", async () => {
-    render(<Home />);
+    render(<Providers />);
     const runs = await tile("Runs");
     expect(runs).toHaveTextContent("12");
     expect(runs).toHaveTextContent("2 await approval");
@@ -211,7 +236,7 @@ describe("a measured metric", () => {
     // docs/ARCHITECTURE.md §15.2: model answers are non-deterministic and shift with
     // model updates. A bare "18.5%" reads as a measured market share, which it is not —
     // and the caveat is easiest to lose exactly when a real figure arrives.
-    render(<Home />);
+    render(<Providers />);
     const sov = await tile("AI share of voice");
     expect(sov).toHaveTextContent("18.5%");
     expect(sov).toHaveTextContent(/sample of model answers, not a census/);
@@ -220,13 +245,13 @@ describe("a measured metric", () => {
   it("renders spend as the string it arrived as", async () => {
     // Money is Decimal server-side. Parsing "3.4218" into a JS number here is how the
     // one figure a customer checks against an invoice acquires a rounding error.
-    render(<Home />);
+    render(<Providers />);
     expect(await tile("Model spend")).toHaveTextContent("$3.4218");
   });
 
   it("says the audit was partial when the crawl was cut short", async () => {
     dashboard = { body: summary({ seoTruncated: true }) };
-    render(<Home />);
+    render(<Providers />);
     expect(await tile("SEO problems on your site")).toHaveTextContent(
       /covers part of the site, not all of it/,
     );
@@ -236,7 +261,7 @@ describe("a measured metric", () => {
     // The other half of the rule, and the half that is easy to over-correct into: zero
     // leads IS a measurement and must render as a figure, not as "not measured".
     dashboard = { body: summary({ leadsTotal: 0 }) };
-    render(<Home />);
+    render(<Providers />);
     const leads = await tile("Leads");
     expect(within(leads).getByText("0")).toBeInTheDocument();
     expect(within(leads).queryByText("not measured")).toBeNull();
@@ -255,7 +280,7 @@ describe("gaps", () => {
         ],
       }),
     };
-    render(<Home />);
+    render(<Providers />);
 
     expect(
       await screen.findByText(
@@ -271,7 +296,7 @@ describe("gaps", () => {
   });
 
   it("renders no gaps panel when the API reports none", async () => {
-    render(<Home />);
+    render(<Providers />);
     await tile("Leads");
     // Otherwise an empty "no gaps" panel becomes permanent furniture on every dashboard.
     expect(screen.queryByRole("heading", { name: "What is not measured yet" })).toBeNull();
@@ -283,7 +308,7 @@ describe("gaps", () => {
 describe("the onboarding panels", () => {
   it("leads with 'Name your business' for an account that has none", async () => {
     onboarding = { body: { hasBusiness: false, onboarded: false, name: null, website: null } };
-    render(<Home />);
+    render(<Providers />);
 
     expect(
       await screen.findByRole("heading", { name: "Name your business" }),
@@ -296,7 +321,7 @@ describe("the onboarding panels", () => {
 
   it("leads with 'Onboard your business' for a business with no confirmed profile", async () => {
     onboarding = { body: { hasBusiness: true, onboarded: false, name: "Ada", website: null } };
-    render(<Home />);
+    render(<Providers />);
 
     expect(
       await screen.findByRole("heading", { name: "Onboard your business" }),
@@ -308,7 +333,7 @@ describe("the onboarding panels", () => {
   });
 
   it("shows neither panel once the business is onboarded", async () => {
-    render(<Home />);
+    render(<Providers />);
     await tile("Leads");
 
     expect(screen.queryByRole("heading", { name: "Onboard your business" })).toBeNull();
@@ -320,7 +345,7 @@ describe("the onboarding panels", () => {
     // A flashed "onboard first" is a setup prompt shown to a business that onboarded
     // months ago, which is why the state starts as unknown rather than as false.
     onboarding = { ok: false, status: 500, body: null };
-    render(<Home />);
+    render(<Providers />);
     await tile("Leads");
 
     expect(screen.queryByRole("heading", { name: "Onboard your business" })).toBeNull();
@@ -397,7 +422,7 @@ describe("topChannel", () => {
 /* --- the row does not force a horizontal scroll ----------------------------- */
 
 it("wraps the tiles rather than laying them out in one fixed row", async () => {
-  render(<Home />);
+  render(<Providers />);
   const list = (await tile("Leads")).parentElement;
   // jsdom computes no layout, so the assertion is on the mechanism: a wrapping grid
   // that starts at one column, plus `min-w-0` on the cell so a long channel name
@@ -409,7 +434,7 @@ it("wraps the tiles rather than laying them out in one fixed row", async () => {
 /* --- the API is asked once, and for the right thing ------------------------- */
 
 it("asks for the summary without a business id", async () => {
-  render(<Home />);
+  render(<Providers />);
   await tile("Leads");
 
   const urls = vi
@@ -435,7 +460,7 @@ it("waits for the read rather than showing an empty dashboard", async () => {
     return base(input as RequestInfo, init);
   }) as unknown as typeof fetch;
 
-  render(<Home />);
+  render(<Providers />);
   // Loading is its own state: the unmeasured copy here would tell a business with 1,240
   // clicks it has none, for as long as the request takes.
   expect(await screen.findByText("Reading your numbers…")).toBeInTheDocument();
@@ -466,7 +491,7 @@ it("shows no KPI tiles, and no failure, to an account with no business", async (
     },
   };
 
-  render(<Home />);
+  render(<Providers />);
 
   // The panel that CAN help is there.
   expect(await screen.findByText("Name your business")).toBeInTheDocument();
