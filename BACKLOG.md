@@ -687,7 +687,7 @@ Postgres on :5435), frontend **259 tests green** (17 files), `ruff` clean, `mypy
 clean on 278 files, `tsc --noEmit` clean. Topmost first, and N1 is first because it is the
 one an owner can see.
 
-- [ ] **N1 · Automation can be RUN but not TURNED ON — nothing writes `automation_settings`**
+- [x] **N1 · Automation can be RUN but not TURNED ON — nothing writes `automation_settings`**
   — the exact inverse of the bug the scheduler commit (`e410d9c`) set out to fix, and the same
   shape: a capability that is complete on one side of the wire and unreachable from the other.
   The worker reads `automation_settings` (cadence, `channels`, `goal_template`, `next_run_at`),
@@ -702,18 +702,32 @@ one an owner can see.
   the arithmetic, so the screen and the worker cannot disagree), turning it OFF stops the
   worker picking it up, and the screen states when the next run is due rather than implying
   it already happened.**
-  **BACKEND HALF LANDED** — `GET`/`PUT /api/v1/automation` (`api/automation.py`) over
-  `services/automation_settings_service.py`, business derived from the session, PUT a full
-  replacement, `nextRunAt` computed on every save and read-only on the wire, off clears the
-  slot as well as the mode, an explicit enable clears a system pause, and the channel rule is
-  now literally the same function `POST /runs` validates against
-  (`specs.canonicalise_known`). 20 tests on real SQL asserting through `due_automations()`
-  itself + 19 hermetic route tests; verified by hand against the dev database. **STILL OPEN,
-  and this box stays unticked for it: there is no SCREEN.** A route an owner cannot reach is
-  the same shape of gap this item was filed for, one layer up — so the remaining work is
-  `frontend/app/automation/` (or a panel on `/dashboard`) reading `knownChannels` /
-  `knownCadences` / `pollIntervalSeconds` from the response rather than restating them, and
-  rendering `nextRunAt` and `pausedReason` verbatim.
+  **CLOSED, both halves.**
+  - **Backend** — `GET`/`PUT /api/v1/automation` (`api/automation.py`) over
+    `services/automation_settings_service.py`, business derived from the session, PUT a full
+    replacement, `nextRunAt` computed on every save and read-only on the wire, off clears the
+    slot as well as the mode, an explicit enable clears a system pause, and the channel rule is
+    now literally the same function `POST /runs` validates against
+    (`specs.canonicalise_known`). 20 tests on real SQL asserting through `due_automations()`
+    itself + 19 hermetic route tests; verified by hand against the dev database.
+  - **Screen** — `frontend/app/automation/page.tsx` + `lib/automation-api.ts`, in the sidebar
+    under Work. The form's whole vocabulary (channels, cadences, goal length, poll interval) is
+    read off the response rather than restated, so a picker cannot offer what the API refuses;
+    `nextRunAt` is rendered and never recomputed from the cadence, which is the reason the API
+    returns it at all; `pausedReason` is rendered verbatim, because the platform's own sentence
+    (with the budget figures in it) beats any summary of it.
+  - **One thing found while building the screen and worth keeping: `isOverdue`.** The worker
+    advances `next_run_at` BEFORE starting a run, so a due timestamp still sitting in the past
+    five poll intervals later means nothing is claiming it — in practice `make worker` is not
+    running. So the panel says "overdue, and here is why" instead of confidently printing a next
+    run that no process will honour. Grace derived from the server's own reported interval, and
+    suppressed while paused (the pause is already the explanation). 20 unit tests on the derived
+    answers, including that a stale timestamp on a PAUSED automation is not reported as overdue.
+  - Honest note on verification: the route was driven end to end against the dev database with a
+    real session, the pure client logic is unit-tested, and the page was loaded in a browser —
+    where it renders and correctly shows the signed-out refusal. The **signed-in** rendering was
+    not verified by me: doing so needs a password entered into the login form, which is not mine
+    to type.
 
 - [x] **N2 · A SCHEDULED run is not subject to the monthly USD cap** — found while verifying
   A7, and it is a money hole rather than a tidy-up. `_require_monthly_headroom` lives in

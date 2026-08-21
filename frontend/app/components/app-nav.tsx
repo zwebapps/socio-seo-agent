@@ -47,6 +47,7 @@ const GROUPS: readonly Group[] = [
     title: "Work",
     items: [
       { href: "/dashboard", label: "Dashboard", hint: "Start a run, see recent ones" },
+      { href: "/automation", label: "Automation", hint: "Let it run on a schedule" },
       { href: "/content", label: "Content", hint: "Posts per channel" },
       { href: "/runs", label: "Runs", hint: "Every run and what it reached" },
       { href: "/leads", label: "Leads", hint: "Who got in touch" },
