@@ -27,57 +27,31 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import { SoftButton } from "@/app/components/soft";
+import { useSession } from "@/app/components/session-context";
 
 /** Screens that ARE the way in, so linking to it from them says nothing. */
 const AUTH_ROUTES = new Set(["/login"]);
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
-type Me = { email: string; role: string };
 
 /** Shared so the signed-in and signed-out bars occupy the same strip. */
 const BAR_CLASS =
   "mx-auto flex w-full max-w-[1800px] flex-wrap items-center justify-end gap-3 px-6 pt-6 lg:px-10 xl:px-14";
 
-type State =
-  | { kind: "loading" }
-  | { kind: "anonymous" }
-  | { kind: "signed-in"; me: Me }
-  | { kind: "leaving" };
-
 export function SessionBar() {
-  const [state, setState] = useState<State>({ kind: "loading" });
+  // The session comes from the provider rather than a fetch of its own: the sidebar
+  // needs the same answer, and two readers each fetching `/auth/me` is two requests for
+  // one fact plus two components that can disagree mid-flight.
+  const { state: session } = useSession();
+  const [leaving, setLeaving] = useState(false);
   const pathname = usePathname();
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const response = await fetch(`${API_URL}/api/v1/auth/me`, {
-          credentials: "include",
-        });
-        if (cancelled) return;
-        if (!response.ok) {
-          // 401 is the ordinary case for a visitor, not an error worth showing.
-          setState({ kind: "anonymous" });
-          return;
-        }
-        setState({ kind: "signed-in", me: (await response.json()) as Me });
-      } catch {
-        // The API being unreachable is the login page's story to tell, not this bar's.
-        if (!cancelled) setState({ kind: "anonymous" });
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   async function signOut() {
-    setState({ kind: "leaving" });
+    setLeaving(true);
     try {
       await fetch(`${API_URL}/api/v1/auth/logout`, {
         method: "POST",
@@ -97,9 +71,9 @@ export function SessionBar() {
 
   // `loading` still renders nothing: flashing "Sign in" at somebody who IS signed in,
   // for one round trip, reads as having been logged out.
-  if (state.kind === "loading") return null;
+  if (session.kind === "loading") return null;
 
-  if (state.kind === "anonymous") {
+  if (session.kind === "anonymous") {
     if (AUTH_ROUTES.has(pathname)) return null;
     return (
       <div className={BAR_CLASS}>
@@ -121,7 +95,7 @@ export function SessionBar() {
     );
   }
 
-  const me = state.kind === "signed-in" ? state.me : null;
+  const me = session.kind === "signed-in" ? session.me : null;
 
   return (
     <div
@@ -139,10 +113,10 @@ export function SessionBar() {
       <SoftButton
         onClick={signOut}
         variant="quiet"
-        disabled={state.kind === "leaving"}
+        disabled={leaving}
         ariaLabel={me ? `Sign out of ${me.email}` : "Sign out"}
       >
-        {state.kind === "leaving" ? "Signing out…" : "Sign out"}
+        {leaving ? "Signing out…" : "Sign out"}
       </SoftButton>
     </div>
   );

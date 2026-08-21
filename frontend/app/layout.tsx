@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 
+import { AppNav } from "@/app/components/app-nav";
 import { SessionBar } from "@/app/components/session-bar";
+import { SessionProvider } from "@/app/components/session-context";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -24,12 +26,30 @@ export default function RootLayout({
     <html lang="en" data-theme="light">
       <body>
         {/*
-          In the root layout so every screen has a way out. Renders nothing for a
-          visitor who is not signed in, so it costs the login and landing pages
-          nothing. See `components/session-bar.tsx` for why it is a client component.
+          One provider, one `/auth/me` read. `SessionBar` and `AppNav` both need to know
+          who is signed in, and two components each fetching it means two requests for
+          one fact on every navigation — plus two components that can disagree while one
+          is still in flight.
         */}
-        <SessionBar />
-        {children}
+        <SessionProvider>
+          {/*
+            In the root layout so every screen has a way out. Renders nothing for a
+            visitor who is not signed in, so it costs the login page nothing. See
+            `components/session-bar.tsx` for why it is a client component.
+          */}
+          <SessionBar />
+          {/*
+            The sidebar sits BESIDE the content rather than above it, and the content
+            column keeps its own `Shell` — so all fifteen existing screens inherit the
+            nav without being edited. `min-w-0` on the column is load-bearing: without
+            it a wide child (a table, a long post body) refuses to shrink and pushes the
+            whole layout into a horizontal scroll.
+          */}
+          <div className="flex">
+            <AppNav />
+            <div className="min-w-0 flex-1">{children}</div>
+          </div>
+        </SessionProvider>
       </body>
     </html>
   );
