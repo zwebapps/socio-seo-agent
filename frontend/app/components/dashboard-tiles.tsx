@@ -89,8 +89,21 @@ function useDashboard(): { state: State; reload: () => void } {
   return { state, reload };
 }
 
-export function DashboardTiles() {
+export function DashboardTiles({ hasBusiness = true }: { hasBusiness?: boolean }) {
   const { state, reload } = useDashboard();
+
+  // A business-less account is NOT an error state, and rendering it as one was the
+  // inverse of the failure this component exists to prevent. `GET /api/v1/dashboard`
+  // sits behind `current_business`, which raises 409 `no_business` when the account owns
+  // none — so the first thing such an owner saw on their own dashboard was
+  // "This account has no business yet. Complete onboarding first." in red, announced
+  // assertively, above the very panel that exists to fix it, beside a "Try again" button
+  // that could never succeed. Not a fabricated measurement; a fabricated failure.
+  //
+  // The caller already knows the answer, so it is passed down rather than inferred from
+  // the error text — matching on a message is how this breaks again the day the wording
+  // changes.
+  if (!hasBusiness) return null;
 
   return (
     <section aria-labelledby="kpi-heading" className="mt-10">

@@ -117,7 +117,12 @@ export default function Home() {
           which is the question an owner opens a dashboard with — and they sit ABOVE the
           two-column split rather than inside it because a tile row squeezed into a
           26rem column is six stacked cards, which is a list, not a row. */}
-      <DashboardTiles />
+      {/* `hasBusiness` is passed rather than left to the tiles to discover: the endpoint
+          409s for an account with no business, and the tiles would render that refusal
+          as a red alert above the panel that fixes it. `setup === null` means the read is
+          still in flight, and defaulting to true there keeps the tiles' own loading
+          state visible instead of flashing them out and back in. */}
+      <DashboardTiles hasBusiness={setup === null ? true : setup.hasBusiness} />
 
       {/* Two columns from `lg`, and the right-hand list gets the extra room at `xl`
           rather than the form growing: a goal input does not read better at 800px, and

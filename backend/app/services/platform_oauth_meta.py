@@ -298,11 +298,15 @@ class MetaOAuthProvider:
         )
         if response.status_code >= 400:
             envelope = _envelope(response)
-            if envelope.code == OAUTH_EXCEPTION_CODE:
-                # Already gone. The protocol promises idempotence, and "the platform has
-                # forgotten this credential" is the state a revoke is trying to reach --
-                # raising here would make `revoke_connection` log a refusal for a
-                # disconnect that is, in substance, complete.
+            # The status is checked as well as the code, and that pairing is the point.
+            # Code 190 on a 4xx means "this credential is already gone", which is the
+            # state a revoke is trying to reach, so the protocol's promise of idempotence
+            # is kept by returning. Code 190 on a 5xx means Meta failed to answer the
+            # question -- and Meta does return an OAuth envelope on 500s. Treating that
+            # as success is worse than any error, because `revoke_connection` then marks
+            # the row REVOKED and discards the local credential: the grant stays live on
+            # the platform and there is nothing left to revoke it with. Ever.
+            if response.status_code < 500 and envelope.code == OAUTH_EXCEPTION_CODE:
                 return
             raise _failure(response, envelope, operation="revoke", platform=self._platform)
 

@@ -444,3 +444,36 @@ it("waits for the read rather than showing an empty dashboard", async () => {
   release?.();
   await waitFor(async () => expect(await tile("Tracked clicks")).toHaveTextContent("1,240"));
 });
+
+it("shows no KPI tiles, and no failure, to an account with no business", async () => {
+  // The endpoint sits behind `current_business`, which 409s when the account owns no
+  // business — so before this the first thing such an owner saw on their own dashboard
+  // was a red, assertively-announced "This account has no business yet" above the very
+  // panel that exists to fix it, beside a "Try again" button that could never succeed.
+  onboarding = { body: { hasBusiness: false, onboarded: false, name: null, website: null } };
+  // The state the suite could not previously express: no business AND the 409 the
+  // endpoint really returns for one. The existing hasBusiness:false test paired it with
+  // a fully-measured 200 body, which cannot happen in production — no business, no
+  // metrics.
+  dashboard = {
+    ok: false,
+    status: 409,
+    body: {
+      detail: {
+        code: "no_business",
+        message: "This account has no business yet. Complete onboarding first.",
+      },
+    },
+  };
+
+  render(<Home />);
+
+  // The panel that CAN help is there.
+  expect(await screen.findByText("Name your business")).toBeInTheDocument();
+  // The one that cannot is not, in any form.
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.queryByText("Where you stand")).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: /try loading your numbers again/i }),
+  ).not.toBeInTheDocument();
+});

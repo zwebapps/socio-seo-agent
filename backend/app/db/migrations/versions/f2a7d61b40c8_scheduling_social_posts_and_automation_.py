@@ -16,7 +16,7 @@ The restricted ``sma_app`` role reaches both through the ``ALTER DEFAULT PRIVILE
 grant installed by ``8ee986b398e9``, so no explicit GRANT is needed here.
 
 Revision ID: f2a7d61b40c8
-Revises: a1c9e4f27b31
+Revises: b3d29f5e7a14
 Create Date: 2026-08-21 12:00:00.000000
 
 """
@@ -30,7 +30,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "f2a7d61b40c8"
-down_revision: Union[str, Sequence[str], None] = "a1c9e4f27b31"
+down_revision: Union[str, Sequence[str], None] = "b3d29f5e7a14"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

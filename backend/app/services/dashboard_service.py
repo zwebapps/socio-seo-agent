@@ -106,11 +106,22 @@ _NO_ANALYTICS_GAP = (
 
 
 async def read_dashboard(business_id: UUID, *, session: AsyncSession) -> DashboardSummary:
-    """One read per tile, all scoped by RLS through the caller's session.
+    """One read per tile.
 
     Raw SQL rather than the ORM, and for one reason: these are six aggregates over five
     tables, and expressing them as ORM queries would fetch rows in order to count them.
-    Every statement is parameterised; ``business_id`` is bound, never formatted in.
+
+    **Tenancy is enforced twice, and the order matters.** The guarantee is row-level
+    security: the caller opens a `business_session(business_id)`, which sets the GUC the
+    policies read, so a row belonging to another business is not visible to these
+    statements at all. The explicit ``business_id = :business_id`` predicate on every
+    statement is the defence in depth BEHIND that, in the same posture `run_store` uses
+    when it scopes to the request's tenant rather than trusting a record's own field.
+
+    It is written that way because the earlier version took ``business_id`` and never
+    used it while this docstring claimed it was bound — so nothing would have noticed if
+    the id handed to this function disagreed with the id the session was opened for, and
+    the next reader was told the tenant was a predicate when it was only a GUC.
     """
     gaps: list[str] = [_NO_ANALYTICS_GAP]
 
@@ -124,10 +135,12 @@ async def read_dashboard(business_id: UUID, *, session: AsyncSession) -> Dashboa
                 SELECT coalesce(channel, 'link_hub') AS channel,
                        sum(click_count)::bigint AS clicks
                 FROM short_links
+                WHERE business_id = :business_id
                 GROUP BY coalesce(channel, 'link_hub')
                 ORDER BY clicks DESC, channel ASC
                 """
-            )
+            ),
+            {"business_id": business_id},
         )
     ).all()
 
@@ -145,7 +158,11 @@ async def read_dashboard(business_id: UUID, *, session: AsyncSession) -> Dashboa
 
     bots = (
         await session.execute(
-            text("SELECT count(*)::bigint AS n FROM link_clicks WHERE is_bot = true")
+            text(
+                "SELECT count(*)::bigint AS n FROM link_clicks "
+                "WHERE business_id = :business_id AND is_bot = true"
+            ),
+            {"business_id": business_id},
         )
     ).scalar_one()
 
@@ -157,16 +174,28 @@ async def read_dashboard(business_id: UUID, *, session: AsyncSession) -> Dashboa
                        count(*) FILTER (WHERE state = 'awaiting_approval')::bigint AS awaiting,
                        count(*) FILTER (WHERE state = 'partial')::bigint AS partial
                 FROM runs
+                WHERE business_id = :business_id
                 """
-            )
+            ),
+            {"business_id": business_id},
         )
     ).one()
 
-    leads = (await session.execute(text("SELECT count(*)::bigint AS n FROM leads"))).scalar_one()
+    leads = (
+        await session.execute(
+            text("SELECT count(*)::bigint AS n FROM leads WHERE business_id = :business_id"),
+            {"business_id": business_id},
+        )
+    ).scalar_one()
 
-    spend = (await session.execute(text("SELECT sum(usd) AS total FROM model_usage"))).scalar_one()
+    spend = (
+        await session.execute(
+            text("SELECT sum(usd) AS total FROM model_usage WHERE business_id = :business_id"),
+            {"business_id": business_id},
+        )
+    ).scalar_one()
 
-    audit, sov, sov_gap = await _from_latest_checkpoint(session)
+    audit, sov, sov_gap = await _from_latest_checkpoint(session, business_id)
 
     if audit is None:
         gaps.append(
@@ -214,6 +243,7 @@ _FAKE_SOV_GAP = (
 
 async def _from_latest_checkpoint(
     session: AsyncSession,
+    business_id: UUID,
 ) -> tuple[dict[str, Any] | None, float | None, str | None]:
     """The SEO audit and share-of-voice from the most recent run that produced them.
 
@@ -244,13 +274,15 @@ async def _from_latest_checkpoint(
                 """
                 SELECT checkpoint
                 FROM runs
-                WHERE checkpoint #> '{facts,site,seo_audit}' IS NOT NULL
-                   OR checkpoint #> '{facts,visibility}' IS NOT NULL
-                   OR checkpoint #> '{measurement,share_of_voice}' IS NOT NULL
+                WHERE business_id = :business_id
+                  AND (checkpoint #> '{facts,site,seo_audit}' IS NOT NULL
+                       OR checkpoint #> '{facts,visibility}' IS NOT NULL
+                       OR checkpoint #> '{measurement,share_of_voice}' IS NOT NULL)
                 ORDER BY created_at DESC
                 LIMIT 25
                 """
-            )
+            ),
+            {"business_id": business_id},
         )
     ).all()
 

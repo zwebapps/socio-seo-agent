@@ -110,6 +110,18 @@ def compute_next_run(
         # would shift every computed slot by the offset, and the answer would still look
         # like a valid schedule.
         raise ValueError("`after` must be timezone-aware; a naive instant has no zone to be in")
+    # The SAME guard for the anchor, and it is not belt-and-braces. `last_run_at` reaches
+    # `astimezone()` further down, where Python treats a naive value as HOST LOCAL TIME —
+    # so a naive anchor makes the fortnightly parity depend on the machine's timezone and
+    # disagree with itself across machines, in the one module whose whole justification is
+    # that it depends on no ambient state. `DateTime(timezone=True)` only protects the
+    # path that comes through asyncpg, and `mypy --strict` cannot help because `datetime`
+    # covers aware and naive alike.
+    if last_run_at is not None and (last_run_at.tzinfo is None or last_run_at.utcoffset() is None):
+        raise ValueError(
+            "`last_run_at` must be timezone-aware; a naive anchor makes the schedule "
+            "depend on the host's timezone"
+        )
     zone = resolve_zone(timezone)
 
     if resolved is Cadence.MONTHLY:

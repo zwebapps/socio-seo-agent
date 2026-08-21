@@ -34,6 +34,20 @@ from backend.app.services.automation_service import (
     resolve_zone,
 )
 
+
+def _repo_root() -> Path:
+    """The repo root, found by walking up to `pyproject.toml`.
+
+    Same helper and same reason as `tests/test_engine_boundary.py`: counting `parents[n]`
+    breaks silently when a file moves, and a cwd-relative path breaks depending on where
+    pytest was invoked from.
+    """
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    raise RuntimeError("could not locate the repo root (no pyproject.toml above this file)")
+
+
 BERLIN = ZoneInfo("Europe/Berlin")
 
 #: Monday=0 .. Sunday=6, matching `date.weekday()`.
@@ -402,7 +416,13 @@ def test_the_module_touches_neither_a_database_nor_the_clock() -> None:
     constraint that admits it is what stops the two drifting. ``db.session`` is the line
     that would turn this into a database module.
     """
-    source = Path("backend/app/services/automation_service.py").read_text(encoding="utf-8")
+    # Anchored on THIS file, not on the working directory. `tests/test_engine_boundary.py`
+    # already learned this the hard way and records it: a cwd-relative path here turns a
+    # purity check into a `FileNotFoundError` the moment pytest is invoked from `backend/`,
+    # and an ERROR reads as "the test is broken" rather than "the module is impure".
+    source = (_repo_root() / "backend/app/services/automation_service.py").read_text(
+        encoding="utf-8"
+    )
     tree = ast.parse(source)
 
     imported: set[str] = set()
@@ -430,3 +450,55 @@ def test_the_module_touches_neither_a_database_nor_the_clock() -> None:
         and node.func.attr in {"now", "utcnow", "today"}
     ]
     assert not clock_reads, f"the scheduler reads the clock: {clock_reads}"
+
+
+def test_a_naive_last_run_at_is_refused_like_a_naive_after() -> None:
+    """The hole the sibling guard left open.
+
+    `after` was hard-refused when naive, with a strong rationale. `last_run_at` then
+    reached `astimezone()` with no check, where Python reads a naive value as HOST LOCAL
+    TIME — so the fortnightly parity flipped by a week depending on the machine's
+    timezone, and disagreed with itself across machines. Demonstrated before the fix:
+    the same arguments gave 2026-09-01 under UTC and 2026-09-08 under Pacific/Auckland.
+    """
+    with pytest.raises(ValueError, match="last_run_at"):
+        compute_next_run(
+            cadence="biweekly",
+            day_of_week=1,
+            hour=9,
+            timezone="Europe/Berlin",
+            after=datetime(2026, 8, 26, 9, 0, tzinfo=UTC),
+            # Naive: no zone to be in.
+            last_run_at=datetime(2026, 8, 25, 23, 0),
+        )
+
+
+def test_an_aware_last_run_at_in_any_zone_gives_the_same_answer() -> None:
+    """The property the guard protects: the same instant expressed in two zones is one
+    instant, so it must produce one schedule.
+
+    Arguments are repeated rather than shared through a dict, because a `**kwargs` dict
+    widens to `dict[str, object]` and `mypy --strict` rejects the unpack — the duplication
+    is what keeps the call site type-checked.
+    """
+    after = datetime(2026, 8, 26, 9, 0, tzinfo=BERLIN)
+
+    as_utc = compute_next_run(
+        cadence="biweekly",
+        day_of_week=TUESDAY,
+        hour=9,
+        timezone="Europe/Berlin",
+        after=after,
+        last_run_at=datetime(2026, 8, 25, 21, 0, tzinfo=UTC),
+    )
+    as_berlin = compute_next_run(
+        cadence="biweekly",
+        day_of_week=TUESDAY,
+        hour=9,
+        timezone="Europe/Berlin",
+        after=after,
+        # 23:00 Berlin IS 21:00 UTC on that date. One instant, two spellings.
+        last_run_at=datetime(2026, 8, 25, 23, 0, tzinfo=BERLIN),
+    )
+
+    assert as_utc == as_berlin

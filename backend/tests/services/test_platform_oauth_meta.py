@@ -508,6 +508,34 @@ async def test_a_revoke_meta_actually_refuses_still_raises() -> None:
     assert raised.value.retryable is True
 
 
+async def test_a_revoke_that_fails_with_an_oauth_code_on_a_5xx_still_raises() -> None:
+    """The gap the sibling test above walked straight past.
+
+    That one uses code=100 on its 500, so it never reaches the "already gone" branch.
+    This one uses code 190 — the OAuth-exception code — ON a 500, which is a shape Meta
+    genuinely returns, and the branch was gated on the code alone.
+
+    Swallowing it is the worst possible outcome and not merely a wrong log line:
+    `revoke_connection` marks the row REVOKED and wipes the stored credential, so a
+    grant that is still live on Meta is left with nothing that could ever revoke it.
+    """
+    wire = Wire([_error(500, type_="OAuthException", code=190)])
+
+    with pytest.raises(OAuthError) as raised:
+        await _provider(wire).revoke(Secret(LONG_LIVED))
+
+    assert raised.value.retryable is True, "a 5xx is worth another attempt"
+
+
+async def test_a_revoke_of_an_already_forgotten_credential_is_idempotent() -> None:
+    """Code 190 on a 4xx IS "already gone", and the protocol promises idempotence: the
+    state a revoke wants has been reached, so raising would report a refusal for a
+    disconnect that is in substance complete."""
+    wire = Wire([_error(400, type_="OAuthException", code=190)])
+
+    await _provider(wire).revoke(Secret(LONG_LIVED))  # must not raise
+
+
 # --------------------------------------------------------------------------- #
 # Selection: which provider a platform actually gets
 # --------------------------------------------------------------------------- #
