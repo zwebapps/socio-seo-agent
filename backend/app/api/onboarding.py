@@ -31,6 +31,7 @@ from backend.app.services.onboarding_service import (
     BusinessNotFoundError,
     ThinSiteError,
     draft_dna_from_website,
+    read_onboarding_state,
     save_confirmed_dna,
 )
 
@@ -182,6 +183,38 @@ async def confirm(
         services=list(stored.get("services") or []),
         banned_claims=list(stored.get("banned_claims") or []),
     )
+
+
+class StateResponse(CamelModel):
+    """Whether this business has a confirmed profile yet."""
+
+    onboarded: bool
+    name: str | None
+    website: str | None
+
+
+@router.get(
+    "",
+    response_model=StateResponse,
+    response_model_by_alias=True,
+    summary="Whether this business has confirmed a Business DNA yet",
+)
+async def state(
+    business_id: Annotated[UUID, Depends(current_business)],
+    open_session: Annotated[Any, Depends(get_business_session_opener)],
+) -> StateResponse:
+    """The read the dashboard needs in order to lead with the right thing.
+
+    Nothing exposed this, and the consequence was on the first screen every new owner
+    sees: the homepage led with "Start a run" and listed "Onboard a business" fifth,
+    under a heading called "Elsewhere" -- while a run without a confirmed DNA cannot do
+    anything at all. INTAKE exits immediately with "no business profile", by design
+    ("ask, never guess"). So the product's own first instruction was the one step it
+    could not yet take, and the screen had no way to know.
+    """
+    async with open_session(business_id) as session:
+        result = await read_onboarding_state(business_id, session=session)
+    return StateResponse(onboarded=result.onboarded, name=result.name, website=result.website)
 
 
 def _error(code: str, message: str) -> dict[str, str]:

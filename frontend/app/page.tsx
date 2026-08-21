@@ -38,6 +38,7 @@ import { Shell } from "@/app/components/page-shell";
 import { RunRows, useRuns } from "@/app/components/run-rows";
 import { Pill, SoftButton, SoftCard } from "@/app/components/soft";
 import { StartRunForm } from "@/app/components/start-run";
+import { fetchOnboardingState } from "@/app/lib/api";
 import { RECENT_RUNS } from "@/app/lib/runs-api";
 
 /** Shape returned by GET /api/v1/health. */
@@ -57,6 +58,27 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
 export default function Home() {
   const { state: runs, live, reload } = useRuns(RECENT_RUNS);
+  // `null` while unknown, which is NOT the same as `false`. Rendering "onboard first"
+  // during the round trip would flash a setup prompt at an owner who onboarded months
+  // ago, so the prompt waits for an answer and the page shows its normal self meanwhile.
+  const [onboarded, setOnboarded] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    void fetchOnboardingState()
+      .then((state) => {
+        if (live) setOnboarded(state.onboarded);
+      })
+      // Swallowed deliberately: this read only decides which of two panels leads. If it
+      // fails the page keeps working exactly as it did before the read existed, and the
+      // BackendStatus element at the bottom is what reports an unreachable API.
+      .catch(() => {
+        if (live) setOnboarded(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
 
   return (
     <Shell className="py-14">
@@ -81,8 +103,16 @@ export default function Home() {
       <div className="mt-10 grid items-start gap-10 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(0,30rem)_minmax(0,1fr)] lg:gap-14 xl:gap-20">
         {/* Left: the thing to DO. */}
         <div>
+          {onboarded === false && <OnboardFirst />}
+
           <SoftCard className="p-6" size="lg">
             <h2 className="text-sm font-semibold">Start a run</h2>
+            {onboarded === false && (
+              <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+                A run needs the profile above first — without one it stops at its first
+                step and tells you the business profile is missing.
+              </p>
+            )}
             <StartRunForm />
           </SoftCard>
 
@@ -114,10 +144,18 @@ export default function Home() {
                 title="Platform accounts"
                 blurb="Which accounts are connected, and whether a publish step would actually be accepted."
               />
+              {/* Still listed when the business IS onboarded — re-running it is how you
+                  correct a profile after the site changes. When it is NOT, `OnboardFirst`
+                  above is the one that leads, and this row is the second mention rather
+                  than the only one. */}
               <NavRow
                 href="/onboard"
-                title="Onboard a business"
-                blurb="Paste a website URL and let it read the business for itself."
+                title={onboarded === false ? "Onboard a business" : "Business profile"}
+                blurb={
+                  onboarded === false
+                    ? "Paste a website URL and let it read the business for itself."
+                    : "Re-read the website and correct what the agent believes about the business."
+                }
               />
             </ul>
           </nav>
@@ -168,6 +206,44 @@ export default function Home() {
 
       <BackendStatus />
     </Shell>
+  );
+}
+
+/**
+ * The setup step, promoted to the top of the page when it has not been done.
+ *
+ * It is not a banner and not a toast: it is the first card, because it is the first
+ * thing to do. Everything downstream reads the profile it writes — HARVEST crawls
+ * `website`, the regulated-claim gate enforces `banned_claims`, and INTAKE refuses to
+ * proceed without a `name` rather than inventing one.
+ */
+function OnboardFirst() {
+  return (
+    <SoftCard className="mb-6 p-6" size="lg">
+      <p
+        className="text-[11px] font-semibold uppercase tracking-[0.18em]"
+        style={{ color: "var(--accent)" }}
+      >
+        Start here
+      </p>
+      <h2 className="mt-2 text-sm font-semibold">Onboard your business</h2>
+      <p className="mt-2 text-sm" style={{ color: "var(--text-muted)" }}>
+        Paste your website and the agent reads it into a profile you confirm or correct.
+        Everything after this depends on it: which site gets audited, which claims are
+        forbidden, and what the posts are allowed to say.
+      </p>
+      <Link
+        href="/onboard"
+        className="soft-edge mt-4 inline-flex items-center px-4 py-2 text-xs font-semibold"
+        style={{
+          borderRadius: "var(--r-pill)",
+          background: "var(--primary)",
+          color: "var(--primary-ink)",
+        }}
+      >
+        Onboard your business
+      </Link>
+    </SoftCard>
   );
 }
 

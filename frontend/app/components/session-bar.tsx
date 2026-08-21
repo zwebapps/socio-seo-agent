@@ -13,17 +13,34 @@
  * cookie-bearing write that arrives with no `Origin` header, and `fetch` from a server
  * component sends none -- the same reason `app/lib/admin-api.ts` carries that warning.
  *
- * It renders NOTHING when nobody is signed in. A "Sign out" button on the login screen
- * is noise at best, and at worst it suggests the session outlived a logout that worked.
+ * When nobody is signed in it offers the way IN. It used to render nothing at all, and
+ * the consequence was the same shape of gap the sign-out control had: `/login` was linked
+ * from nowhere in the entire app, so a visitor who arrived at the dashboard signed out saw
+ * a screen of failed reads with no way to fix it, and had to know to type `/login` in the
+ * address bar. The old note here — that a "Sign out" button on the login screen is noise —
+ * was right about SIGN OUT and is why that button is still suppressed for a visitor; it
+ * was never a reason to hide the entrance.
+ *
+ * It stays silent on the auth screens themselves, where a "Sign in" link pointing at the
+ * page you are already on is the noise the original note was about.
  */
 
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { SoftButton } from "@/app/components/soft";
 
+/** Screens that ARE the way in, so linking to it from them says nothing. */
+const AUTH_ROUTES = new Set(["/login"]);
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
 type Me = { email: string; role: string };
+
+/** Shared so the signed-in and signed-out bars occupy the same strip. */
+const BAR_CLASS =
+  "mx-auto flex w-full max-w-[1800px] flex-wrap items-center justify-end gap-3 px-6 pt-6 lg:px-10 xl:px-14";
 
 type State =
   | { kind: "loading" }
@@ -33,6 +50,7 @@ type State =
 
 export function SessionBar() {
   const [state, setState] = useState<State>({ kind: "loading" });
+  const pathname = usePathname();
 
   useEffect(() => {
     let cancelled = false;
@@ -77,13 +95,37 @@ export function SessionBar() {
     window.location.href = "/login";
   }
 
-  if (state.kind === "loading" || state.kind === "anonymous") return null;
+  // `loading` still renders nothing: flashing "Sign in" at somebody who IS signed in,
+  // for one round trip, reads as having been logged out.
+  if (state.kind === "loading") return null;
+
+  if (state.kind === "anonymous") {
+    if (AUTH_ROUTES.has(pathname)) return null;
+    return (
+      <div className={BAR_CLASS}>
+        <span className="text-sm" style={{ color: "var(--text-muted)" }}>
+          You are not signed in.
+        </span>
+        <Link
+          href="/login"
+          className="soft-edge inline-flex items-center px-4 py-2 text-xs font-semibold"
+          style={{
+            borderRadius: "var(--r-pill)",
+            background: "var(--primary)",
+            color: "var(--primary-ink)",
+          }}
+        >
+          Sign in or create an account
+        </Link>
+      </div>
+    );
+  }
 
   const me = state.kind === "signed-in" ? state.me : null;
 
   return (
     <div
-      className="mx-auto flex w-full max-w-[1800px] flex-wrap items-center justify-end gap-3 px-6 pt-6 lg:px-10 xl:px-14"
+      className={BAR_CLASS}
       // `aria-live` so the sign-out transition is announced rather than silently
       // replacing the row a screen-reader user was on.
       aria-live="polite"

@@ -93,6 +93,24 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+export type OnboardingState = {
+  onboarded: boolean;
+  name: string | null;
+  website: string | null;
+};
+
+/**
+ * Whether this business has confirmed a profile yet.
+ *
+ * The dashboard needs it to decide what to lead with. A run without a confirmed DNA
+ * cannot do anything — INTAKE exits with "no business profile" by design — so a screen
+ * that offers "Start a run" first to a business with no profile is offering the one
+ * action that cannot work.
+ */
+export function fetchOnboardingState(): Promise<OnboardingState> {
+  return request<OnboardingState>("/api/v1/onboarding");
+}
+
 export async function previewOnboarding(url: string): Promise<PreviewResponse> {
   let response: Response;
   try {

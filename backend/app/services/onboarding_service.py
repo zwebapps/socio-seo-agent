@@ -295,6 +295,49 @@ class BusinessNotFoundError(LookupError):
         super().__init__(f"No business {business_id}")
 
 
+class OnboardingState(BaseModel):
+    """Whether this business has been onboarded, and the little a caller needs to say so.
+
+    Deliberately NOT the whole DNA. The screens that want the profile itself already have
+    `GET /api/v1/memory`; this answers one question -- "is there a business here yet" --
+    and a route that returned the full profile to answer it would invite a second reader
+    of `businesses.dna` with its own idea of what "onboarded" means.
+    """
+
+    onboarded: bool
+    name: str | None = None
+    website: str | None = None
+
+
+async def read_onboarding_state(business_id: UUID, *, session: AsyncSession) -> OnboardingState:
+    """Has this business confirmed a DNA?
+
+    Keyed on ``businesses.website``, which `save_confirmed_dna` writes as a first-class
+    column for exactly this reason -- its own comment says the column exists so "which
+    businesses have we crawled" is a query rather than a JSONB dig. So the answer here is
+    a column read, and it cannot drift from the write that sets it.
+
+    ``website`` is the right key rather than "is `dna` non-empty", and the difference is
+    reachable: `memory_service.remember` writes `dna["preferences"]` for a business that
+    has never been onboarded, so a non-empty `dna` does NOT mean a confirmed profile. A
+    website means the confirm step ran.
+
+    A missing business reads as not onboarded rather than raising. The caller is a screen
+    asking what to show next, and 404 for a session whose business row is gone would turn
+    a navigation hint into an error page.
+    """
+    statement = select(Business).where(Business.id == business_id)
+    business = (await session.execute(statement)).scalar_one_or_none()
+    if business is None:
+        return OnboardingState(onboarded=False)
+    website = (business.website or "").strip()
+    return OnboardingState(
+        onboarded=bool(website),
+        name=str((business.dna or {}).get("name") or "").strip() or None,
+        website=website or None,
+    )
+
+
 async def save_confirmed_dna(
     business_id: UUID,
     *,
