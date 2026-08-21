@@ -9,9 +9,16 @@
  * see a single captured lead — every one of those endpoints existed and worked, and nothing
  * on any screen called them.
  *
- * So the page now answers the three questions an owner actually has, in the order they have
- * them: **what should the agent work on** (start a run), **what has it been doing** (recent
- * runs, with their real state), and **what did it earn me** (leads).
+ * So the page now answers the questions an owner actually has, in the order they have them:
+ * **how is it going** (the KPI tile row), **what should the agent work on** (start a run),
+ * **what has it been doing** (recent runs, with their real state), and **what did it earn
+ * me** (leads).
+ *
+ * The tile row is `components/dashboard-tiles.tsx`, and the reason it is a separate module
+ * rather than six blocks here is the rule it carries: an unmeasured metric must render as a
+ * sentence, never as `0` and never as a dash. That is enforced by a required prop on the
+ * tile, which only works if there is exactly one tile component — six inline copies is six
+ * chances for the next number added to this page to quietly report nought.
  *
  * A client component, and it has to be. Every call it makes carries the session cookie, and
  * the API's Origin-CSRF guard refuses a cookie-bearing request that arrives with no `Origin`
@@ -34,6 +41,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useId, useState } from "react";
 
+import { DashboardTiles } from "@/app/components/dashboard-tiles";
 import { Shell } from "@/app/components/page-shell";
 import { RunRows, useRuns } from "@/app/components/run-rows";
 import { Pill, SoftButton, SoftCard, SoftInput } from "@/app/components/soft";
@@ -105,10 +113,16 @@ export default function Home() {
         hands it back to you to approve.
       </p>
 
+      {/* The numbers first, full width. They are the answer to "how is this going",
+          which is the question an owner opens a dashboard with — and they sit ABOVE the
+          two-column split rather than inside it because a tile row squeezed into a
+          26rem column is six stacked cards, which is a list, not a row. */}
+      <DashboardTiles />
+
       {/* Two columns from `lg`, and the right-hand list gets the extra room at `xl`
           rather than the form growing: a goal input does not read better at 800px, and
           a list of runs with wrapped goals and stop-reasons does. */}
-      <div className="mt-10 grid items-start gap-10 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(0,30rem)_minmax(0,1fr)] lg:gap-14 xl:gap-20">
+      <div className="mt-12 grid items-start gap-10 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(0,30rem)_minmax(0,1fr)] lg:gap-14 xl:gap-20">
         {/* Left: the thing to DO. */}
         <div>
           {needsOnboarding && <OnboardFirst />}
