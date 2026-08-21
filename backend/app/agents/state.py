@@ -27,12 +27,23 @@ Design notes worth keeping:
   first checkpoint is `NotRequired` and :func:`from_checkpoint` supplies the default.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from pydantic import BaseModel
+
+from backend.app.engines.channel.specs import canonical_channel, has_spec
+
+#: The channels a run renders posts for when nobody chose.
+#:
+#: It lives HERE rather than in `agents.nodes` where it used to, because the channel
+#: set is now per-run state and `state.py` cannot import from `nodes` -- `nodes`
+#: imports this module. `nodes` re-exports the name, so importers of
+#: `agents.nodes.DEFAULT_CHANNELS` are unaffected.
+DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
 
 # From docs/AGENT_RUNTIME.md section 8. Named constants rather than literals at the
 # call sites, so the documented numbers and the enforced ones cannot drift.
@@ -132,6 +143,18 @@ class AgentState(TypedDict):
     #: already paid for. `from_checkpoint` supplies `None`; the executor then stamps the
     #: id it fetched the row by, so a pre-key checkpoint resumes fully attributed.
     run_id: NotRequired[str | None]
+    #: The channels THIS run renders posts for, chosen by the caller.
+    #:
+    #: It is state rather than a `NodeDeps` field, and that is the point of the key:
+    #: as a dependency it was rebuilt from the default on every resume, so a run
+    #: started for LinkedIn alone came back from a checkpoint targeting all three.
+    #: The channel set is a property of the run, the checkpoint is the run's single
+    #: source of truth, so it belongs in the checkpoint.
+    #:
+    #: `NotRequired` for the same reason as `run_id`: it postdates checkpoints already
+    #: written, and `from_checkpoint` supplies the default rather than letting a run
+    #: fail to resume over a field a default answers correctly.
+    channels: NotRequired[list[str]]
 
     # Set at INTAKE, carried everywhere after.
     dna: dict[str, Any]
@@ -238,6 +261,7 @@ def new_state(
     remembered: list[str] | None = None,
     caps: RunCaps | None = None,
     run_id: str | UUID | None = None,
+    channels: Sequence[str] | None = None,
 ) -> AgentState:
     """A fresh run.
 
@@ -253,6 +277,7 @@ def new_state(
         run_id=str(run_id) if run_id is not None else None,
         goal=goal,
         surfaces=surfaces if surfaces is not None else ["google"],
+        channels=normalise_channels(channels),
         dna=dna or {},
         remembered=remembered or [],
         facts={},
@@ -304,6 +329,50 @@ def _valid_run_id(raw: object) -> str | None:
     """The checkpoint form of :func:`parse_run_id`: a canonical string, or ``None``."""
     parsed = parse_run_id(raw)
     return str(parsed) if parsed is not None else None
+
+
+def normalise_channels(raw: object) -> list[str]:
+    """``raw`` as a usable channel list, or the default set.
+
+    One normaliser, so the API validator, `new_state` and the checkpoint reader cannot
+    disagree about what counts as a channel. Three rules, and each has a reason:
+
+    * **Unknown channels are dropped, not carried.** A channel with no entry in
+      ``engines/channel/specs.py`` cannot be length- or link-checked, which is already
+      why ``actuators/social.py`` refuses one. Carrying it would produce a post nothing
+      could validate.
+    * **Names are canonicalised**, so ``facebook_post`` and ``facebook`` are one
+      channel rather than two renderings of the same post.
+    * **Empty normalises to the default set.** A run targeting nothing would pass
+      VALIDATE, reach REPACK and render zero posts -- a silently empty deliverable.
+      The default is the honest answer to "the caller did not choose".
+
+    Order is the caller's, deduplicated, because it is the order the review screen and
+    the export pack list the posts in.
+
+    Only a list or a tuple is accepted, which is narrower than "iterable" and
+    deliberately so: this value arrives from a JSONB column, where an array is the only
+    thing that legitimately deserialises here, and the two iterables that are NOT
+    arrays both fail interestingly. A bare ``"linkedin"`` would iterate into the
+    channels ``l``, ``i``, ``n``, ...; a ``{"linkedin": true}`` would be key-mined into
+    a real channel and so would look correct while proving nothing about the column.
+    Both are malformed, and malformed reads as "nobody chose".
+    """
+    if not isinstance(raw, list | tuple):
+        return list(DEFAULT_CHANNELS)
+    seen: dict[str, None] = {}
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        channel = canonical_channel(entry.strip())
+        if channel and has_spec(channel):
+            seen[channel] = None
+    return list(seen) if seen else list(DEFAULT_CHANNELS)
+
+
+def channels_of(state: AgentState) -> tuple[str, ...]:
+    """This run's channels, defaulted. The one reader every node uses."""
+    return tuple(normalise_channels(state.get("channels")))
 
 
 def run_uuid(state: AgentState) -> UUID | None:
@@ -421,6 +490,10 @@ def from_checkpoint(payload: dict[str, Any]) -> AgentState:
     # which is exactly what a pre-key checkpoint means, and the executor overwrites it
     # with the id it fetched the row by anyway.
     restored["run_id"] = _valid_run_id(payload.get("run_id"))
+    # Same rule again for `channels`: a pre-key checkpoint has none, and a stored list
+    # can hold a channel whose spec has since been removed. Normalising on the way in
+    # means a resumed run renders for channels that can actually be validated.
+    restored["channels"] = normalise_channels(payload.get("channels"))
     # The payload came from JSON, so the static type is a promise about what
     # to_checkpoint wrote, not a fact the checker can verify. One cast, named.
     return cast("AgentState", restored)

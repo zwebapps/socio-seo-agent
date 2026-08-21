@@ -216,6 +216,13 @@ class Run(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin):
     __tablename__ = "runs"
 
     goal: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The channels this run renders posts for. Stored on the run, not derived at
+    #: execution time, because the answer must not change under a resume -- and
+    #: "which channels did this run target" has to stay answerable in SQL after the
+    #: default set changes.
+    channels: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
     state: Mapped[str] = mapped_column(
         String(32), default="queued", server_default="queued", nullable=False, index=True
     )

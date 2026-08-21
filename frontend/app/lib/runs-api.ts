@@ -243,12 +243,30 @@ export function canReject(state: string): boolean {
  * `surfaces` is left off the body on purpose so the server's own default applies. Sending a
  * copy of a default from the client is how the two drift.
  */
-export function startRun(goal: string): Promise<StartedRun> {
+export function startRun(goal: string, channels?: readonly string[]): Promise<StartedRun> {
   return request<StartedRun>("/api/v1/runs", {
     method: "POST",
-    body: JSON.stringify({ goal }),
+    // `channels` is omitted rather than sent empty when nobody chose. The API reads an
+    // absent field as "use the default set" and records `[]` on the row, which keeps
+    // "nobody chose" distinguishable from "chose all three" — sending `[]` explicitly
+    // would be the same request with a claim attached to it.
+    body: JSON.stringify(channels && channels.length > 0 ? { goal, channels } : { goal }),
   });
 }
+
+/**
+ * The channels a run can render posts for, and the label each one gets.
+ *
+ * Mirrors `CHANNEL_SPECS` in `backend/app/engines/channel/specs.py`, restricted to the
+ * three the product renders by default. It is a short list rather than a fetch because
+ * the API refuses an unknown channel by name — so the failure mode of drift here is a
+ * 422 the form shows verbatim, not a silently dropped channel.
+ */
+export const RUN_CHANNELS = [
+  { id: "linkedin", label: "LinkedIn" },
+  { id: "facebook", label: "Facebook" },
+  { id: "instagram", label: "Instagram" },
+] as const;
 
 /** The API's own bounds on a goal, so the form can refuse early and say why. */
 export const GOAL_MIN = 3;

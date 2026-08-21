@@ -762,7 +762,18 @@ class RunExecutor:
         resume: bool,
     ) -> AgentState:
         if not resume:
-            return new_state(business_id=business_id, goal=goal, run_id=run_id)
+            # Channels come from the ROW, not from a parameter, and deliberately so.
+            # `submit` is also what the scheduled worker calls, and a job payload that
+            # has to carry the channel set is a payload that can disagree with the row
+            # it names. One primary-key read per fresh run buys "the run targets what
+            # the row says it targets", which stays true however the run was started.
+            record = await service.get(run_id)
+            return new_state(
+                business_id=business_id,
+                goal=goal,
+                run_id=run_id,
+                channels=record.channels if record is not None else None,
+            )
 
         restored = await service.restore(run_id)
         if restored is None:

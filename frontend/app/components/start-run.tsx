@@ -31,19 +31,23 @@ import { useId, useState } from "react";
 
 import { SoftButton, SoftInput } from "@/app/components/soft";
 import { ApiError } from "@/app/lib/api";
-import { GOAL_MAX, GOAL_MIN, startRun } from "@/app/lib/runs-api";
+import { GOAL_MAX, GOAL_MIN, RUN_CHANNELS, startRun } from "@/app/lib/runs-api";
 
 export function StartRunForm() {
   const router = useRouter();
   const [goal, setGoal] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Every channel selected initially, which is exactly what every run did before this
+  // control existed: the form starts at the previous behaviour rather than at nothing.
+  const [channels, setChannels] = useState<string[]>(() => RUN_CHANNELS.map((c) => c.id));
 
   // `useId` rather than a hard-coded string: this form is on the dashboard today and could
   // sit beside another instance tomorrow, and two inputs sharing an id bind the visible
   // label to the wrong one. That exact bug is documented on `SoftRange.controlId`.
   const inputId = useId();
   const hintId = useId();
+  const channelsHintId = useId();
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -54,10 +58,19 @@ export function StartRunForm() {
       return;
     }
 
+    // Refused rather than treated as "all of them". The API reads an empty channel set
+    // as "nobody chose" and falls back to the default three, so submitting none would
+    // quietly produce posts for every channel — the opposite of what unticking them all
+    // looks like it asks for.
+    if (channels.length === 0) {
+      setError("Choose at least one channel to post to.");
+      return;
+    }
+
     setSubmitting(true);
     setError(null);
     try {
-      const started = await startRun(trimmed);
+      const started = await startRun(trimmed, channels);
       // A router push, not `window.location`: the session and the fetched state on the run
       // page belong to the same account, so there is nothing to tear down — unlike sign-out,
       // where the full navigation is deliberate.
@@ -103,6 +116,62 @@ export function StartRunForm() {
           {submitting ? "Starting…" : "Start a run"}
         </SoftButton>
       </div>
+
+      <fieldset className="mt-4">
+        <legend
+          className="text-[11px] font-semibold uppercase tracking-wider"
+          style={{ color: "var(--text-muted)" }}
+        >
+          Post to
+        </legend>
+        <div className="mt-2 flex flex-wrap gap-2" aria-describedby={channelsHintId}>
+          {RUN_CHANNELS.map((channel) => {
+            const on = channels.includes(channel.id);
+            return (
+              <label key={channel.id} className="soft-choice cursor-pointer">
+                {/*
+                  A real checkbox, visually hidden rather than replaced: it carries the
+                  checked state, the keyboard behaviour and the screen-reader semantics
+                  for free, and `.soft-choice` in globals.css moves its focus ring onto
+                  the pill. A div with an onClick would have to reimplement all four.
+                */}
+                <input
+                  type="checkbox"
+                  className="sr-only"
+                  checked={on}
+                  onChange={() => {
+                    setChannels((current) =>
+                      current.includes(channel.id)
+                        ? current.filter((id) => id !== channel.id)
+                        : // Rebuilt in RUN_CHANNELS order, not append order, so the run
+                          // records the channels in the order the review screen lists
+                          // them however they were clicked.
+                          RUN_CHANNELS.filter(
+                            (c) => c.id === channel.id || current.includes(c.id),
+                          ).map((c) => c.id),
+                    );
+                    if (error) setError(null);
+                  }}
+                />
+                <span
+                  className="soft-edge inline-flex items-center px-3.5 py-1.5 text-xs font-semibold"
+                  style={{
+                    borderRadius: "var(--r-pill)",
+                    background: on ? "var(--primary)" : "var(--surface-raised)",
+                    color: on ? "var(--primary-ink)" : "var(--text-muted)",
+                  }}
+                >
+                  {channel.label}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        <p id={channelsHintId} className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
+          The article and the SEO work happen either way — this chooses which channels get
+          a post written for them.
+        </p>
+      </fieldset>
 
       <p id={hintId} className="mt-2.5 text-xs" style={{ color: "var(--text-muted)" }}>
         A run takes a few minutes. You will land on its timeline and can leave the page —

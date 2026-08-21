@@ -756,6 +756,17 @@ def _client_with_executor(service: RunService, executor: _RecordingExecutor) -> 
     app.dependency_overrides[runs_api.get_run_service] = lambda: service
     app.dependency_overrides[runs_api.current_business] = lambda: BUSINESS
     app.dependency_overrides[runs_api.get_executor] = lambda: executor
+    # The spend reader is faked here rather than left real, and it is not a convenience.
+    # Unoverridden it is `monthly_spend_usd`, a live `model_usage` read -- so every test
+    # that posted a run through this helper opened a Postgres connection, and the pool
+    # binds to whichever test's event loop reached it first. Every later test in the
+    # module then failed with "attached to a different loop", which is the shared-table
+    # db-suite pollution BACKLOG.md section D records, arriving in a route test that has
+    # no reason to touch a database at all. Zero spend is also the honest fixture: these
+    # tests are about the run lifecycle, and the ceiling has its own tests below.
+    # `_spend` is defined further down, beside the ceiling tests it was written for;
+    # the lambda body runs per request, so the forward reference resolves.
+    app.dependency_overrides[runs_api.get_monthly_spend_reader] = lambda: _spend("0")
     from backend.app.api.auth import current_user
 
     app.dependency_overrides[current_user] = _user
@@ -778,6 +789,72 @@ async def test_starting_a_run_submits_it_for_execution() -> None:
     assert response.status_code == 202
     run_id = UUID(response.json()["runId"])
     assert executor.submitted == [(run_id, BUSINESS, "more local leads", False)]
+
+
+async def test_a_run_records_the_channels_the_caller_chose() -> None:
+    """The seam that existed and could not be reached.
+
+    `NodeDeps.channels` was injectable from the first day the nodes were written, and
+    the one production construction site never passed it -- so the system looked
+    configurable and rendered the same three channels for every business.
+    """
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post(
+            "/api/v1/runs", json={"goal": "more local leads", "channels": ["linkedin"]}
+        )
+
+    assert response.status_code == 202
+    run = await service.get(UUID(response.json()["runId"]))
+    assert run is not None
+    assert run.channels == ["linkedin"]
+
+
+async def test_omitting_channels_records_none_rather_than_guessing_the_default() -> None:
+    """Empty on the row means "nobody chose", which is not the same fact as a caller
+    choosing all three. The executor resolves it at `new_state`, so the distinction
+    survives in the row and the default can change without rewriting history."""
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post("/api/v1/runs", json={"goal": "more local leads"})
+
+    run = await service.get(UUID(response.json()["runId"]))
+    assert run is not None
+    assert run.channels == []
+
+
+async def test_an_unknown_channel_is_refused_by_name_rather_than_dropped() -> None:
+    """A silent drop would look like a successful run that simply produced nothing for
+    the channel asked for, and the caller would have no way to tell."""
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post(
+            "/api/v1/runs",
+            json={"goal": "more local leads", "channels": ["linkedin", "threads"]},
+        )
+
+    assert response.status_code == 422
+    assert "threads" in response.text
+
+
+async def test_a_channel_alias_is_canonicalised_not_treated_as_a_second_channel() -> None:
+    """`engines/channel/specs.py` exists because two tables of channel names
+    disagreed; accepting both spellings as separate channels would rebuild that."""
+    service = RunService(InMemoryRunStore())
+
+    async with _client_with_executor(service, _RecordingExecutor()) as client:
+        response = await client.post(
+            "/api/v1/runs",
+            json={"goal": "more local leads", "channels": ["facebook_post", "facebook"]},
+        )
+
+    assert response.status_code == 202
+    run = await service.get(UUID(response.json()["runId"]))
+    assert run is not None
+    assert run.channels == ["facebook"]
 
 
 async def test_resuming_a_stalled_run_submits_it_with_resume_set() -> None:

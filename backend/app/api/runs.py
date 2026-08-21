@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.auth import CurrentUser
 from backend.app.core.config import get_settings
 from backend.app.db.adapters.run_store import PostgresRunStore
+from backend.app.engines.channel.specs import CHANNEL_SPECS, canonical_channel, has_spec
 from backend.app.llm.pricing import format_usd
 from backend.app.services.cost_service import (
     MONTHLY_CAP_WINDOW_DAYS,
@@ -247,6 +248,42 @@ class CamelModel(BaseModel):
 class StartRunRequest(BaseModel):
     goal: str = Field(min_length=3, max_length=500)
     surfaces: list[str] = Field(default_factory=lambda: ["google"])
+    #: Which channels to render posts for. Omitted or empty means the default set,
+    #: which is what every run did before this field existed.
+    channels: list[str] | None = None
+
+    @field_validator("channels")
+    @classmethod
+    def _known_channels(cls, value: list[str] | None) -> list[str] | None:
+        """Refuse an unknown channel rather than dropping it.
+
+        A 422 naming the channel, not a silent drop, and the difference matters to the
+        caller: a request for `["linkedin", "threads"]` that quietly rendered LinkedIn
+        alone would look like a successful run that simply produced nothing for
+        Threads. A channel with no entry in `engines/channel/specs.py` cannot be
+        length- or link-checked, which is already why `actuators/social.py` refuses
+        one, so accepting it here would only defer the refusal to a point where it
+        costs a model call.
+
+        Canonicalised on the way through, so `facebook_post` and `facebook` are one
+        channel rather than two renderings of the same post.
+        """
+        if value is None:
+            return None
+        canonical: list[str] = []
+        unknown: list[str] = []
+        for raw in value:
+            channel = canonical_channel(raw.strip())
+            if channel and has_spec(channel):
+                canonical.append(channel)
+            else:
+                unknown.append(raw.strip() or raw)
+        if unknown:
+            known = ", ".join(sorted(CHANNEL_SPECS))
+            raise ValueError(f"unknown channel(s): {', '.join(unknown)}. Known: {known}")
+        # Deduplicated, order preserved: it is the order the review screen and the
+        # export pack list the posts in.
+        return list(dict.fromkeys(canonical))
 
 
 class StartRunResponse(CamelModel):
@@ -364,7 +401,7 @@ async def start_run(
     # and then discovers it should not have.
     await _require_monthly_headroom(business_id, spend)
 
-    run = await service.start(business_id=business_id, goal=payload.goal)
+    run = await service.start(business_id=business_id, goal=payload.goal, channels=payload.channels)
     # 202 and then work in the background. Before this, the row was created and
     # nothing ever advanced it: `run_graph` was reachable only from tests, so a
     # started run stayed `queued` forever and the timeline had nothing to show.

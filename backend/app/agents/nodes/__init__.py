@@ -39,7 +39,7 @@ no change here.
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Final, NamedTuple, get_args
 from uuid import UUID
@@ -72,7 +72,13 @@ from backend.app.agents.nodes.prompts import (
     fence,
     system,
 )
-from backend.app.agents.state import AgentState, NodeError, run_uuid
+from backend.app.agents.state import (
+    DEFAULT_CHANNELS,
+    AgentState,
+    NodeError,
+    channels_of,
+    run_uuid,
+)
 from backend.app.agents.tools import (
     CHANNEL_VALIDATE,
     CLAIMS_CHECK,
@@ -141,7 +147,6 @@ Node = Callable[[AgentState], Awaitable[dict[str, Any]]]
 #: target is not enforcement. Being over the target is REPORTED instead (see `repack`).
 CHANNEL_LIMITS: Mapping[str, int] = hard_char_limits()
 
-DEFAULT_CHANNELS: tuple[str, ...] = ("linkedin", "facebook", "instagram")
 
 #: The bio-link hub always gets its own CTA, whatever channels a run renders posts
 #: for. docs/CHANNELS.md section 1: an Instagram feed caption and a TikTok caption
@@ -363,7 +368,6 @@ class NodeDeps:
     #: resolved, or no `OWNER_NOTICE_FROM` sender identity -- and EXPORT reports that in a
     #: named note rather than skipping silently.
     owner_notice: OwnerNoticeIdentity | None = None
-    channels: tuple[str, ...] = field(default=DEFAULT_CHANNELS)
     #: node -> tools an operator has revoked, loaded from `node_tool_policies`.
     #:
     #: Injected like every other dependency rather than read here, because the nodes
@@ -1009,7 +1013,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         box = _toolbox("CONVERT", deps)
         outline = state.get("outline") or {}
         draft = state.get("draft") or {}
-        channels = _cta_channels(deps.channels)
+        channels = _cta_channels(channels_of(state))
 
         # Proof points must come from the business's own material, so the node reads
         # that material rather than trusting the model to remember it. A missing
@@ -1174,7 +1178,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
         box = _toolbox("REPACK", deps)
         draft = state.get("draft") or {}
         outline = state.get("outline") or {}
-        wanted = ", ".join(deps.channels)
+        wanted = ", ".join(channels_of(state))
 
         args, cost = await _ask(
             deps,

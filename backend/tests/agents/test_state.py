@@ -11,14 +11,19 @@ from decimal import Decimal
 import pytest
 
 from backend.app.agents.state import (
+    DEFAULT_CHANNELS,
     AgentState,
     CapExceededError,
     NodeError,
     RunCaps,
+    channels_of,
     charge,
+    from_checkpoint,
     new_state,
+    normalise_channels,
     record_error,
     step,
+    to_checkpoint,
 )
 
 
@@ -161,3 +166,64 @@ def test_caps_have_the_documented_defaults() -> None:
     assert caps.max_steps == 14
     assert caps.max_usd == Decimal("0.50")
     assert caps.max_validate_loops == 2
+
+
+# --------------------------------------------------------------------------- #
+# channels — per-run, checkpointed, and normalised on the way in
+# --------------------------------------------------------------------------- #
+
+
+def test_channels_default_when_the_caller_does_not_choose() -> None:
+    """The behaviour every run had before the field existed, preserved exactly."""
+    assert channels_of(_state()) == DEFAULT_CHANNELS
+
+
+def test_a_chosen_channel_set_survives_the_checkpoint_round_trip() -> None:
+    """The whole point of the key.
+
+    As a `NodeDeps` field this was rebuilt from the default on every resume, so a run
+    started for LinkedIn alone came back from its checkpoint targeting three channels
+    and published two posts nobody asked for.
+    """
+    state = new_state(
+        business_id="11111111-1111-1111-1111-111111111111",
+        goal="more leads",
+        channels=["linkedin"],
+    )
+    assert channels_of(from_checkpoint(to_checkpoint(state))) == ("linkedin",)
+
+
+def test_a_checkpoint_written_before_channels_existed_resumes_on_the_default() -> None:
+    """A run must never fail to resume over a field a default answers correctly."""
+    payload = to_checkpoint(_state())
+    del payload["channels"]
+    assert channels_of(from_checkpoint(payload)) == DEFAULT_CHANNELS
+
+
+def test_an_unknown_channel_is_dropped_rather_than_carried() -> None:
+    """A channel with no spec cannot be length- or link-checked.
+
+    `actuators/social.py` already refuses one for that reason, so carrying it here
+    would only produce a rendering that nothing downstream could validate.
+    """
+    assert normalise_channels(["linkedin", "threads"]) == ["linkedin"]
+
+
+def test_channel_aliases_collapse_to_one_channel() -> None:
+    """`facebook_post` and `facebook` are the same post, not two of them."""
+    assert normalise_channels(["facebook_post", "facebook"]) == ["facebook"]
+
+
+def test_an_empty_channel_set_reads_as_the_default_not_as_nothing() -> None:
+    """A run targeting nothing would pass VALIDATE, reach REPACK and render zero
+    posts — a silently empty deliverable. The default is the honest reading of
+    "the caller did not choose"."""
+    assert normalise_channels([]) == list(DEFAULT_CHANNELS)
+
+
+@pytest.mark.parametrize("raw", [None, "linkedin", 7, {"linkedin": True}, [None, 3]])
+def test_a_hand_edited_channel_column_reads_as_the_default(raw: object) -> None:
+    """This column can hold whatever an UPDATE put there. A bare string is the
+    interesting case: it is iterable, so a naive reader would render posts for the
+    channels `l`, `i`, `n`, ..."""
+    assert normalise_channels(raw) == list(DEFAULT_CHANNELS)

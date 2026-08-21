@@ -122,17 +122,19 @@ def _deps(
     # would hide a regression that started making one.
     return NodeDeps(
         router=object(),
-        channels=("linkedin", "facebook"),
         actuator_for=by_action.get,
         actuator_store=ledger,
     )
 
 
 def _state(business_id: UUID, spec: LandingPageSpec, **over: Any) -> AgentState:
+    # `channels` is per-run state rather than a `NodeDeps` field, so a run that
+    # renders two channels says so here.
     state = new_state(
         business_id=business_id,
         goal="more local leads",
         dna={"name": "Müller Sanitär GmbH", "city": "Koblenz"},
+        channels=("linkedin", "facebook"),
     )
     state.update({"approved_by": APPROVER, "landing_page": spec.model_dump(mode="json")})
     state.update(over)  # type: ignore[typeddict-item]

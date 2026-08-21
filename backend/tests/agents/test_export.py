@@ -186,7 +186,9 @@ def _notifier() -> tuple[OwnerNoticeActuator, RecordingSender]:
 
 
 def _deps(**over: Any) -> NodeDeps:
-    base: dict[str, Any] = {"router": object(), "channels": ("linkedin", "facebook")}
+    # No `channels` here: the run's channel set is state, not a dependency, so `_state`
+    # below declares it. EXPORT reads `renderings` rather than the channel list anyway.
+    base: dict[str, Any] = {"router": object()}
     base.update(over)
     return NodeDeps(**base)
 
@@ -205,6 +207,7 @@ def _state(**over: Any) -> AgentState:
         # `email` is the CRAWLED contact address. Kept here so the notify tests can prove
         # it is never used -- see `ACCOUNT_EMAIL` above.
         dna={"name": "Müller Sanitär GmbH", "city": "Koblenz", "email": CRAWLED_EMAIL},
+        channels=("linkedin", "facebook"),
     )
     state.update(
         {

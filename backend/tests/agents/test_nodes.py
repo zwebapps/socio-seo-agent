@@ -1169,7 +1169,7 @@ async def test_convert_always_asks_for_a_bio_link_hub_cta() -> None:
             return await super().complete(task, messages, **kw)
 
     router = Capturing()
-    await build_nodes(_deps(router, channels=("linkedin",)))["CONVERT"](_state(**CONVERT_STATE))
+    await build_nodes(_deps(router))["CONVERT"](_state(**CONVERT_STATE, channels=["linkedin"]))
 
     assert "Channels needing a CTA: linkedin, link_hub" in router.bodies[0]
 
