@@ -399,19 +399,25 @@ def get_oauth_provider(platform: str, env: Mapping[str, str] | None = None) -> O
     it is why a machine with no credential cannot accidentally be pointed at a real
     platform.
 
-    Today exactly one real adapter exists: :mod:`platform_oauth_meta`, for ``facebook``
-    and ``instagram``, and only when BOTH ``META_APP_ID`` and ``META_APP_SECRET`` are
-    present. Everything else is still the fake, for the reasons in the module docstring.
+    Two real adapters exist: :mod:`platform_oauth_meta` for ``facebook`` and
+    ``instagram`` (both ``META_APP_ID`` and ``META_APP_SECRET`` required), and
+    :mod:`platform_oauth_linkedin` for ``linkedin`` (both ``LINKEDIN_CLIENT_ID`` and
+    ``LINKEDIN_CLIENT_SECRET``). TikTok, YouTube and Google Business Profile are still
+    the fake, for the reasons in the module docstring.
 
     The import is inside the function because ``platform_oauth_meta`` imports
     :class:`OAuthError` and :class:`TokenGrant` from here: a module-level import would be
     a cycle. It also keeps ``httpx`` out of this module's import graph, so a caller that
     only wants :class:`FakeOAuthProvider` pays nothing for the real one.
     """
+    from backend.app.services.platform_oauth_linkedin import build_linkedin_provider
     from backend.app.services.platform_oauth_meta import build_meta_provider
 
     environ = env if env is not None else os.environ
-    real = build_meta_provider(platform, environ)
+    # Each builder answers `None` for a platform it does not speak for, so the order is
+    # not a precedence rule — no two builders claim the same platform, and a `for` loop
+    # over them would read as though one could shadow another.
+    real = build_meta_provider(platform, environ) or build_linkedin_provider(platform, environ)
     if real is not None:
         return real
     return FakeOAuthProvider(platform)

@@ -132,6 +132,13 @@ class Settings(BaseSettings):
     meta_app_id: str | None = None
     meta_app_secret: SecretStr | None = None
 
+    # LinkedIn, on the same terms and for the same reason: declared and typed here so
+    # the variables are documented in one place, while
+    # `services/platform_oauth_linkedin.py` reads `os.environ` directly so a credential
+    # never enters a settings instance that something might serialise.
+    linkedin_client_id: str | None = None
+    linkedin_client_secret: SecretStr | None = None
+
     # The per-business ceiling, in USD. `Decimal`, never `float`: this number is
     # compared against a sum of `Numeric(12, 8)` ledger rows, and a binary float
     # would make the comparison at the boundary a matter of luck. pydantic parses
