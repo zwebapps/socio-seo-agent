@@ -24,13 +24,13 @@ export type Role = "member" | "owner" | "platform_admin";
  * never silently on the operator's.
  */
 export const ROLE_LANDING: Record<Role, string> = {
-  member: "/",
-  owner: "/",
+  member: "/dashboard",
+  owner: "/dashboard",
   platform_admin: "/developer/models",
 };
 
 /** The business dashboard: the safe answer for any role we do not recognise. */
-const DEFAULT_LANDING = "/";
+const DEFAULT_LANDING = "/dashboard";
 
 export function landingFor(role: string | null | undefined): string {
   if (role && role in ROLE_LANDING) return ROLE_LANDING[role as Role];

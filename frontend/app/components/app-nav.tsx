@@ -46,7 +46,7 @@ const GROUPS: readonly Group[] = [
   {
     title: "Work",
     items: [
-      { href: "/", label: "Dashboard", hint: "Start a run, see recent ones" },
+      { href: "/dashboard", label: "Dashboard", hint: "Start a run, see recent ones" },
       { href: "/content", label: "Content", hint: "Posts per channel" },
       { href: "/runs", label: "Runs", hint: "Every run and what it reached" },
       { href: "/leads", label: "Leads", hint: "Who got in touch" },
@@ -81,6 +81,10 @@ export function AppNav() {
   // note: a sidebar that appears a beat late reads as a layout bug, and one full of
   // links that refuse you is not navigation.
   if (state.kind !== "signed-in") return null;
+  // `/` is the public marketing page. A signed-in visitor reading it does not need the
+  // app's sidebar beside the pitch, and the page carries its own "go to your dashboard"
+  // link — so the nav stays out of the way rather than framing a landing page.
+  if (pathname === "/") return null;
 
   const groups = isOperator(state) ? [...GROUPS, OPERATOR] : GROUPS;
 

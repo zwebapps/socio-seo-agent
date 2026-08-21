@@ -29,7 +29,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SessionProvider } from "@/app/components/session-context";
 import { normalizeSummary, topChannel } from "@/app/lib/dashboard-api";
-import Home from "@/app/page";
+import Home from "@/app/dashboard/page";
 
 /**
  * The page inside the provider the real root layout gives it.

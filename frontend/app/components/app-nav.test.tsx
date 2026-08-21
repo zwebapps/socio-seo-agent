@@ -13,11 +13,17 @@ import { describe, expect, it } from "vitest";
 import { isCurrent } from "@/app/components/app-nav";
 
 describe("isCurrent", () => {
-  it("matches the dashboard only exactly", () => {
+  it("matches the marketing root only exactly", () => {
+    // `/` is the public page now, but the rule still matters: as a PREFIX it matches
+    // every path in the app, so any item pointing at it would light up everywhere.
     expect(isCurrent("/", "/")).toBe(true);
-    // The bug a prefix match would produce: every screen also highlighting Dashboard.
     expect(isCurrent("/content", "/")).toBe(false);
     expect(isCurrent("/runs/abc", "/")).toBe(false);
+  });
+
+  it("matches the dashboard at its own path", () => {
+    expect(isCurrent("/dashboard", "/dashboard")).toBe(true);
+    expect(isCurrent("/content", "/dashboard")).toBe(false);
   });
 
   it("matches a section exactly", () => {

@@ -16,7 +16,9 @@ import { landingFor, safeNext } from "@/app/lib/roles";
 
 describe("landingFor", () => {
   it("sends a business owner to the business dashboard", () => {
-    expect(landingFor("owner")).toBe("/");
+    // `/dashboard`, not `/`: `/` is the public marketing page now, and landing an owner
+    // there after they authenticate would show them the pitch instead of their work.
+    expect(landingFor("owner")).toBe("/dashboard");
   });
 
   it("sends a platform admin to the operator screens", () => {
@@ -26,14 +28,14 @@ describe("landingFor", () => {
   it("sends a member to the business dashboard, never the operator's", () => {
     // `member` exists in the enum and the DB constraint and nothing implements it. Until
     // it means something it must not resolve to the operator console by accident.
-    expect(landingFor("member")).toBe("/");
+    expect(landingFor("member")).toBe("/dashboard");
   });
 
   it("falls back to the business dashboard for a role this build has not heard of", () => {
     // A server that has grown a new role must not strand the person on a blank screen.
-    expect(landingFor("auditor")).toBe("/");
-    expect(landingFor(null)).toBe("/");
-    expect(landingFor(undefined)).toBe("/");
+    expect(landingFor("auditor")).toBe("/dashboard");
+    expect(landingFor(null)).toBe("/dashboard");
+    expect(landingFor(undefined)).toBe("/dashboard");
   });
 });
 
