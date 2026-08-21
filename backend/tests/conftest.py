@@ -32,6 +32,15 @@ _CREDENTIALS = (
     "RESEND_API_KEY",
     "LANGFUSE_PUBLIC_KEY",
     "LANGFUSE_SECRET_KEY",
+    # Both halves, and for BOTH reasons this list exists. An outbound call:
+    # `services/platform_oauth_meta.py` would POST Meta's token endpoint for real. And a
+    # divergence: `get_oauth_provider` selects by credential, so a developer holding a
+    # Meta app would run the connection suite against `MetaOAuthProvider` where CI runs
+    # it against `FakeOAuthProvider` -- two different providers under one green tick.
+    # A test that wants the real adapter passes `env={...}` or constructs it with an
+    # `httpx.MockTransport`.
+    "META_APP_ID",
+    "META_APP_SECRET",
     # Not an outbound call -- a DIVERGENCE. `core/token_cipher.select_token_cipher` reads
     # this from `os.environ`, so a developer holding a real AES key runs the suite against
     # `AesGcmCipher` where CI, which has no key, runs it against `NotConfiguredCipher`.

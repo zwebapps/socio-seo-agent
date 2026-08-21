@@ -167,8 +167,10 @@ ProviderFactory = Callable[[str], OAuthProvider]
 
 
 def get_provider_factory() -> ProviderFactory:
-    """The real factory. Returns ``FakeOAuthProvider`` for every platform today -- see
-    ``platform_oauth``'s module docstring for why no real client is written."""
+    """The real factory. Returns the Meta adapter for ``facebook``/``instagram`` when
+    ``META_APP_ID`` and ``META_APP_SECRET`` are both set, and ``FakeOAuthProvider``
+    otherwise -- see ``platform_oauth``'s module docstring for what that does and does
+    not make possible."""
     return get_oauth_provider
 
 
