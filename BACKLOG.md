@@ -773,7 +773,7 @@ one an owner can see.
 - [ ] **N3 · The connection-expiry sweep has no caller** — see A3-ii, sharpened rather than
   duplicated: the function is written and tested, and the scheduler is now the obvious home.
 
-- [ ] **N4 · Three documents describe the frontend as it was yesterday** — a fresh drift, not a
+- [x] **N4 · Three documents describe the frontend as it was yesterday** — a fresh drift, not a
   reopening of A8-i (which correctly closed for the tree that existed when it was written).
   `30a57b2` moved the owner's home to `/dashboard` and put a marketing front page at `/`, and
   `09cf3c3` / `c21ebfa` added `content/`, `business/` and the post calendar. So:
@@ -785,6 +785,34 @@ one an owner can see.
   it runs no scheduler and sees automation do nothing — the very failure `e410d9c` fixed.
   **done = §10's block, §1's list and the README's quickstart match `ls frontend/app` and the
   Makefile; the README says a third process exists and what breaks without it.**
+  **CLOSED.** §10's block and §1's list now match `ls frontend/app` exactly (five screens were
+  missing: `dashboard/`, `automation/`, `content/`, `business/`, and `page.tsx` was described as
+  the owner's home); §10 gained a paragraph on why `/` is public and `/dashboard` is the home;
+  §1's interactions row gained scheduling and the calendar; the README's quickstart names
+  `make worker` as terminal 3 and says plainly what silently does not happen without it, and its
+  journey now walks `/dashboard` → `/content` → `/automation`.
+  - **And it is now a TEST, because this drifted twice in two days.**
+    `backend/tests/test_docs_frontend_tree.py` parses §10's ASCII block and fails the build on
+    any entry in `ls frontend/app` that is missing from it (or documented and absent), and
+    checks that `CRITERIA_MAP.md` §1 names every screen — matched on the backticked path token,
+    so the row stays free to write `developer/{models,runtime,tools,cost}` the way a person
+    would. A third assertion pins the premise that `components/`, `lib/`, `globals.css` and
+    `layout.tsx` are not screens, so the exemption cannot rot into a hidden hole if one of them
+    ever gains a `page.tsx`. Verified by deleting a row from the block: red. It cannot check
+    that a DESCRIPTION is accurate — no test can — only that the enumeration is complete.
+  - **Three further claim defects found while doing it, all fixed here rather than filed:**
+    (1) `asgi.py` documented itself as "the ONLY place that touches the environment" while
+    `worker/__main__.py` also loads `.env` — both docstrings now state the rule as *every process
+    entry point loads it, nothing below one does*, and the README's layout block agreed with the
+    stale version. (2) The README's layout block had no `worker/` at all. (3) **Bigger, and the
+    reason this entry grew: `ARCHITECTURE.md` §12 and `DIAGRAMS.md` §12 both draw a deployment
+    that does not exist** — `worker-content` / `worker-harvest` pools pulling jobs from Redis.
+    There is no job queue: a graph run executes in the API process and the scheduler scans
+    `next_run_at`. Both are now labelled PLANNED with a "what ships today" note carrying the
+    reason (ARQ is uninstallable against this project's `redis` pin, and the database is already
+    an adequate queue for a weekly cadence). Left as annotation rather than a rewrite: the target
+    topology is still the target, and `CRITERIA_MAP.md` §7 asks that a claim be true, not that an
+    intention be deleted.
 
 - [x] **A1a · A real `publish.page` actuator, so a run actually creates the landing page**
   — `c3a5dab`. `backend/app/actuators/landing.py`, wired in `run_executor`. `fake` is

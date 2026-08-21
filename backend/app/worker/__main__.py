@@ -4,12 +4,12 @@ Its own entry point rather than a flag on the API, because the two have differen
 failure modes and different lifetimes: an API restart during a deploy must not abandon a
 run mid-flight, and a scheduler that dies must not take the API with it.
 
-**It loads `.env` the same way `asgi.py` does, and for the same reason.** That module is
-documented as "the ONLY place that loads .env", and this is the second process the
-project has — so the rule becomes "every process entry point loads it, and nothing
-below one does". A worker that skipped it would connect to the default database rather
-than the configured one, which is the kind of misconfiguration that looks like an empty
-queue.
+**It loads `.env` the same way `asgi.py` does, and for the same reason.** That module
+used to document itself as the only place that loads it; this is the second process the
+project has, so the rule is now "every process entry point loads it, and nothing below
+one does" — stated in both entry points rather than in one. A worker that skipped it
+would connect to the default database rather than the configured one, which is the kind
+of misconfiguration that looks like an empty queue.
 """
 
 from __future__ import annotations

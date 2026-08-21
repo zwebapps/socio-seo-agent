@@ -399,12 +399,17 @@ A 10-payload injection corpus is a test, not a checklist — ten distinct *mecha
 
 `frontend/app/` is **flat** — one directory per screen. There is no route group, no
 dynamic business segment, and no public form page. This block is the whole tree;
-`ls frontend/app` should turn up nothing that is not in it.
+`ls frontend/app` should turn up nothing that is not in it, and
+`backend/tests/test_docs_frontend_tree.py` fails the build if it does.
 
 ```
 app/
-├─ layout.tsx                  <html>, pinned light theme, SessionBar. No auth, no redirect
-├─ page.tsx                    owner's home: start a run · recent runs · latest leads
+├─ layout.tsx                  <html>, pinned light theme, SessionBar, AppNav. No auth, no redirect
+├─ page.tsx                    the PUBLIC front page: what this is, for somebody not signed in
+├─ dashboard/                  the owner's home: KPI tiles · start a run · recent runs · latest leads
+├─ automation/                 the schedule: on/off, cadence, channels, goal, next run, pauses
+├─ content/                    posts per channel, and the calendar the queue is placed on
+├─ business/                   identity, voice, banned claims — what the agent believes about you
 ├─ login/                      sign in and sign up
 ├─ onboard/                    crawl a homepage → confirm the business DNA
 ├─ documents/                  upload, ingest status, reindex
@@ -415,9 +420,16 @@ app/
 ├─ connections/                platform accounts: status, usability verdict, disconnect
 ├─ developer/                  layout + nav, then models · runtime · tools · cost
 ├─ globals.css                 tokens, the light/dark palettes, neumorphic surfaces
-├─ components/                 shell, cards, run rows, safe HTML — not routes
+├─ components/                 shell, nav, cards, run rows, safe HTML — not routes
 └─ lib/                        one typed API client per surface — not routes
 ```
+
+**`/` is public and `/dashboard` is the home, and the split is not cosmetic.** `/` used
+to be the dashboard, so a visitor who had not signed in was shown a shell of
+authenticated panels and three red refusals instead of an explanation of the product.
+Every claim on the public page has to be one the product can support — no user count, no
+uptime figure — because `CRITERIA_MAP.md` §7's claims discipline binds UI copy exactly as
+it binds the README.
 
 **Why there is no `businesses/[id]/…` segment.** The business is never in the URL: it
 is resolved from the session on every read, and `GET /api/v1/leads` records why it must
@@ -522,6 +534,8 @@ Cloudflare ──► Caddy (TLS) ──┬──► web      (Next.js, 1)
 ```
 
 Rules: workers are separate services from `api` so a long run can't block a request; `scheduler` is a single replica (its jobs are not concurrency-safe); `api` is stateless and horizontally scalable; migrations run in an entrypoint before the app starts, never inside the app.
+
+**What ships today, as distinct from the target above.** Three processes: `web`, `api`, and **one** scheduler (`python -m backend.app.worker`, `make worker`). There are no `worker-content` / `worker-harvest` pools and **no job queue at all** — a graph run executes in the API process (`services/run_executor.py`, documented as in-process and not a queue), and the scheduler discovers work by asking which automations are due, which is a `next_run_at` index scan. That is a decision rather than a gap: ARQ is uninstallable here (`arq>=0.27` requires `redis[hiredis]>=4.2,<6` and this project pins `redis>=8.1.0`, so the resolver refuses), and the database is already the queue — a job queue would add a second place for "when does this run" to live, whose failure mode is a run that fires twice or not at all. Redis stays where it earns its place: rate-limit token buckets. `backend/app/worker/scheduler.py` carries the full reasoning. The pools become real when a long run genuinely blocks a request; nothing about the state has to move, because it is already externalised.
 
 **Two operational traps worth naming now**, both learned the hard way elsewhere: build images in CI and pull on the box — a small VPS will not compile a Next.js image; and never construct a Postgres URL by interpolating a raw secret, because generated passwords contain `/ + @` and the URL parser will reject it at boot. Percent-encode in the entrypoint.
 

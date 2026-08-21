@@ -477,7 +477,7 @@ flowchart TB
     api --> redis[("Redis")]
     api --> s3[("Object storage")]
 
-    subgraph pools["Worker pools — separated so a slow crawl cannot starve content"]
+    subgraph pools["PLANNED worker pools — not shipped; see the note below"]
         wc["worker-content<br/>LLM-heavy · concurrency 4"]
         wh["worker-harvest<br/>network-bound · concurrency 8"]
         sch["scheduler<br/>1 replica only"]
@@ -493,6 +493,14 @@ flowchart TB
 **What to notice:** `scheduler` is deliberately a single replica — its jobs are
 not concurrency-safe. And the internal endpoints are 404'd at the edge, so the
 token is defence *in depth*, not the only defence.
+
+**What ships today is the three unshaded boxes plus ONE scheduler.** The pools are
+the target, not the current deployment: there is no job queue, a graph run executes
+in the `api` process, and the scheduler finds work by scanning `next_run_at` rather
+than by pulling from Redis — so the `redis --> wc` / `redis --> wh` edges above do
+not exist yet either. ARQ is genuinely uninstallable against this project's `redis`
+pin, and the database is already an adequate queue for a weekly cadence;
+`ARCHITECTURE.md` §12 and `backend/app/worker/scheduler.py` carry the reasoning.
 
 ---
 
