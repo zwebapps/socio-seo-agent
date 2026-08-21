@@ -872,10 +872,23 @@ class PlatformConnection(Base, UuidPkMixin, BusinessScopedMixin, TimestampMixin)
         # must UPDATE the credential rather than accumulate rows nobody can choose
         # between -- and "which of these three LinkedIn tokens is live" is not a question
         # a publish path should have to answer.
+        # Named explicitly and SHORT. The `uq` naming convention would render
+        # `uq_platform_connections_business_id_platform_external_account_id` here -- 64
+        # characters, one over Postgres's 63-character identifier limit. A convention-
+        # generated name is a `conv` label, which SQLAlchemy silently truncates and
+        # hashes; a name given as a plain string is validated instead, and an over-long
+        # one raises `IdentifierError` before any schema comparison can happen. That is
+        # how this table disabled `alembic check` for the whole project. See
+        # `tests/db/test_schema_identifiers.py`, which now fails at test time instead.
         UniqueConstraint(
             "business_id",
             "platform",
             "external_account_id",
-            name="uq_platform_connections_business_id_platform_external_account_id",
+            name="uq_platform_connections_business_platform_account",
         ),
+        # The publish path asks exactly one question of this table -- "does this business
+        # have a usable connection to this platform" -- so that is the index it gets.
+        # Declared here as well as in `d4f18a6c93b7` because a migration-only index is
+        # drift, and `alembic check` says so now that it can run at all.
+        Index("ix_platform_connections_business_platform", "business_id", "platform"),
     )

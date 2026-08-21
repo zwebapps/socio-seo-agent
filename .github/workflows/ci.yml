@@ -72,6 +72,16 @@ jobs:
       - name: Migrate
         run: uv run alembic upgrade head
 
+      # The drift guard, and the only place it runs automatically. The database above
+      # was just built by the migrations, so anything autogenerate still wants to emit
+      # is a model the migrations do not produce -- a column that exists in Python and
+      # not in Postgres fails here rather than at the first query in production. This
+      # step was absent while a 64-character constraint name made `alembic check` raise
+      # before it could compare anything, which is how a migration-only index on
+      # `platform_connections` went unnoticed.
+      - name: Assert the models match the migrations
+        run: uv run alembic check
+
       # No external network calls: every provider is faked in tests.
       - name: Pytest
         run: uv run pytest
