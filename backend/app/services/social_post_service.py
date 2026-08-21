@@ -43,6 +43,7 @@ from backend.app.actuators.actuate import actuate
 from backend.app.actuators.contract import Actuation, Actuator, ActuatorStore, OutcomeStatus
 from backend.app.db.models import ContentPiece, SocialPost, SocialPostStatus
 from backend.app.engines.channel.specs import canonical_channel, has_spec
+from backend.app.services.publish_cap import PublishCounter, weekly_publish_state
 
 __all__ = [
     "SOCIAL_POST_ACTION",
@@ -316,6 +317,7 @@ async def publish_post(
     actuator: Actuator | None,
     store: ActuatorStore,
     session: AsyncSession,
+    count_published: PublishCounter | None = None,
 ) -> PublishResult:
     """Send one post now, through `actuate()`.
 
@@ -328,10 +330,38 @@ async def publish_post(
     calendar emptied by a publisher that does not exist. Every other status is recorded,
     including `refused`, because "our policy said no" and "the platform said no" need to
     stay distinguishable in SQL.
+
+    **The weekly volume cap applies here too, and that is the point of `count_published`
+    being a parameter rather than an import.** This is the second way a piece can be
+    published — EXPORT is the first — and a cap enforced on one path is advisory. The
+    per-business USD ceiling was exactly that for a while: guarded on the HTTP routes and
+    invisible to the scheduler, which spent past it. So both publish paths consult the
+    same `services/publish_cap` decision, and `tests/test_run_start_guard.py` fails the
+    build if a third one appears without doing so. `None` means the cap is not enforced,
+    which only a test chooses; the route wires it.
     """
     post = await _load(post_id, session=session)
     if post.status not in PUBLISHABLE_FROM:
         raise PostNotPublishableError(post.status)
+
+    if count_published is not None:
+        allowance = await weekly_publish_state(business_id, count=count_published)
+        if allowance.exhausted:
+            # The row keeps its status, exactly as it does for a simulated send and for
+            # the same reason: a cap says "not this week", so consuming the post would
+            # turn a delay into a loss. It stays on the calendar and the button works
+            # again once the week rolls forward.
+            return PublishResult(
+                post=_record(post),
+                status=post.status,
+                simulated=False,
+                external_ref=None,
+                error=(
+                    f"{allowance.sentence}, so this post stays queued. This is a "
+                    "deliberate volume cap, not a failure — it can go out once the week "
+                    "rolls forward."
+                ),
+            )
 
     if actuator is None:
         post.status = SocialPostStatus.REFUSED.value

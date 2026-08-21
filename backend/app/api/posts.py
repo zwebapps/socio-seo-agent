@@ -129,6 +129,21 @@ def get_action_store() -> Any:
     return PostgresActionStore()
 
 
+def get_publish_counter() -> Any:
+    """Counts this business's publishes inside the rolling week. Overridden in tests.
+
+    The weekly volume cap of `ARCHITECTURE.md` §7.4 applies to this button as well as to
+    EXPORT — a cap enforced on one of two publish paths is advisory, which is precisely
+    how the per-business USD ceiling came to be enforced on the HTTP routes and not on
+    the scheduled one. Same `services/publish_cap` decision, same ledger.
+    """
+    from backend.app.agents.nodes import PUBLISHABLE_ACTIONS
+    from backend.app.db.adapters.action_store import PostgresActionStore
+    from backend.app.services.publish_cap import counter_for
+
+    return counter_for(PostgresActionStore(), action_types=PUBLISHABLE_ACTIONS)
+
+
 def _out(record: PostRecord) -> PostOut:
     return PostOut(
         id=record.id,
@@ -332,6 +347,7 @@ async def publish(
     open_session: Annotated[Any, Depends(get_business_session_opener)],
     actuator_for: Annotated[Any, Depends(get_actuator_resolver)],
     store: Annotated[Any, Depends(get_action_store)],
+    count_published: Annotated[Any, Depends(get_publish_counter)],
 ) -> PublishResponse:
     """The publish button.
 
@@ -355,6 +371,7 @@ async def publish(
                 actuator=actuator_for(social_post_service.SOCIAL_POST_ACTION),
                 store=store,
                 session=session,
+                count_published=count_published,
             )
         except PostNotFoundError as exc:
             raise HTTPException(

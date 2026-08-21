@@ -36,6 +36,24 @@ DEFAULT_SESSION_SECRET = "insecure-local-development-secret-change-me"  # noqa: 
 #: the fact.
 DEFAULT_BUSINESS_MONTHLY_CAP_USD = Decimal("25.00")
 
+#: Published pieces per business per rolling week. `ARCHITECTURE.md` §7.4's third cap,
+#: and the only one of the three that is NOT a cost control: it exists because
+#: `ROADMAP.md` §10 names scaled content abuse as a real risk to mitigate in the
+#: architecture rather than in a disclaimer, and §15 states plainly that this product
+#: "will not mass-produce, and shouldn't".
+#:
+#: **Ten, and the arithmetic is the defence.** The product offers six publishable
+#: channels and three cadences (weekly, biweekly, monthly), so the most an automation can
+#: legitimately produce is six pieces in a week. Ten leaves an owner four more for manual
+#: publishes from the calendar, and refuses the shapes that look like mass production —
+#: two full runs in one week (12), or anything daily (42). A number that permitted every
+#: conceivable use would not be a cap.
+#:
+#: A non-positive value refuses every publish, which is the kill switch:
+#: `BUSINESS_WEEKLY_PUBLISH_CAP=0` stops all publishing for every business without a
+#: deploy, in the same shape as the monthly USD one.
+DEFAULT_BUSINESS_WEEKLY_PUBLISH_CAP = 10
+
 Environment = Literal["local", "ci", "staging", "production"]
 
 
@@ -148,6 +166,12 @@ class Settings(BaseSettings):
     # switch: `BUSINESS_MONTHLY_CAP_USD=0` stops all model spend for every
     # business without a deploy.
     business_monthly_cap_usd: Decimal = DEFAULT_BUSINESS_MONTHLY_CAP_USD
+
+    # Published pieces per business per rolling week — the quality control, not a cost
+    # control. An `int` because it counts rows, and the rows it counts are the `actions`
+    # ledger's succeeded publishes; see `services/publish_cap.py` for the window and the
+    # reason the count is taken before the idempotency key is claimed.
+    business_weekly_publish_cap: int = DEFAULT_BUSINESS_WEEKLY_PUBLISH_CAP
 
 
 @lru_cache
