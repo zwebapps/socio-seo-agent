@@ -185,8 +185,22 @@ class LoginRequest(CamelModel):
 
 class SignupResponse(CamelModel):
     user_id: UUID
-    business_id: UUID
+    #: `None` when no business was named, which is now the ordinary case. Naming a
+    #: business is a separate step the owner takes when ready — see
+    #: `POST /api/v1/business`.
+    business_id: UUID | None
     email: str
+
+
+class CreateBusinessRequest(CamelModel):
+    """Name the business. The step signup used to force before an account existed."""
+
+    name: str = Field(default="", max_length=auth_service.MAX_BUSINESS_NAME_LENGTH)
+
+
+class CreateBusinessResponse(CamelModel):
+    business_id: UUID
+    name: str
 
 
 class UserOut(CamelModel):
@@ -587,3 +601,42 @@ async def me(user: CurrentUser, db: Annotated[AsyncSession, Depends(db_session)]
         role=user.role,
         business_id=await business_for_user(user.id, session=db),
     )
+
+
+@router.post(
+    "/business",
+    response_model=CreateBusinessResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create this account's business",
+)
+async def create_business(
+    payload: CreateBusinessRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(db_session)],
+) -> CreateBusinessResponse:
+    """Name the business, after the account exists.
+
+    Signup used to refuse without a business name, so somebody who wanted an account
+    had to decide on a business first — the field stood between them and signing in at
+    all. This is that step, taken when the owner is ready.
+
+    Authenticated, and the owner comes from the SESSION rather than the body: accepting
+    a user id here would be letting the caller choose whose business they create.
+    """
+    try:
+        business_id = await auth_service.create_business(user.id, payload.name, session=db)
+    except auth_service.InvalidBusinessNameError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_error("invalid_business_name", str(exc)),
+        ) from exc
+    except auth_service.BusinessAlreadyExistsError as exc:
+        # 409 rather than returning the existing one: a caller that thinks it is
+        # creating a business and silently receives a different, older one has been
+        # given the wrong answer to the question it asked.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=_error("business_exists", str(exc)),
+        ) from exc
+    return CreateBusinessResponse(business_id=business_id, name=payload.name.strip())

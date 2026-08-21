@@ -32,13 +32,18 @@
  */
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 
 import { Shell } from "@/app/components/page-shell";
 import { RunRows, useRuns } from "@/app/components/run-rows";
-import { Pill, SoftButton, SoftCard } from "@/app/components/soft";
+import { Pill, SoftButton, SoftCard, SoftInput } from "@/app/components/soft";
 import { StartRunForm } from "@/app/components/start-run";
-import { fetchOnboardingState } from "@/app/lib/api";
+import {
+  ApiError,
+  createBusiness,
+  fetchOnboardingState,
+  type OnboardingState,
+} from "@/app/lib/api";
 import { RECENT_RUNS } from "@/app/lib/runs-api";
 
 /** Shape returned by GET /api/v1/health. */
@@ -58,27 +63,30 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
 export default function Home() {
   const { state: runs, live, reload } = useRuns(RECENT_RUNS);
-  // `null` while unknown, which is NOT the same as `false`. Rendering "onboard first"
-  // during the round trip would flash a setup prompt at an owner who onboarded months
-  // ago, so the prompt waits for an answer and the page shows its normal self meanwhile.
-  const [onboarded, setOnboarded] = useState<boolean | null>(null);
+  // `null` while unknown, which is NOT the same as a loaded answer. Rendering
+  // "onboard first" during the round trip would flash a setup prompt at an owner who
+  // onboarded months ago, so the prompt waits and the page shows its normal self.
+  const [setup, setSetup] = useState<OnboardingState | null>(null);
 
   useEffect(() => {
     let live = true;
     void fetchOnboardingState()
       .then((state) => {
-        if (live) setOnboarded(state.onboarded);
+        if (live) setSetup(state);
       })
-      // Swallowed deliberately: this read only decides which of two panels leads. If it
-      // fails the page keeps working exactly as it did before the read existed, and the
+      // Swallowed deliberately: this read only decides which panel leads. If it fails
+      // the page keeps working exactly as it did before the read existed, and the
       // BackendStatus element at the bottom is what reports an unreachable API.
       .catch(() => {
-        if (live) setOnboarded(null);
+        if (live) setSetup(null);
       });
     return () => {
       live = false;
     };
   }, []);
+
+  const needsOnboarding = setup !== null && setup.hasBusiness && !setup.onboarded;
+  const hasNoBusiness = setup !== null && !setup.hasBusiness;
 
   return (
     <Shell className="py-14">
@@ -103,11 +111,21 @@ export default function Home() {
       <div className="mt-10 grid items-start gap-10 lg:grid-cols-[minmax(0,26rem)_minmax(0,1fr)] xl:grid-cols-[minmax(0,30rem)_minmax(0,1fr)] lg:gap-14 xl:gap-20">
         {/* Left: the thing to DO. */}
         <div>
-          {onboarded === false && <OnboardFirst />}
+          {needsOnboarding && <OnboardFirst />}
+          {hasNoBusiness && (
+            <NoBusiness
+              onCreated={() => {
+                // A full reload rather than refetching one value: creating the business
+                // changes what almost every panel on this page may read, and several of
+                // them fetched before it existed.
+                window.location.reload();
+              }}
+            />
+          )}
 
           <SoftCard className="p-6" size="lg">
             <h2 className="text-sm font-semibold">Start a run</h2>
-            {onboarded === false && (
+            {needsOnboarding && (
               <p className="mt-2 text-xs" style={{ color: "var(--text-muted)" }}>
                 A run needs the profile above first — without one it stops at its first
                 step and tells you the business profile is missing.
@@ -150,9 +168,9 @@ export default function Home() {
                   than the only one. */}
               <NavRow
                 href="/onboard"
-                title={onboarded === false ? "Onboard a business" : "Business profile"}
+                title={needsOnboarding ? "Onboard a business" : "Business profile"}
                 blurb={
-                  onboarded === false
+                  needsOnboarding
                     ? "Paste a website URL and let it read the business for itself."
                     : "Re-read the website and correct what the agent believes about the business."
                 }
@@ -243,6 +261,77 @@ function OnboardFirst() {
       >
         Onboard your business
       </Link>
+    </SoftCard>
+  );
+}
+
+/**
+ * An account with no business at all.
+ *
+ * It gets its own panel rather than the onboarding one, because onboarding cannot
+ * help: `POST /onboarding/confirm` writes to a specific business and there is none to
+ * write to, so the button would 409. This is reachable for a platform admin granted
+ * the role by `scripts/grant_platform_admin.py` — signup creates a user and a business
+ * in one transaction, so an ordinary owner always has one.
+ */
+function NoBusiness({ onCreated }: { onCreated: () => void }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const nameId = useId();
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setError("Give the business a name.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await createBusiness(trimmed);
+      onCreated();
+    } catch (exc) {
+      setError(exc instanceof ApiError ? exc.message : "The business could not be created.");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <SoftCard className="mb-6 p-6" size="lg">
+      <p
+        className="text-[11px] font-semibold uppercase tracking-[0.18em]"
+        style={{ color: "var(--accent)" }}
+      >
+        Start here
+      </p>
+      <h2 className="mt-2 text-sm font-semibold">Name your business</h2>
+      <p className="mt-2 text-sm" style={{ color: "var(--text-muted)" }}>
+        Runs, documents and your website profile all belong to a business. Signing up no
+        longer asks for this, so name it now — you can change it later.
+      </p>
+      <form onSubmit={submit} className="mt-4 flex flex-wrap items-start gap-3">
+        <SoftInput
+          controlId={nameId}
+          label="Business name"
+          value={name}
+          onChange={(next) => {
+            setName(next);
+            if (error) setError(null);
+          }}
+          placeholder="Müller Sanitär GmbH"
+          className="min-w-0 flex-1"
+        />
+        <SoftButton type="submit" variant="primary" disabled={busy}>
+          {busy ? "Creating…" : "Create business"}
+        </SoftButton>
+      </form>
+      {error && (
+        <p role="alert" className="mt-2 text-sm font-medium" style={{ color: "var(--err)" }}>
+          {error}
+        </p>
+      )}
     </SoftCard>
   );
 }

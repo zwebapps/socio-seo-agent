@@ -231,7 +231,10 @@ class SignupResult:
     """
 
     user_id: UUID
-    business_id: UUID
+    #: `None` when the account was created without a business, which is the ordinary
+    #: case now: naming a business is a separate step the owner takes when they are
+    #: ready, not a field standing between them and an account.
+    business_id: UUID | None
     email: str
 
 
@@ -262,42 +265,62 @@ async def _reject_breached_password(password: str, *, checker: PwnedChecker | No
 async def signup(
     email: str,
     password: str,
-    business_name: str,
+    business_name: str | None = None,
     *,
     session: AsyncSession,
     pwned_checker: PwnedChecker | None = None,
 ) -> SignupResult:
-    """Create a user and their first business in one transaction.
+    """Create an account. A business too, but only if one was named.
+
+    **`business_name` is optional, and that is a deliberate reversal.** This used to
+    create a user and a business in one transaction and refuse a signup without a
+    business name, on the reasoning that "a user with no business cannot exist even
+    for the length of a request". The cost of that invariant landed on the wrong
+    person: somebody who wants an account has to name a business before they have
+    decided anything about it, and the field is the first thing they meet. Creating
+    the business is now its own step (`create_business`), taken when the owner is
+    ready — which is also what makes a second business possible later.
 
     Validation runs before anything is written, so a weak password never costs a
     round trip. The duplicate-address check is the unique index itself rather than
     a prior ``SELECT``: a check-then-insert has a window between the two in which a
     concurrent signup wins, and the index has no window.
 
-    Commits on success. On any failure the transaction is rolled back, so the
-    "user with no business" state cannot exist even for the length of a request.
+    Commits on success; rolls back on any failure.
     """
     normalised = normalise_email(email)
     validate_password(password)
     await _reject_breached_password(password, checker=pwned_checker)
-    name = _clean_business_name(business_name)
+    # An empty string and an absent field mean the same thing here — "not naming one
+    # yet" — because an HTML form posts "" for a field left blank, and treating that
+    # as an invalid name would put the old refusal back through the front door.
+    raw_name = (business_name or "").strip()
+    name = _clean_business_name(raw_name) if raw_name else None
 
     # Bounded: hashing costs the same 64 MiB as verifying, so an unthrottled
     # signup route is the same memory-amplification DoS as an unthrottled login.
     password_hash = await hash_password_bounded(password)
     user = User(id=uuid4(), email=normalised, password_hash=password_hash, is_active=True)
-    business_id = uuid4()
-    business = Business(
-        id=business_id, owner_id=user.id, name=name, slug=business_slug(name, business_id)
+    business_id = uuid4() if name is not None else None
+    business = (
+        Business(id=business_id, owner_id=user.id, name=name, slug=business_slug(name, business_id))
+        if name is not None and business_id is not None
+        else None
     )
 
     session.add(user)
-    session.add(business)
+    if business is not None:
+        session.add(business)
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        if _is_slug_conflict(exc):
+        if (
+            business is not None
+            and business_id is not None
+            and name is not None
+            and _is_slug_conflict(exc)
+        ):
             # Two customers with the same name is ordinary, not an error: the second
             # one gets the suffixed form. Retried here rather than pre-checked with a
             # SELECT, because that check is racy and this one is decided by the
@@ -325,7 +348,77 @@ async def signup(
         await session.rollback()
         raise
 
-    return SignupResult(user_id=user.id, business_id=business.id, email=normalised)
+    return SignupResult(
+        user_id=user.id,
+        business_id=business.id if business is not None else None,
+        email=normalised,
+    )
+
+
+class BusinessAlreadyExistsError(AuthServiceError):
+    """This account already owns a business.
+
+    One per account today, which is what `current_business` assumes when it derives the
+    business from the session rather than taking one from the client. Refused rather
+    than silently creating a second, because the second would be invisible: every read
+    resolves ONE business for a user, so the new one would own the runs and the old
+    one's data would vanish from every screen without being deleted.
+    """
+
+
+async def create_business(
+    user_id: UUID,
+    name: str,
+    *,
+    session: AsyncSession,
+) -> UUID:
+    """Create this account's business. The step signup used to force.
+
+    Separate from signup so an account can exist before a business does — see
+    :func:`signup`. Idempotent in the useful direction: an account that already owns
+    one is refused rather than given a second, because every read derives a single
+    business from the user and a second would orphan the first on every screen.
+
+    The slug conflict is handled exactly as signup handles it, and for the same reason:
+    two customers with the same business name is ordinary, not an error, so the second
+    gets the suffixed form. Decided by the unique index rather than a prior SELECT,
+    which would be racy.
+
+    Commits. Returns the new business id.
+    """
+    cleaned = _clean_business_name(name)
+    existing = await session.execute(select(Business.id).where(Business.owner_id == user_id))
+    if existing.scalar_one_or_none() is not None:
+        raise BusinessAlreadyExistsError("This account already has a business.")
+
+    business_id = uuid4()
+    session.add(
+        Business(
+            id=business_id,
+            owner_id=user_id,
+            name=cleaned,
+            slug=business_slug(cleaned, business_id),
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        if not _is_slug_conflict(exc):
+            raise
+        session.add(
+            Business(
+                id=business_id,
+                owner_id=user_id,
+                name=cleaned,
+                slug=suffixed_slug(cleaned, business_id),
+            )
+        )
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        raise
+    return business_id
 
 
 async def _find_by_email(email: str, session: AsyncSession) -> User | None:

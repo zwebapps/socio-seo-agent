@@ -137,6 +137,11 @@ export function StartRunForm() {
                 */}
                 <input
                   type="checkbox"
+                  // The wrapping <label> already names this implicitly, which is why
+                  // `getByRole("checkbox", { name: "LinkedIn" })` resolves. Stated
+                  // explicitly anyway: an accessible name computed from a wrapper is
+                  // the fragile kind, and this costs nothing to make certain.
+                  aria-label={channel.label}
                   className="sr-only"
                   checked={on}
                   onChange={() => {

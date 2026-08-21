@@ -164,3 +164,114 @@ async def test_the_response_is_camel_case_for_the_typescript_client() -> None:
 
     assert "needsConfirmation" in body and "needs_confirmation" not in body
     assert "factGaps" in body
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/v1/onboarding — the read the dashboard leads on
+# --------------------------------------------------------------------------- #
+
+
+def _state_client(
+    monkeypatch: pytest.MonkeyPatch, *, business_id: object, onboarded: bool
+) -> httpx.AsyncClient:
+    """A client whose account either has a business or does not.
+
+    `business_for_user` is patched rather than a row created, because the interesting
+    branch is the ABSENCE of a business and there is no row to create for that.
+
+    `monkeypatch` is taken as an argument rather than instantiated here, so pytest
+    undoes the patches at the end of each test. A `MonkeyPatch()` built inside a helper
+    and never undone leaks into every later test in the module — the same cross-test
+    pollution that made the runs-API suite fail depending on order.
+    """
+    from uuid import uuid4
+
+    from backend.app.api.auth import current_user
+    from backend.app.services.onboarding_service import OnboardingState
+
+    app = create_app()
+
+    async def fake_business_for_user(user_id: object, *, session: object) -> object:
+        return business_id
+
+    async def fake_read_state(bid: object, *, session: object) -> OnboardingState:
+        return OnboardingState(
+            onboarded=onboarded,
+            name="Müller Sanitär GmbH" if onboarded else None,
+            website="https://mueller.example" if onboarded else None,
+        )
+
+    class _Session:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(onboarding_api, "business_for_user", fake_business_for_user)
+    monkeypatch.setattr(onboarding_api, "read_onboarding_state", fake_read_state)
+    # The route opens a plain session to resolve the business, and this test must not
+    # reach Postgres: a real connection here binds the pool to this test's event loop
+    # and every later test in the module fails with "attached to a different loop".
+    monkeypatch.setattr("backend.app.db.session.session", lambda *a, **k: _Session())
+    app.dependency_overrides[onboarding_api.get_business_session_opener] = lambda: (
+        lambda _bid: _Session()
+    )
+    app.dependency_overrides[current_user] = lambda: type(
+        "U",
+        (),
+        {"id": uuid4(), "email": "o@example.test", "role": "owner", "is_active": True},
+    )()
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+async def test_an_account_with_no_business_gets_an_answer_not_a_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE bug this route was reported for.
+
+    It was behind `current_business`, which raises 409 `no_business` when the account
+    has no business row. So the dashboard asked "should I show the onboarding prompt?",
+    got a 409, swallowed it, and showed nothing — in exactly the state that most needs
+    the prompt. A platform admin granted the role by `scripts/grant_platform_admin.py`
+    hits this, and so does an owner whose business was removed.
+    """
+    async with _state_client(monkeypatch, business_id=None, onboarded=False) as client:
+        response = await client.get("/api/v1/onboarding")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["hasBusiness"] is False
+    assert body["onboarded"] is False
+
+
+async def test_a_business_that_has_not_onboarded_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import uuid4
+
+    async with _state_client(monkeypatch, business_id=uuid4(), onboarded=False) as client:
+        response = await client.get("/api/v1/onboarding")
+
+    body = response.json()
+    assert body["hasBusiness"] is True
+    assert body["onboarded"] is False
+
+
+async def test_an_onboarded_business_returns_its_name_and_website(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dashboard stops offering setup once it is done, so the two states have to
+    be distinguishable in the response rather than inferred from a missing field."""
+    from uuid import uuid4
+
+    async with _state_client(monkeypatch, business_id=uuid4(), onboarded=True) as client:
+        response = await client.get("/api/v1/onboarding")
+
+    body = response.json()
+    assert body == {
+        "hasBusiness": True,
+        "onboarded": True,
+        "name": "Müller Sanitär GmbH",
+        "website": "https://mueller.example",
+    }

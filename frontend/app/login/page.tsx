@@ -25,7 +25,12 @@ export default function LoginPage() {
 
     const body =
       mode === "signup"
-        ? { email, password, businessName: business }
+        ? // Omitted rather than sent empty. The API reads an absent or blank name as
+          // "not naming one yet" and creates the account alone, which is the point of
+          // the field being optional.
+          business.trim()
+          ? { email, password, businessName: business.trim() }
+          : { email, password }
         : { email, password };
 
     try {
@@ -98,7 +103,10 @@ export default function LoginPage() {
           </Field>
 
           {mode === "signup" && (
-            <Field label="Business name">
+            <Field
+              label="Business name"
+              hint="Optional — you can add this from your dashboard later"
+            >
               <SoftInput
                 value={business}
                 onChange={setBusiness}

@@ -222,9 +222,69 @@ async def test_signup_rejects_a_weak_password_before_touching_the_database(
 
 
 @pytest.mark.db
-async def test_signup_rejects_a_blank_business_name(db: AsyncSession) -> None:
+async def test_signup_without_a_business_name_creates_the_account_alone(
+    db: AsyncSession,
+) -> None:
+    """The reversal, asserted.
+
+    This used to raise `InvalidBusinessNameError`, on the reasoning that a user with
+    no business must not exist even for the length of a request. The cost of that
+    invariant landed on the wrong person: somebody who wants an account had to name a
+    business before deciding anything about it, and the field was the first thing they
+    met. Naming one is now `create_business`, taken when they are ready.
+    """
+    email = _email()
+    result = await auth_service.signup(email, "correct horse battery", session=db)
+
+    assert result.business_id is None
+    assert await _count(db, "SELECT count(*) FROM users WHERE email = :e", e=email) == 1
+
+
+@pytest.mark.db
+async def test_a_blank_business_name_is_read_as_absent_rather_than_invalid(
+    db: AsyncSession,
+) -> None:
+    """An HTML form posts "" for a field left blank, so treating that as an invalid
+    name would put the old refusal back through the front door."""
+    result = await auth_service.signup(_email(), "correct horse battery", "   ", session=db)
+
+    assert result.business_id is None
+
+
+@pytest.mark.db
+async def test_a_business_name_that_is_too_long_is_still_refused(db: AsyncSession) -> None:
+    """Optional is not unvalidated. `businesses.name` is String(255), so an over-long
+    name would be a database error rather than a message anybody can act on."""
     with pytest.raises(auth_service.InvalidBusinessNameError):
-        await auth_service.signup(_email(), "correct horse battery", "   ", session=db)
+        await auth_service.signup(
+            _email(),
+            "correct horse battery",
+            "x" * (auth_service.MAX_BUSINESS_NAME_LENGTH + 1),
+            session=db,
+        )
+
+
+@pytest.mark.db
+async def test_a_business_can_be_created_after_the_account(db: AsyncSession) -> None:
+    """The step signup used to force, taken separately."""
+    result = await auth_service.signup(_email(), "correct horse battery", session=db)
+    business_id = await auth_service.create_business(
+        result.user_id, "Müller Sanitär GmbH", session=db
+    )
+
+    assert await _count(db, "SELECT count(*) FROM businesses WHERE id = :i", i=business_id) == 1
+
+
+@pytest.mark.db
+async def test_a_second_business_is_refused_rather_than_orphaning_the_first(
+    db: AsyncSession,
+) -> None:
+    """Every read derives ONE business from the user, so a second would take over the
+    screens and the first one's runs would silently vanish from all of them."""
+    result = await auth_service.signup(_email(), "correct horse battery", "First", session=db)
+
+    with pytest.raises(auth_service.BusinessAlreadyExistsError):
+        await auth_service.create_business(result.user_id, "Second", session=db)
 
 
 # --------------------------------------------------------------------------- #
