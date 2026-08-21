@@ -28,6 +28,7 @@ from backend.app.api import (
     links,
     onboarding,
     pages,
+    posts,
     runs,
 )
 from backend.app.core.body_limit import BodyLimit, BodySizeLimitMiddleware
@@ -134,6 +135,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(connections.router)
     app.include_router(cost.router)
     app.include_router(dashboard.router)
+    app.include_router(posts.router)
     app.include_router(documents.router)
     app.include_router(onboarding.router)
     app.include_router(runs.router)

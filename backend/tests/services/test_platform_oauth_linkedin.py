@@ -27,9 +27,9 @@ from backend.app.services.platform_oauth_linkedin import (
 )
 
 CLIENT_ID: Final = "77abc123linked"
-CLIENT_SECRET: Final = "WPL_AP1.sup3r-s3cret-value.xyz"  # noqa: S105 -- a fixture
+CLIENT_SECRET: Final = "WPL_AP1.sup3r-s3cret-value.xyz"
 ACCESS: Final = "AQV8xk-access-token-value"
-REFRESH: Final = "AQW9yl-refresh-token-value"  # noqa: S105 -- a fixture
+REFRESH: Final = "AQW9yl-refresh-token-value"
 REDIRECT: Final = "http://localhost:8100/api/v1/connections/linkedin/callback"
 
 
