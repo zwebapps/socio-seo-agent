@@ -9,6 +9,7 @@ from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: The obviously-unsafe default. Named rather than inlined so `create_app` can
@@ -110,6 +111,26 @@ class Settings(BaseSettings):
     # maintain. If it goes a release without being touched, the builtin driver should
     # go with it.
     agent_runtime: AgentRuntime = "langgraph"
+
+    # The Meta app behind the Facebook/Instagram OAuth adapter
+    # (`services/platform_oauth_meta.py`). BOTH optional, and both absent is the
+    # ordinary state: with either one missing, `get_oauth_provider` returns
+    # `FakeOAuthProvider` and `oauth_status()` says so. There is deliberately no
+    # "enable Meta" flag -- selection is by credential and by nothing else, so a
+    # setting cannot disagree with whether an app exists.
+    #
+    # The app id is not a secret (it travels in the consent-dialog URL, which a
+    # customer's browser shows them). The secret is, so it is `SecretStr`: pydantic
+    # masks it in `repr` and in a JSON dump, which is what stops it reaching a startup
+    # log line or an exception rendering the settings object. Note that the provider
+    # itself reads `os.environ`, not this object -- `asgi.py` calls `load_dotenv`
+    # before importing the app, so a `.env` value is in the environment either way,
+    # and a credential that never enters a settings instance cannot be leaked by
+    # anything that serialises one (the rule `core/token_cipher.py` records for
+    # `PLATFORM_CREDENTIAL_KEY`). These fields exist so the two variables are
+    # declared and typed in the one place configuration is documented.
+    meta_app_id: str | None = None
+    meta_app_secret: SecretStr | None = None
 
     # The per-business ceiling, in USD. `Decimal`, never `float`: this number is
     # compared against a sum of `Numeric(12, 8)` ledger rows, and a binary float

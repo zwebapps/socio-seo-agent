@@ -5,16 +5,26 @@ operations, in the same order, with the same failure modes. So this is one port 
 fake behind it, and a real adapter per platform is added the day that platform's App
 Review is actually approved.
 
-**No Meta, LinkedIn or TikTok client is written here, and that is the point of the
-module, not a gap in it.** ``docs/CHANNELS.md`` §2-3 is explicit: Facebook Page and
-Instagram publishing need Meta App Review (screencast, privacy policy, business
-verification, two to six weeks, refusable by form letter); LinkedIn company-page posting
-needs Marketing Developer Platform approval; TikTok's unaudited apps are confined to
-private/self-only visibility. A client written against those APIs today could not be
-exercised end to end — not by a test (this suite makes no network calls, ever) and not by
-hand (there is no approved app to authenticate against). It would be untested code
-shaped like a feature, which is worse than an honest absence, because the absence is
-visible and the untested code is not.
+**One real adapter now exists — :mod:`platform_oauth_meta`, for ``facebook`` and
+``instagram`` — and it changes nothing about what may be PUBLISHED.** ``docs/CHANNELS.md``
+§2-3 is unchanged and still explicit: Facebook Page and Instagram publishing need Meta App
+Review (screencast, privacy policy, business verification, two to six weeks, refusable by
+form letter); LinkedIn company-page posting needs Marketing Developer Platform approval;
+TikTok's unaudited apps are confined to private/self-only visibility. So what the Meta
+adapter buys is precisely the CONNECTION lifecycle against the live platform — a real
+consent dialog, a real long-lived credential, a real renewal, a real de-authorisation —
+and :func:`oauth_status` says both halves out loud, because a screen that reports "real
+provider" without reporting "publishing is still in somebody else's queue" is a support
+ticket.
+
+**No LinkedIn or TikTok client is written here, and that is still a decision rather than a
+gap.** A client written against those APIs today could not be exercised end to end — not
+by a test (this suite makes no network calls, ever) and not by hand (there is no approved
+app to authenticate against). It would be untested code shaped like a feature, which is
+worse than an honest absence, because the absence is visible and the untested code is not.
+The Meta adapter is subject to the same limit and does not pretend otherwise: every path
+in it is proven against an injected ``httpx.MockTransport``, and the first real
+round-trip happens the day somebody sets ``META_APP_ID`` and ``META_APP_SECRET``.
 
 What IS buildable now, and what the rest of the system is waiting on, is this shape:
 
@@ -81,6 +91,7 @@ __all__ = [
     "fake_consent_path",
     "get_oauth_provider",
     "oauth_status",
+    "real_oauth_platforms",
 ]
 
 #: The platforms a connection row may name. Closed, and widening it is a migration
@@ -382,27 +393,85 @@ APP_REVIEW_GATED: Final[tuple[str, ...]] = (
 def get_oauth_provider(platform: str, env: Mapping[str, str] | None = None) -> OAuthProvider:
     """The provider for ``platform``.
 
-    Always the fake today, for every platform, because no real adapter exists — see the
-    module docstring. ``env`` is threaded through now rather than later so that adding a
-    real adapter is one branch here (``if _read_key(environ, "META_APP_SECRET"): ...``)
-    and not a change to every caller's signature.
+    Selection is by CREDENTIAL and by nothing else — no flag, no setting, no separate
+    "enable Meta" switch that could disagree with whether an app is configured. That is
+    the same rule ``actuators/email.build_email_actuator`` and ``llm.router`` follow, and
+    it is why a machine with no credential cannot accidentally be pointed at a real
+    platform.
+
+    Today exactly one real adapter exists: :mod:`platform_oauth_meta`, for ``facebook``
+    and ``instagram``, and only when BOTH ``META_APP_ID`` and ``META_APP_SECRET`` are
+    present. Everything else is still the fake, for the reasons in the module docstring.
+
+    The import is inside the function because ``platform_oauth_meta`` imports
+    :class:`OAuthError` and :class:`TokenGrant` from here: a module-level import would be
+    a cycle. It also keeps ``httpx`` out of this module's import graph, so a caller that
+    only wants :class:`FakeOAuthProvider` pays nothing for the real one.
     """
-    _ = env if env is not None else os.environ
+    from backend.app.services.platform_oauth_meta import build_meta_provider
+
+    environ = env if env is not None else os.environ
+    real = build_meta_provider(platform, environ)
+    if real is not None:
+        return real
     return FakeOAuthProvider(platform)
 
 
-def oauth_status() -> OAuthStatus:
-    """Report what connecting a platform would actually do right now."""
-    return OAuthStatus(
-        platforms=CONNECTABLE_PLATFORMS,
-        real_providers=(),
-        using_fake_providers=True,
-        blocked_on_app_review=APP_REVIEW_GATED,
-        message=(
-            "No real platform OAuth adapter is implemented, so every connection is made "
+def real_oauth_platforms(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Which of :data:`CONNECTABLE_PLATFORMS` have a real adapter AND its credentials.
+
+    Derived by asking :func:`get_oauth_provider` rather than by re-reading the
+    environment, so the list a screen shows cannot disagree with the provider a connect
+    actually uses — the failure being prevented is a settings page that says "Facebook is
+    live" while the callback is being served by the fake.
+    """
+    environ = env if env is not None else os.environ
+    return tuple(
+        platform
+        for platform in CONNECTABLE_PLATFORMS
+        if not get_oauth_provider(platform, environ).fake
+    )
+
+
+def oauth_status(env: Mapping[str, str] | None = None) -> OAuthStatus:
+    """Report what connecting a platform would actually do right now.
+
+    ``env`` is optional so the routes can keep calling this with no arguments; a test
+    that wants a configured app passes ``env={...}``, which is how every provider seam in
+    this project is written (``tests/conftest.py`` strips the real variables).
+    """
+    real = real_oauth_platforms(env)
+    fake = tuple(platform for platform in CONNECTABLE_PLATFORMS if platform not in real)
+
+    if not real:
+        message = (
+            "No real platform OAuth adapter is configured, so every connection is made "
             "against FakeOAuthProvider (no network) and nothing can be published "
             "outside this process. Publishing to "
             + ", ".join(APP_REVIEW_GATED)
             + " is gated on per-platform App Review -- see docs/CHANNELS.md sections 2-3."
-        ),
+        )
+    else:
+        # Two sentences, and the second one is the important one: a real adapter means a
+        # customer's grant is real, NOT that we may post with it. Saying only the first
+        # half is how a settings screen starts promising something App Review has not
+        # granted yet.
+        message = (
+            "A real OAuth adapter is configured for "
+            + ", ".join(real)
+            + ", so connecting one of those authorises us against the live platform and "
+            "the credential we store is real. Publishing is still gated on per-platform "
+            "App Review (" + ", ".join(APP_REVIEW_GATED) + ") -- see docs/CHANNELS.md "
+            "sections 2-3."
+        )
+        if fake:
+            message += " Every other platform (" + ", ".join(fake) + ") still uses "
+            message += "FakeOAuthProvider: no network, nothing published."
+
+    return OAuthStatus(
+        platforms=CONNECTABLE_PLATFORMS,
+        real_providers=real,
+        using_fake_providers=bool(fake),
+        blocked_on_app_review=APP_REVIEW_GATED,
+        message=message,
     )
