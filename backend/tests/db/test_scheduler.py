@@ -10,13 +10,16 @@ wrong. A test with a mocked session could not tell those apart.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
 
+from backend.app.core.config import get_settings
 from backend.app.db.session import business_session, session
+from backend.app.services import cost_service
 from backend.app.worker.scheduler import STRANDED_AFTER, tick
 
 pytestmark = pytest.mark.db
@@ -336,3 +339,155 @@ async def test_a_finished_run_is_never_reopened_by_the_sweep(
     await tick(submit=_Submit())
 
     assert (await _state_of(business_a, run_id)).state == "done"
+
+
+# --------------------------------------------------------------------------- #
+# the monthly ceiling
+# --------------------------------------------------------------------------- #
+#
+# The bug these exist for: the per-business USD ceiling was enforced in `api/runs.py`,
+# and this worker started runs through `RunService.start` directly — so an automation
+# spent past a ceiling a human pressing the same button was refused at. A test asserting
+# only "an over-ceiling business does not start" would have passed on the broken code
+# whenever the ledger happened to be empty, which is why each of these seeds real spend.
+
+
+async def _spend(business_id: UUID, usd: str) -> None:
+    """A real `model_usage` row, because the guard reads the ledger and not a flag."""
+    async with business_session(business_id) as db:
+        await db.execute(
+            text(
+                """
+                INSERT INTO model_usage
+                    (id, business_id, provider, model, tokens_in, tokens_out, usd,
+                     latency_ms, created_at)
+                VALUES (:i, :b, 'openrouter', 'openai/gpt-4.1-mini', 100, 200, :usd,
+                        250, now())
+                """
+            ),
+            {"i": uuid4(), "b": business_id, "usd": Decimal(usd)},
+        )
+
+
+async def _reason(business_id: UUID) -> str | None:
+    async with business_session(business_id) as db:
+        reason = (
+            await db.execute(
+                text("SELECT paused_reason FROM automation_settings WHERE business_id = :b"),
+                {"b": business_id},
+            )
+        ).scalar_one()
+    return None if reason is None else str(reason)
+
+
+async def test_an_over_ceiling_automation_is_paused_instead_of_started(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The whole point of N2: the worker asks the same question the API asks.
+
+    Four things are asserted together because each alone would pass on a broken fix: no
+    run submitted, the pause recorded, the REASON stating both figures, and the slot NOT
+    claimed — a claimed-then-refused slot would silently skip a cycle the owner never got.
+    """
+    due_at = datetime.now(UTC) - timedelta(minutes=1)
+    await _automation(business_a, next_run_at=due_at)
+    await _spend(business_a, "40.00")
+    submit = _Submit()
+    try:
+        report = await tick(submit=submit)
+
+        assert submit.calls == [], "a run started past the ceiling is money we refused a human"
+        assert report.paused == [business_a]
+        assert report.started == []
+
+        reason = await _reason(business_a)
+        assert reason is not None
+        assert "40.00" in reason, "the owner needs the figures, not 'over budget'"
+        assert "25.00" in reason
+        assert (await _settings(business_a)).next_run_at == due_at, "the slot must survive"
+    finally:
+        await _clear(business_a)
+
+
+async def test_a_paused_automation_leaves_the_workers_list_entirely(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """`due_automations()` requires `paused_reason IS NULL`, so the pause is what stops
+    the next tick re-reading the same row and re-pausing it forever."""
+    await _automation(business_a, next_run_at=datetime.now(UTC) - timedelta(minutes=1))
+    await _spend(business_a, "40.00")
+    try:
+        await tick(submit=_Submit())
+
+        async with session() as db:
+            still_due = (
+                await db.execute(
+                    text("SELECT count(*) FROM due_automations() WHERE business_id = :b"),
+                    {"b": business_a},
+                )
+            ).scalar_one()
+        assert still_due == 0
+
+        second = await tick(submit=_Submit())
+        assert second.paused == [], "a paused automation is not re-paused every minute"
+    finally:
+        await _clear(business_a)
+
+
+async def test_spend_under_the_ceiling_still_starts_the_run(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The direction of the guard, pinned. Without this, an inverted comparison — or a
+    guard that fired on any ledger row at all — would pass every test above."""
+    await _automation(business_a, next_run_at=datetime.now(UTC) - timedelta(minutes=1))
+    await _spend(business_a, "1.50")
+    submit = _Submit()
+    try:
+        report = await tick(submit=submit)
+
+        assert report.paused == []
+        assert [call[1] for call in submit.calls] == [business_a]
+    finally:
+        await _clear(business_a)
+
+
+async def test_one_business_over_its_ceiling_does_not_pause_another(
+    scoped_sessions: None, business_a: UUID, business_b: UUID
+) -> None:
+    """The ceiling is per business, and the tick must not treat one ledger as the fleet's."""
+    await _automation(business_a, next_run_at=datetime.now(UTC) - timedelta(minutes=1))
+    await _automation(business_b, next_run_at=datetime.now(UTC) - timedelta(minutes=1))
+    await _spend(business_a, "40.00")
+    submit = _Submit()
+    try:
+        report = await tick(submit=submit)
+
+        assert report.paused == [business_a]
+        assert [call[1] for call in submit.calls] == [business_b]
+        assert await _reason(business_b) is None
+    finally:
+        await _clear(business_a)
+        await _clear(business_b)
+
+
+async def test_the_kill_switch_pauses_automation_too(
+    scoped_sessions: None, business_a: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`BUSINESS_MONTHLY_CAP_USD=0` is documented as stopping all model spend for every
+    business. It has to stop the spend nobody is watching as well as the spend somebody
+    just clicked — otherwise the switch says "off" and the scheduler keeps going.
+
+    Patched on `cost_service`, which is where the ceiling is read now that two callers
+    enforce it.
+    """
+    zero = get_settings().model_copy(update={"business_monthly_cap_usd": Decimal("0")})
+    monkeypatch.setattr(cost_service, "get_settings", lambda: zero)
+    await _automation(business_a, next_run_at=datetime.now(UTC) - timedelta(minutes=1))
+    submit = _Submit()
+    try:
+        report = await tick(submit=submit)
+
+        assert submit.calls == []
+        assert report.paused == [business_a]
+    finally:
+        await _clear(business_a)

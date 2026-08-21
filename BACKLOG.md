@@ -715,7 +715,7 @@ one an owner can see.
   `knownCadences` / `pollIntervalSeconds` from the response rather than restating them, and
   rendering `nextRunAt` and `pausedReason` verbatim.
 
-- [ ] **N2 · A SCHEDULED run is not subject to the monthly USD cap** — found while verifying
+- [x] **N2 · A SCHEDULED run is not subject to the monthly USD cap** — found while verifying
   A7, and it is a money hole rather than a tidy-up. `_require_monthly_headroom` lives in
   `api/runs.py` and guards the two HTTP routes; the scheduler calls `RunService.start` +
   `submit(...)` directly (`worker/scheduler._start_run`), so an automation on a weekly cadence
@@ -729,6 +729,32 @@ one an owner can see.
   start and says why in the run's own record rather than only in a log; the API's 409 body is
   unchanged; a test starts a scheduled run for an over-cap business and asserts no provider
   call was made.**
+  **CLOSED, with ONE deliberate deviation from that criterion, recorded rather than quietly
+  taken.** `cost_service.monthly_cap_state` is now the single decision — the ledger read, the
+  configured ceiling (read there, so two entry points cannot enforce two different numbers),
+  and one `sentence` stating both figures. Every entry point asks it: `POST /runs` and
+  `/runs/{id}/resume` refuse 409 with the body **byte-identical** to before (the sentence stops
+  before the consequence and each caller appends its own), and the scheduler asks BEFORE
+  claiming the slot. `approve` stays exempt for the reason already documented at its call site.
+  - **The deviation: a scheduled refusal is recorded on the AUTOMATION, not "in the run's own
+    record".** Writing it to a run means creating one — and `api/runs.py` already argues, at
+    length, that a `partial` row with no events appears in the runs list, in the dashboard's
+    run count and in the timeline as work it never did. So the refusal is written to
+    `automation_settings.paused_reason`, which is the column whose model docstring already
+    names "budget exhausted" as its example, and which the owner sees on their own screen. The
+    original wording was written before that column was in view; this is the better answer and
+    the criterion was wrong, not the code.
+  - **The guard is not enforced by review.** `tests/test_run_start_guard.py` walks the AST of
+    every module under `backend/app` and fails the build if one hands a run to the executor
+    without referencing `monthly_cap_state` — module level, not per call site, because a
+    per-function exemption list for `approve` would make the test a rubber stamp. It carries a
+    second assertion pinning the set of run-starting modules, so it cannot start passing
+    vacuously when `submit` is renamed or a route file is split. Verified by deleting the guard:
+    three scheduler tests and this one go red, which is exactly the shipped bug reproduced.
+  - Also: `BUSINESS_MONTHLY_CAP_USD=0` is documented as stopping all model spend for every
+    business, and now actually does — it has to stop the spend nobody is watching as well as
+    the spend somebody just clicked. `ARCHITECTURE.md` §7.4 rewritten to describe this, and to
+    stop stating the weekly published-pieces cap as fact (A6 is still open).
 
 - [ ] **N3 · The connection-expiry sweep has no caller** — see A3-ii, sharpened rather than
   duplicated: the function is written and tested, and the scheduler is now the obvious home.

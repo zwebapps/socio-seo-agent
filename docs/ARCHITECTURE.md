@@ -313,7 +313,9 @@ Three layers, weakest to strongest:
 Unique index on `actions.idempotency_key` is the lock. An `in_flight` row older than its timeout is reconciled by asking the provider whether the action landed (search the CMS for the slug, the social API for the post) before any retry. **A safety net that guesses is not a safety net.**
 
 ### 7.4 Budgets and caps
-Checked *before* each model call, at three levels: per run (USD + 14 steps), per business per month (USD), per business per week (published pieces — this one is a quality control, not a cost control). Exceeding any cap ends the run with a partial result and a stated reason. Never an infinite loop.
+Checked *before* each model call, at three levels: per run (USD + 14 steps), per business per month (USD), per business per week (published pieces — this one is a quality control, not a cost control; **not implemented yet**, see `BACKLOG.md` A6). Exceeding a cap mid-run ends the run with a partial result and a stated reason. Never an infinite loop.
+
+**A ceiling already breached before a run exists is refused instead**, because a `partial` row with no events would appear in the runs list, in the run count and in the timeline as work it never did. `cost_service.monthly_cap_state` is the single decision — the ledger read, the configured ceiling, and one sentence stating both figures — and **every path that can begin a run asks it**: `POST /runs` and `POST /runs/{id}/resume` refuse 409, and the scheduler pauses that business's automation with the figures in `automation_settings.paused_reason`, since a worker has nobody to return a status code to. `POST /runs/{id}/approve` is deliberately exempt: it publishes work already generated and already paid for, and the only route to `awaiting_approval` is a guarded start. The composition used to live in `api/runs.py`, which was correct until the scheduler became a second caller and spent past a ceiling a human was refused at; `tests/test_run_start_guard.py` now fails the build if a module hands a run to the executor without consulting it.
 
 ### 7.5 SLOs (starting targets)
 

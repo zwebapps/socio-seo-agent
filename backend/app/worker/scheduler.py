@@ -36,6 +36,15 @@ one of them win, without a lock and without a queue.
 **One business's failure costs that business.** Every step is per-business and wrapped,
 in the same posture HARVEST applies to a dead fact source: a tenant whose run cannot
 start must not stop the tick that would have served the other forty.
+
+**The monthly ceiling is checked here, before the slot is claimed.** It has to be: the
+per-business USD cap was enforced in `api/runs.py`, so for as long as this worker called
+`RunService.start` directly, an automation spent past a ceiling a human pressing the same
+button was refused at. The decision is `cost_service.monthly_cap_state`, shared with
+those routes; what differs is the consequence, because a scheduler has nobody to return a
+409 to. So an over-ceiling automation is PAUSED with the figures stated, which is exactly
+what `automation_settings.paused_reason` is for — the owner sees why on their own screen
+instead of the refusal existing only in a log line nobody reads.
 """
 
 from __future__ import annotations
@@ -53,6 +62,8 @@ from sqlalchemy.engine import CursorResult
 from backend.app.agents.state import normalise_channels
 from backend.app.db.session import business_session, session
 from backend.app.services.automation_service import compute_next_run
+from backend.app.services.automation_settings_service import pause_automation
+from backend.app.services.cost_service import monthly_cap_state
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +106,11 @@ class TickReport:
     #: separately from `started` because a scheduler reporting "42 due" while starting
     #: none is the failure this field exists to make visible.
     failed: list[UUID] = field(default_factory=list)
+    #: Businesses whose automation was paused this pass because their monthly ceiling
+    #: is used up. Reported rather than only logged for the same reason `failed` is: a
+    #: tick that silently declined to run half its work is indistinguishable from a tick
+    #: with no work to do.
+    paused: list[UUID] = field(default_factory=list)
     stranded_marked: int = 0
     connections_expired: int = 0
 
@@ -156,6 +172,40 @@ async def _claim(row: Any, *, now: datetime) -> datetime | None:
         if cast("CursorResult[Any]", result).rowcount == 0:
             return None
     return following
+
+
+async def _pause_over_ceiling(business_id: UUID) -> bool:
+    """Pause this business's automation if its monthly ceiling is used up.
+
+    Returns whether it was paused, so the caller skips it without needing to know how the
+    decision was made. Called BEFORE `_claim`, which is what stops the slot being spent
+    on a run that must not start: a claimed-then-refused slot would silently skip a cycle
+    the owner never got.
+
+    **The reason names both figures**, because the panel renders this string verbatim and
+    "paused: over budget" gives an owner nothing to act on. `state.sentence` is the same
+    sentence the API's 409 quotes, so the two cannot disagree about one ledger.
+
+    Nothing here un-pauses. An automation resumes when the owner switches it back on
+    (`save_automation` clears `paused_reason` on an explicit enable and recomputes the
+    slot), which is deliberate: the window rolling forward is not, by itself, evidence
+    that the owner still wants the runs they were refused.
+    """
+    state = await monthly_cap_state(business_id)
+    if not state.exceeded:
+        return False
+
+    async with business_session(business_id) as db:
+        await pause_automation(
+            business_id,
+            session=db,
+            reason=(
+                f"{state.sentence}, so scheduled runs are paused. Switch automation back "
+                "on once the window has rolled forward."
+            ),
+        )
+    logger.info("scheduler: paused automation for %s -- monthly ceiling used up", business_id)
+    return True
 
 
 async def _start_run(row: Any, *, submit: Any) -> UUID:
@@ -251,6 +301,12 @@ async def tick(*, submit: Any, now: datetime | None = None) -> TickReport:
 
     for row in due:
         try:
+            # Before the claim, and before anything that can reach a provider. See the
+            # module docstring: this worker used to be the one run-starting path that
+            # did not ask.
+            if await _pause_over_ceiling(row.business_id):
+                report.paused.append(row.business_id)
+                continue
             if await _claim(row, now=moment) is None:
                 continue
             report.started.append(await _start_run(row, submit=submit))
@@ -281,11 +337,12 @@ async def run_forever(
     logger.info("scheduler: started, every %.0fs", interval_s)
     while True:
         report = await tick(submit=submit)
-        if report.started or report.failed or report.stranded_marked:
+        if report.started or report.failed or report.paused or report.stranded_marked:
             logger.info(
-                "scheduler: started=%d failed=%d stranded=%d",
+                "scheduler: started=%d failed=%d paused=%d stranded=%d",
                 len(report.started),
                 len(report.failed),
+                len(report.paused),
                 report.stranded_marked,
             )
         if stop is not None and stop.is_set():

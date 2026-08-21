@@ -26,8 +26,7 @@ first thing `start_run` does, ahead of even creating the row.
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from decimal import Decimal
+from collections.abc import AsyncIterator
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -41,11 +40,10 @@ from backend.app.api.auth import CurrentUser
 from backend.app.core.config import get_settings
 from backend.app.db.adapters.run_store import PostgresRunStore
 from backend.app.engines.channel.specs import canonicalise_known
-from backend.app.llm.pricing import format_usd
 from backend.app.services.cost_service import (
-    MONTHLY_CAP_WINDOW_DAYS,
+    SpendReader,
+    monthly_cap_state,
     monthly_spend_usd,
-    over_monthly_cap,
 )
 from backend.app.services.review_service import (
     ExportPack,
@@ -185,7 +183,7 @@ async def get_run_service(
 #: call, for the same reason `get_run_service` is one: the routes that hold the guard have
 #: to be testable without a Postgres, and a test that could only assert the refusal by
 #: seeding a ledger would not be run often enough to be worth having.
-MonthlySpendReader = Callable[[UUID], Awaitable[Decimal]]
+MonthlySpendReader = SpendReader
 
 
 def get_monthly_spend_reader() -> MonthlySpendReader:
@@ -201,16 +199,19 @@ async def _require_monthly_headroom(business_id: UUID, spend: MonthlySpendReader
     not control". The per-run guard applies that to one call; this applies it to a whole
     run, which is the level `docs/ARCHITECTURE.md` section 7.4 states the ceiling at.
 
-    **The refusal states both numbers.** "Over budget" with no figures gives the owner
-    nothing to act on and gives support nothing to check, and the two things anybody asks
-    next are what was spent and what the limit is. Both are rendered with
-    :func:`~backend.app.llm.pricing.format_usd`, so they match the cost screen digit for
-    digit rather than being a second opinion about the same ledger.
+    **The decision is `cost_service.monthly_cap_state` and is NOT assembled here.** It
+    was, until the scheduler began starting runs through `RunService.start` without ever
+    passing this function — so an automation spent past a ceiling a human pressing the
+    same button was refused at. The ledger read, the configured ceiling and the sentence
+    that states both figures now live in one place and every entry point asks it; what is
+    left here is the only part that is genuinely an API decision, which is the status
+    code.
 
-    Rendered as strings and never as `Decimal`, and that is not cosmetic: FastAPI encodes
-    an exception's `detail` with `jsonable_encoder`, which turns a `Decimal` into a JSON
-    float -- so a money value put in this dict raw would leave here as binary floating
-    point, in the one code path that exists to talk about money accurately.
+    **The refusal states both numbers**, because "over budget" with no figures gives the
+    owner nothing to act on and gives support nothing to check. `state.sentence` stops
+    before the consequence and this appends the API's own, so the automation's
+    `paused_reason` can append a different one without either drifting on how the money
+    is quoted.
 
     409 rather than 402, to match every other refusal in this module. The blocking
     condition is the state of this business's ledger, which is the same shape of answer as
@@ -223,19 +224,15 @@ async def _require_monthly_headroom(business_id: UUID, spend: MonthlySpendReader
     anything: a `partial` row with no events would appear in the runs list, in the
     dashboard's run count and in the timeline as work, and it did none.
     """
-    cap_usd = get_settings().business_monthly_cap_usd
-    spent_usd = await spend(business_id)
+    state = await monthly_cap_state(business_id, spend=spend)
 
-    if over_monthly_cap(spent_usd, cap_usd):
+    if state.exceeded:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "code": "monthly_cap_exceeded",
                 "message": (
-                    f"This business has spent ${format_usd(spent_usd)} of its "
-                    f"${format_usd(cap_usd)} ceiling for the last "
-                    f"{MONTHLY_CAP_WINDOW_DAYS} days, so no new run can start until that "
-                    "window rolls forward."
+                    f"{state.sentence}, so no new run can start until that window rolls forward."
                 ),
             },
         )

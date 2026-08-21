@@ -20,6 +20,7 @@ from backend.app.core.config import get_settings
 from backend.app.db.models import Role, User
 from backend.app.llm.pricing import format_usd
 from backend.app.main import create_app
+from backend.app.services import cost_service
 from backend.app.services.run_service import MAX_RUN_LIST_LIMIT, InMemoryRunStore, RunService
 
 BUSINESS = uuid4()
@@ -1790,9 +1791,14 @@ async def test_the_ceiling_comes_from_configuration(monkeypatch: pytest.MonkeyPa
     Also pins the direction: the same spend that passes under a $25 ceiling is refused
     under a 10-cent one, which is what makes this the ceiling doing the work rather than
     the spend figure.
+
+    Patched on `cost_service`, which is where the ceiling is now read: the composition of
+    ledger-read + configured-ceiling + stated-figures moved there when the scheduler
+    became a second caller that had to enforce the same number. Two entry points reading
+    two settings would be the same bug one level down.
     """
     tight = get_settings().model_copy(update={"business_monthly_cap_usd": Decimal("0.10")})
-    monkeypatch.setattr(runs_api, "get_settings", lambda: tight)
+    monkeypatch.setattr(cost_service, "get_settings", lambda: tight)
 
     service = RunService(InMemoryRunStore())
     executor = _RecordingExecutor()

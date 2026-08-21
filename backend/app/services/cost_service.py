@@ -30,12 +30,24 @@ indexes to the API's memory, and the numbers are the only thing we want back.
 The same ledger also answers a question that is not a dashboard question: **may this
 business start another run at all.** :func:`monthly_spend_usd` and
 :func:`over_monthly_cap` are the read and the boundary behind the per-business ceiling of
-`docs/ARCHITECTURE.md` section 7.4; the refusal itself lives in ``api/runs.py``, because
-what to do about a breached ceiling is an API decision and reading a ledger is not.
+`docs/ARCHITECTURE.md` section 7.4, and :func:`monthly_cap_state` is the ONE place that
+puts them together — the ledger read, the configured ceiling, and the sentence that
+states both figures.
+
+**Why that composition is here and not at each caller.** It used to be assembled inside
+``api/runs.py``, which was correct while the API was the only way a run could begin. Then
+the scheduler started runs too, called ``RunService.start`` directly, and spent past a
+ceiling a human pressing the same button was refused at — the ceiling existed and one
+caller simply did not know about it. So the *decision* lives here and every entry point
+asks it. What to DO about a breached ceiling still belongs to the caller, and genuinely
+differs: an HTTP request is refused 409 and an automation pauses itself with a stated
+reason, because a scheduler has nobody to return a status code to.
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
@@ -48,6 +60,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from backend.app.agents.state import DEFAULT_MAX_USD
+from backend.app.core.config import get_settings
 from backend.app.db.models import ModelUsage, Run
 from backend.app.db.session import business_session
 from backend.app.llm.pricing import format_usd, is_priced
@@ -73,6 +86,11 @@ BREAKDOWN_LIMIT: Final = 20
 #: would also hand a business at its ceiling a full allowance again at midnight on the
 #: 1st, which is a reset rather than a control.
 MONTHLY_CAP_WINDOW_DAYS: Final = DEFAULT_WINDOW_DAYS
+
+#: Reads one business's spend over the ceiling's window. Named here rather than in each
+#: caller so the API's dependency override and the scheduler's test double are the same
+#: shape as the real function they stand in for.
+type SpendReader = Callable[[UUID], Awaitable[Decimal]]
 
 
 class _Wire(BaseModel):
@@ -377,6 +395,78 @@ async def monthly_spend_usd(
     return spent if spent is not None else Decimal("0")
 
 
+@dataclass(frozen=True, slots=True)
+class MonthlyCapState:
+    """One business's standing against its monthly ceiling, as every caller sees it.
+
+    A value object rather than a bare bool, because both callers need the FIGURES and
+    not just the verdict: "over budget" with no numbers gives the owner nothing to act
+    on and gives support nothing to check, and the two things anybody asks next are what
+    was spent and what the limit is.
+
+    Not a pydantic model: this is not a wire shape. It reaches the owner as an HTTP
+    refusal body composed in ``api/runs.py`` and as an automation's ``paused_reason``,
+    both of which state it in words.
+    """
+
+    spent_usd: Decimal
+    cap_usd: Decimal
+    window_days: int
+
+    @property
+    def exceeded(self) -> bool:
+        """Whether the ceiling is used up. :func:`over_monthly_cap` owns the boundary."""
+        return over_monthly_cap(self.spent_usd, self.cap_usd)
+
+    @property
+    def sentence(self) -> str:
+        """The shared statement of fact, with no consequence attached.
+
+        Deliberately stops before "so ...": the consequence differs by caller (a refused
+        request, a paused automation) and each appends its own. What must NOT differ is
+        how the money is quoted — both figures go through
+        :func:`~backend.app.llm.pricing.format_usd`, the same formatter the cost screen
+        uses, so a refusal and the dashboard cannot give two opinions about one ledger.
+
+        A `str`, never a `Decimal` on the wire: FastAPI encodes an exception's `detail`
+        with `jsonable_encoder`, which turns a `Decimal` into a JSON float — binary
+        floating point in the one code path that exists to talk about money accurately.
+        """
+        return (
+            f"This business has spent ${format_usd(self.spent_usd)} of its "
+            f"${format_usd(self.cap_usd)} ceiling for the last {self.window_days} days"
+        )
+
+
+async def monthly_cap_state(
+    business_id: UUID,
+    *,
+    spend: SpendReader | None = None,
+    cap_usd: Decimal | None = None,
+    window_days: int = MONTHLY_CAP_WINDOW_DAYS,
+) -> MonthlyCapState:
+    """Read the ledger and the ceiling, and report where this business stands.
+
+    **Every path that can begin a run calls this before anything that can reach a
+    provider**, and that ordering is the whole control: `llm/router.py` — "checking spend
+    after the tokens are gone is accounting, not control". The per-run guard applies that
+    to one call; this applies it to a whole run, which is the level
+    `docs/ARCHITECTURE.md` section 7.4 states the ceiling at.
+
+    `spend` is a seam so the guard is testable without a Postgres — a refusal that could
+    only be asserted by seeding a ledger is a test nobody runs often enough to be worth
+    having. `cap_usd` defaults to the configured ceiling, read HERE rather than at each
+    caller so two entry points cannot enforce two different numbers.
+    """
+    reader = spend if spend is not None else monthly_spend_usd
+    ceiling = cap_usd if cap_usd is not None else get_settings().business_monthly_cap_usd
+    return MonthlyCapState(
+        spent_usd=await reader(business_id),
+        cap_usd=ceiling,
+        window_days=window_days,
+    )
+
+
 def over_monthly_cap(spent_usd: Decimal, cap_usd: Decimal) -> bool:
     """Whether ``spent_usd`` has used up the ceiling.
 
@@ -402,9 +492,12 @@ __all__ = [
     "MONTHLY_CAP_WINDOW_DAYS",
     "CostReport",
     "DailySpend",
+    "MonthlyCapState",
     "RunSpend",
+    "SpendReader",
     "SpendRow",
     "cost_report",
+    "monthly_cap_state",
     "monthly_spend_usd",
     "over_monthly_cap",
 ]

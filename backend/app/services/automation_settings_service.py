@@ -62,6 +62,7 @@ __all__ = [
     "AutomationRecord",
     "InvalidScheduleError",
     "load_automation",
+    "pause_automation",
     "save_automation",
 ]
 
@@ -272,6 +273,48 @@ async def save_automation(
         .returning(AutomationSetting)
     )
     row = (await session.execute(statement)).scalar_one()
+    await session.flush()
+    return _project(row)
+
+
+async def pause_automation(
+    business_id: UUID, *, session: AsyncSession, reason: str
+) -> AutomationRecord:
+    """Record that the SYSTEM stopped this automation, and why.
+
+    The counterpart to an owner's switch, and the reason `paused_reason` is a separate
+    column from `mode`: an owner turning automation off and the platform stopping it are
+    different events, and only one of them has to be explained back. `due_automations()`
+    requires `paused_reason IS NULL`, so writing one is what takes the row out of the
+    worker's list — no mode change, so the owner's own setting is preserved and reading
+    the panel still shows the schedule they chose.
+
+    **`next_run_at` is deliberately left where it is.** Advancing it would claim a slot
+    that was never used, and clearing it would lose the fact that a run was due. Nothing
+    can act on a stale timestamp while `paused_reason` is set, and the only thing that
+    clears that — an owner deliberately switching automation back on — recomputes the
+    slot from the current time anyway.
+
+    Idempotent by intent rather than by check: writing the same reason twice is the same
+    row. A no-op guard would need to compare the text, and a paused automation being
+    re-pausable with a FRESHER reason is the more useful behaviour (the figures in a
+    budget message move).
+
+    Returns the record so a caller can log or render what the owner will now see, rather
+    than re-reading the row it just wrote.
+    """
+    row = (
+        await session.execute(
+            select(AutomationSetting).where(AutomationSetting.business_id == business_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        # Nothing to pause. Not an error: the automation may have been switched off, or
+        # the row deleted, between the worker selecting it as due and this write — and
+        # inventing a row to hold a pause reason would put a business into the
+        # scheduler's table for a decision nobody made.
+        return _defaults(business_id)
+    row.paused_reason = reason
     await session.flush()
     return _project(row)
 
