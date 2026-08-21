@@ -101,6 +101,27 @@ def get_actuator_resolver() -> Any:
     return _build_actuator_resolver()
 
 
+async def get_run_service(
+    business_id: Annotated[UUID, Depends(current_business)],
+) -> Any:
+    """The run store, for reading a run's checkpoint.
+
+    Reuses `api/runs.get_run_service` rather than building a second one: the tenant is
+    injected into the store there, and a second construction is a second chance to get
+    that wrong — which is the bug that made every run 404.
+    """
+    from backend.app.api.runs import get_run_service as runs_service
+
+    return await runs_service(business_id)
+
+
+def get_content_store() -> Any:
+    """Content-piece persistence. Overridden in tests."""
+    from backend.app.db.adapters.content_store import PostgresContentStore
+
+    return PostgresContentStore()
+
+
 def get_action_store() -> Any:
     """The `actions` ledger the idempotency key is claimed in. Overridden in tests."""
     from backend.app.db.adapters.action_store import PostgresActionStore
@@ -147,6 +168,90 @@ async def list_posts(
     async with open_session(business_id) as session:
         records = await social_post_service.list_posts(
             business_id, session=session, since=since, until=until, limit=MAX_POSTS
+        )
+    return PostListResponse(posts=[_out(record) for record in records])
+
+
+class QueueFromRunRequest(CamelModel):
+    """Optionally give every queued post the same time."""
+
+    scheduled_at: datetime | None = None
+
+
+@router.post(
+    "/from-run/{run_id}",
+    response_model=PostListResponse,
+    response_model_by_alias=True,
+    status_code=status.HTTP_201_CREATED,
+    summary="Put an approved run's channel posts on the calendar",
+)
+async def queue_from_run(
+    run_id: UUID,
+    payload: QueueFromRunRequest,
+    business_id: Annotated[UUID, Depends(current_business)],
+    open_session: Annotated[Any, Depends(get_business_session_opener)],
+    service: Annotated[Any, Depends(get_run_service)],
+    store: Annotated[Any, Depends(get_content_store)],
+) -> PostListResponse:
+    """Take the renderings REPACK wrote and make them queued posts.
+
+    **Only from an approved run.** The renderings exist from REPACK onward, but a run
+    that has not passed REVIEW has content nobody agreed to publish, and putting it on a
+    calendar beside a publish button is the approval gate becoming optional by the back
+    door. `approved_by` in the checkpoint is the same authority EXPORT checks.
+
+    The article piece is created here if the run has none, and reused if it has one:
+    two anchors for one run would split its clicks across two pieces and make "which
+    content earned this" unanswerable. That row is also what makes the founder's
+    no-landing-page ruling implementable at all — until it existed, the only thing that
+    ever created a `content_pieces` row was the landing-page actuator, so removing the
+    page would have removed the anchor attribution hangs off.
+    """
+    checkpoint = await service.restore(run_id)
+    if checkpoint is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=_error("run_not_found", "No such run.")
+        )
+    if not str(checkpoint.get("approved_by") or "").strip():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=_error(
+                "run_not_approved",
+                "This run has not been approved, so its posts cannot be queued. "
+                "Approve it on the run page first.",
+            ),
+        )
+
+    renderings = checkpoint.get("renderings")
+    if not isinstance(renderings, dict) or not renderings:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=_error(
+                "no_renderings",
+                "This run produced no channel posts. The timeline says which step it "
+                "reached and why.",
+            ),
+        )
+
+    piece_id = await store.article_for_run(business_id, run_id)
+    if piece_id is None:
+        draft = checkpoint.get("draft")
+        draft = draft if isinstance(draft, dict) else {}
+        piece = await store.create_article_piece(
+            business_id,
+            title=str(draft.get("title") or "Untitled")[:512],
+            body_md=str(draft.get("html") or ""),
+            run_id=run_id,
+        )
+        piece_id = piece.id
+
+    async with open_session(business_id) as session:
+        records = await social_post_service.queue_posts(
+            business_id,
+            content_piece_id=piece_id,
+            renderings=renderings,
+            session=session,
+            scheduled_at=payload.scheduled_at,
         )
     return PostListResponse(posts=[_out(record) for record in records])
 

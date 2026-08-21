@@ -27,6 +27,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { Shell } from "@/app/components/page-shell";
 import { Pill, SoftButton, SoftCard } from "@/app/components/soft";
+import { PostCalendar } from "@/app/content/calendar";
 import { fetchReview, type SocialPost } from "@/app/lib/review-api";
 import { fetchRuns, type RunSummary } from "@/app/lib/runs-api";
 
@@ -98,6 +99,16 @@ export default function ContentPage() {
         Every post the agent wrote, shaped for its channel — the claim is identical across
         them, only the register and the length change. Copy one and paste it; that works on
         every channel today, including the ones no API can publish to.
+      </p>
+
+      {/* The calendar first: it is where a post is acted on. The run-by-run list below
+          stays because it is where posts COME FROM, and because it shows the ones a run
+          produced that were never queued. */}
+      <PostCalendar />
+
+      <h2 className="mt-12 text-sm font-semibold">Straight from your runs</h2>
+      <p className="mt-1 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
+        Everything REPACK wrote, whether or not it is on the calendar yet.
       </p>
 
       {state.kind === "loading" && (
