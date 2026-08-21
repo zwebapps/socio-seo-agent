@@ -143,6 +143,16 @@ export default function Home() {
             </h2>
             <ul className="mt-3 space-y-2.5">
               <NavRow
+                href="/business"
+                title="Your business"
+                blurb="Everything the agent knows about you — website, voice, and the claims it may never make."
+              />
+              <NavRow
+                href="/content"
+                title="Your content"
+                blurb="Every post it wrote, per channel, ready to copy and paste."
+              />
+              <NavRow
                 href="/leads"
                 title="Leads"
                 blurb="Who got in touch, and which piece of content earned them."

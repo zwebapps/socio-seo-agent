@@ -239,3 +239,44 @@ async def test_a_taught_preference_alone_does_not_count_as_onboarded(
         state = await read_onboarding_state(business_a, session=s)
 
     assert state.onboarded is False
+
+
+async def test_a_named_but_unonboarded_business_reports_its_name(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """The bug this closes, seen on the /business screen.
+
+    `dna` is `{}` until onboarding, so reading the name only from there reported a
+    business the owner had just named as "Not set". `businesses.name` is what they
+    typed when they created it, and it is the right answer until a confirmed DNA
+    supplies a better one.
+    """
+    async with business_session(business_a) as s:
+        # No explicit commit: `business_session` owns the transaction, and committing
+        # inside it closes the context manager out from under the read below.
+        await s.execute(
+            text("UPDATE businesses SET name = :n WHERE id = :i"),
+            {"n": "Robot Aircraft", "i": business_a},
+        )
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.onboarded is False, "naming a business is not onboarding it"
+    assert state.name == "Robot Aircraft"
+
+
+async def test_a_confirmed_dna_name_wins_over_the_typed_one(
+    scoped_sessions: None, business_a: UUID
+) -> None:
+    """They are different facts: the column is what the owner typed, the DNA name is
+    the trading name the crawl extracted and they then confirmed."""
+    async with business_session(business_a) as s:
+        await s.execute(
+            text("UPDATE businesses SET name = :n WHERE id = :i"),
+            {"n": "typed-name-gmbh", "i": business_a},
+        )
+        await save_confirmed_dna(
+            business_a, dna=_draft(), source_url="https://mueller.example", session=s
+        )
+        state = await read_onboarding_state(business_a, session=s)
+
+    assert state.name == "Müller Sanitär GmbH"

@@ -535,7 +535,22 @@ async def login(
         settings,
         issued_at=session_issued_at(user.sessions_valid_from),
     )
-    return UserOut(id=user.id, email=user.email, is_active=user.is_active, role=user.role)
+    # Imported locally, exactly as `/auth/me` does it below: `api.runs` imports from
+    # this module, so a top-level import here would be circular.
+    from backend.app.api.runs import business_for_user
+
+    # `business_id` is populated here for the same reason `/auth/me` populates it: this
+    # is ONE model returned by two routes, and a client reading `businessId` off the
+    # login response was getting `null` for an account that owns a business — the field
+    # defaulting rather than being resolved. A response that means something different
+    # depending on which route produced it is worse than one that omits the field.
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        is_active=user.is_active,
+        role=user.role,
+        business_id=await business_for_user(user.id, session=db),
+    )
 
 
 @router.post(

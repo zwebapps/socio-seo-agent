@@ -331,9 +331,16 @@ async def read_onboarding_state(business_id: UUID, *, session: AsyncSession) -> 
     if business is None:
         return OnboardingState(onboarded=False)
     website = (business.website or "").strip()
+    # The DNA name FIRST, then the column. They are different facts and the order
+    # matters: `businesses.name` is what the owner typed when they created the business,
+    # while `dna["name"]` is the legal/trading name the crawl extracted and the owner
+    # confirmed — so once onboarded, the confirmed one is the better answer. Before
+    # then the DNA is `{}`, and reading only it reported a named business as "Not set".
+    dna_name = str((business.dna or {}).get("name") or "").strip()
+    column_name = (business.name or "").strip()
     return OnboardingState(
         onboarded=bool(website),
-        name=str((business.dna or {}).get("name") or "").strip() or None,
+        name=dna_name or column_name or None,
         website=website or None,
     )
 
