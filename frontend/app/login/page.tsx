@@ -4,6 +4,7 @@
 
 import { useState } from "react";
 import { Pill, SoftButton, SoftCard, SoftInput } from "../components/soft";
+import { landingFor, safeNext } from "../lib/roles";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8100";
 
@@ -48,8 +49,17 @@ export default function LoginPage() {
         return;
       }
 
-      const next = new URLSearchParams(window.location.search).get("next");
-      window.location.href = next ?? "/developer/models";
+      // Role-based, and read from the response we already have: `POST /login` returns
+      // `UserOut`, which carries `role`. A signup has no role in its response and is
+      // always a business owner, so it takes the owner landing.
+      const landed: unknown = await response.json().catch(() => null);
+      const role =
+        mode === "signup"
+          ? "owner"
+          : ((landed as { role?: string } | null)?.role ?? null);
+
+      const requested = safeNext(new URLSearchParams(window.location.search).get("next"));
+      window.location.href = requested ?? landingFor(role);
     } catch {
       setState({
         kind: "error",
