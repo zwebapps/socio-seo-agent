@@ -55,6 +55,15 @@ from backend.app.agents.tools import ANALYTICS_FETCH, GEO_PROBE, NOTIFY, PUBLISH
 BUSINESS = uuid4()
 APPROVER = "user:owner-1"
 
+#: The `runs` row every state below belongs to.
+#:
+#: On the state rather than derived, because it is what attributes a side effect to its
+#: cause: `_actuate` copies it onto every `Actuation`, the ledger writes it to
+#: `actions.run_id`, and the landing actuator writes it to `content_pieces.run_id`.
+#: Without it a published page cannot be joined back to the run that published it, so
+#: "how many leads did this run earn" has no answer however good the click tracking is.
+RUN = uuid4()
+
 
 # --------------------------------------------------------------------------- #
 # Doubles

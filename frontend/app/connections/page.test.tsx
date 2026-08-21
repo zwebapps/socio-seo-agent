@@ -114,12 +114,19 @@ function list(over: Partial<ConnectionList> = {}): ConnectionList {
   };
 }
 
-/** The `POST /connect` body, which is fake for every platform today. */
+/**
+ * The `POST /connect` body, which is fake for every platform today.
+ *
+ * The URL is the API's own stand-in consent screen, which is what the fake provider now
+ * mints. It used to be `https://fake-oauth.invalid/authorize` — unresolvable by RFC 2606,
+ * so a connect could be started and never finished.
+ */
 function started(over: Partial<ConnectStart> = {}): ConnectStart {
   return {
     platform: "linkedin",
     authorizationUrl:
-      "https://fake-oauth.invalid/authorize?client_id=fake-linkedin-app&state=abc",
+      "http://localhost:8100/api/v1/connections/linkedin/simulated-consent" +
+      "?client_id=fake-linkedin-app&state=abc",
     scopes: ["w_member_social"],
     fake: true,
     ...over,
@@ -276,24 +283,37 @@ describe("a simulated connection says so", () => {
   });
 
   /**
-   * The end of a connect attempt. A fake authorisation URL points at a domain RFC 2606
-   * reserves so it can never resolve, so offering it as a link would read as a broken
-   * connection rather than an absent one — and would be the one place on this screen where
-   * a simulation is dressed as the real thing.
+   * The end of a connect attempt, on the branch that is nearly always taken today.
+   *
+   * This link used to be rendered as inert text, and correctly so: it pointed at a domain
+   * RFC 2606 reserves so it can never resolve, and offering it would have read as a broken
+   * connection rather than an absent one. It now points at a stand-in consent screen the
+   * API serves, which does resolve and does complete the round trip — so it has to be a
+   * link, or the screen would hide a working path. What must not change is that the
+   * simulation is never dressed as the real thing.
    */
-  it("offers no link for a simulated authorisation, and says nothing was connected", async () => {
+  it("links to the stand-in consent screen and says no real account is connected", async () => {
     const user = userEvent.setup();
     await mount(reply(list()), reply(started()));
 
     await user.click(screen.getByRole("button", { name: "Start connecting a LinkedIn account" }));
     await settle();
 
-    expect(screen.getByText(/Nothing was sent anywhere and no account was connected/)).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: /Continue to LinkedIn/ })).not.toBeInTheDocument();
-    // The address is still shown — an operator needs to see what would have been sent —
-    // but as text, not as a destination.
-    expect(screen.getByText(/fake-oauth\.invalid/)).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: /fake-oauth/ })).not.toBeInTheDocument();
+    const link = screen.getByRole("link", { name: "Continue to the simulated consent screen" });
+    expect(link).toHaveAttribute("href", started().authorizationUrl);
+    expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
+    // Never dressed as LinkedIn's own screen — the pill, the heading and the copy all say
+    // what it is, and the copy says what approving it does not do.
+    expect(screen.getByText("simulated")).toBeInTheDocument();
+    expect(screen.getByText(/Simulated LinkedIn authorisation/)).toBeInTheDocument();
+    expect(screen.getByText(/no real account is connected/)).toBeInTheDocument();
+    expect(screen.getByText(/labelled simulated wherever it appears/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /^Continue to LinkedIn$/ }),
+    ).not.toBeInTheDocument();
+    // The address is still printed, because on this branch it is the evidence for the
+    // sentence beside it: the consent screen is on our own origin.
+    expect(screen.getByText(/simulated-consent/)).toBeInTheDocument();
     // What was asked for travels with it, because a token granted a subset of these is
     // the usual reason a publish fails long after the connection looked fine.
     expect(screen.getByText(/Permissions requested: w_member_social/)).toBeInTheDocument();

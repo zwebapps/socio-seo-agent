@@ -97,6 +97,64 @@ def test_state_survives_a_json_round_trip() -> None:
     assert [e.code for e in restored["errors"]] == ["thin"]
 
 
+def test_the_run_id_survives_the_round_trip_as_a_string() -> None:
+    """`run_id` is what attributes a published page to the run that made it.
+
+    A string rather than a `UUID` for the same reason `business_id` is one: this goes
+    into a JSONB column, and a `UUID` does not survive `json.dumps`.
+    """
+    import json
+    from uuid import uuid4
+
+    from backend.app.agents.state import from_checkpoint, run_uuid, to_checkpoint
+
+    run = uuid4()
+    state = new_state(business_id="11111111-1111-1111-1111-111111111111", goal="x", run_id=run)
+
+    assert state["run_id"] == str(run)
+    restored = from_checkpoint(json.loads(json.dumps(to_checkpoint(state))))
+    assert restored["run_id"] == str(run)
+    assert run_uuid(restored) == run, "the actuation needs it back as a UUID"
+
+
+def test_a_checkpoint_written_before_the_run_id_existed_still_reads() -> None:
+    """Nothing migrates a JSONB column, so an older row has no `run_id` at all -- and a
+    run that cannot resume loses work a customer already paid for."""
+    from backend.app.agents.state import from_checkpoint, run_uuid, to_checkpoint
+
+    old = to_checkpoint(_state())
+    del old["run_id"]
+    assert "run_id" not in old
+
+    revived = from_checkpoint(old)
+    assert revived["run_id"] is None, "a missing key reads as unattributed, not as a crash"
+    assert run_uuid(revived) is None
+
+
+@pytest.mark.parametrize("junk", ["", "   ", "latest", "not-a-uuid", 7, None, ["x"], {}])
+def test_a_hand_edited_run_id_reads_as_unattributed_rather_than_reaching_a_foreign_key(
+    junk: object,
+) -> None:
+    """This column can hold whatever an UPDATE, a backup restore or a copied row put in
+    it. The value ends up in `Actuation.run_id`, which is typed `UUID | None` and lands
+    in a foreign key -- so anything unparseable must read as "not attributed" rather
+    than crash the publish path or write a reference to nothing."""
+    from backend.app.agents.state import from_checkpoint
+
+    assert from_checkpoint({"run_id": junk, "errors": []})["run_id"] is None
+
+
+def test_a_run_id_is_normalised_rather_than_copied_through() -> None:
+    """Whitespace and case are the same id; the stored form must be the canonical one,
+    or the same run reads as two in a `GROUP BY`."""
+    from backend.app.agents.state import from_checkpoint
+
+    canonical = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+    assert from_checkpoint({"run_id": f"  {canonical.upper()}  ", "errors": []})["run_id"] == (
+        canonical
+    )
+
+
 def test_caps_have_the_documented_defaults() -> None:
     """14 steps and $0.50 per run, from docs/AGENT_RUNTIME.md section 8."""
     caps = RunCaps()

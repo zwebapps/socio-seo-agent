@@ -42,7 +42,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, Final
+from typing import Any, Final, cast
 from uuid import UUID
 
 from sqlalchemy import text
@@ -762,7 +762,7 @@ class RunExecutor:
         resume: bool,
     ) -> AgentState:
         if not resume:
-            return new_state(business_id=business_id, goal=goal)
+            return new_state(business_id=business_id, goal=goal, run_id=run_id)
 
         restored = await service.restore(run_id)
         if restored is None:
@@ -771,10 +771,17 @@ class RunExecutor:
             # resume that silently restarts has thrown away the work it was meant to
             # preserve.
             logger.warning("run %s has no checkpoint to resume from; starting fresh", run_id)
-            return new_state(business_id=business_id, goal=goal)
+            return new_state(business_id=business_id, goal=goal, run_id=run_id)
 
         await service.mark_resumed(run_id)
-        return restored
+        # Stamped, not read. This is the ONE place that knows the run's identity for
+        # certain -- the checkpoint was fetched BY this id -- and a checkpoint written
+        # before `run_id` existed has none at all. Overwriting rather than defaulting is
+        # what makes those old rows publish attributed: EXPORT runs only on a resume, so
+        # a state restored here is the state that actuates, and a `None` left in place
+        # would put another NULL in `content_pieces.run_id` for every pre-key run
+        # anybody approves from now on.
+        return cast("AgentState", {**restored, "run_id": str(run_id)})
 
     @staticmethod
     async def _drain_events(

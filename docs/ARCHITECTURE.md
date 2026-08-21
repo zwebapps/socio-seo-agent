@@ -395,30 +395,86 @@ A 10-payload injection corpus is a test, not a checklist — ten distinct *mecha
 
 ## 10. Frontend architecture
 
+`frontend/app/` is **flat** — one directory per screen. There is no route group, no
+dynamic business segment, and no public form page. This block is the whole tree;
+`ls frontend/app` should turn up nothing that is not in it.
+
 ```
 app/
-├─ (marketing)/                public, static, no auth
-├─ (auth)/login  signup
-├─ (app)/
-│  ├─ layout.tsx               session + business resolve → redirect, once
-│  ├─ businesses/[id]/
-│  │  ├─ page.tsx              dashboard: SoV, leads, opportunities
-│  │  ├─ documents/            upload, status, reindex
-│  │  ├─ opportunities/        ranked list → "create content"
-│  │  ├─ runs/[runId]/         SSE timeline: nodes, tool calls, live cost
-│  │  ├─ content/[pieceId]/    tabs: draft · SEO findings · social · AI blocks
-│  │  │                        edit → approve → export
-│  │  ├─ leads/                inbox with attribution
-│  │  └─ settings/             brand voice, channels, approval policy
-│  └─ developer/               models, sliders, prompt versions, tool toggles,
-│                              raw traces — the API is role-gated, not the route
-└─ f/[formId]/                 PUBLIC lead form — no auth, no cookies,
-                               its own minimal bundle
+├─ layout.tsx                  <html>, pinned light theme, SessionBar. No auth, no redirect
+├─ page.tsx                    owner's home: start a run · recent runs · latest leads
+├─ login/                      sign in and sign up
+├─ onboard/                    crawl a homepage → confirm the business DNA
+├─ documents/                  upload, ingest status, reindex
+├─ runs/                       the run list
+│  └─ [runId]/                 timeline (SSE → polling), review tabs, approve/reject, export
+├─ leads/                      inbox with attribution
+├─ memory/                     the business preferences the next run's prompt will carry
+├─ connections/                platform accounts: status, usability verdict, disconnect
+├─ developer/                  layout + nav, then models · runtime · tools · cost
+├─ globals.css                 tokens, the light/dark palettes, neumorphic surfaces
+├─ components/                 shell, cards, run rows, safe HTML — not routes
+└─ lib/                        one typed API client per surface — not routes
 ```
 
-**Rules.** Server components for reads; client islands only for the SSE timeline, the editor, and the form. The public lead form is a separate route group with its own tiny bundle — a slow form is a lost lead. Every destructive or publishing action is a server action with a confirm step. Streaming a run must degrade to polling if SSE drops. WCAG AA: focus states, contrast, keyboard paths, `aria-live` on the run timeline.
+**Why there is no `businesses/[id]/…` segment.** The business is never in the URL: it
+is resolved from the session on every read, and `GET /api/v1/leads` records why it must
+be — FastAPI ignores an unknown query parameter silently, so a `businessId` that
+"worked" would be a complete cross-tenant read that no test would notice. One owner,
+one business, resolved server-side. An id in the path would be a second, weaker source
+of truth for tenancy.
 
-**Guard placement:** authentication and business resolution happen once, in the segment layout, as a server-side `redirect()` — not in middleware (which would make public routes vary on cookie) and not duplicated per page.
+**The public lead form is not a page in this tree, and that is the design.** It is
+server-rendered by the API: `GET /p/{piece_id}` returns a plain HTML document whose
+`<form method="post">` submits to `POST /public/forms/{form_id}`, and the confirmation
+is the same document re-rendered with `?sent=1`. Attribution reaches it through the
+short-link service — `/l/{code}` (tracked redirect, click written after the 302) and
+`/go/{slug}` (bio hub) — not through a Next route. So the "minimal bundle" a form
+deserves is not a small bundle here, it is **no bundle at all**: no JavaScript, no
+cookie, works with scripting off, cacheable by anything in between, and its markup
+comes from the pure `engines/landing.py` renderer so the escaping is unit-tested rather
+than reviewed by eye. `api/pages.py` and `api/leads.py` carry the full reasoning.
+
+**Rules.** Every screen is a **client** component, and that is forced rather than
+preferred: the API is a different origin (Next `:3100`, FastAPI `:8100`), the session
+cookie is `HttpOnly` and host-only to the API, and the Origin-CSRF middleware (§9)
+refuses a cookie-bearing request that arrives with no `Origin` header — which is
+exactly what `fetch` from a server component sends. Two consequences, both admitted
+rather than designed around: authenticated data is never server-rendered, so every
+screen carries a real loading state and "the API is unreachable" is a designed state on
+all of them; and there are **no server actions** anywhere in this tree. A destructive or
+publishing action is therefore a browser `fetch` that confirms inline first (`memory/`,
+`connections/`) rather than through `window.confirm`, which cannot be styled and reads
+as a browser error. The run timeline streams over `EventSource`, resumes from the last
+sequence number it saw, and falls back to a 2 s poll when SSE is unavailable or errors —
+a timeline that silently stops updating looks like an agent that silently stopped.
+WCAG AA: focus states, contrast, keyboard paths, and `aria-live` on anything that
+arrives from a poll rather than from a click.
+
+**Guard placement: there is no route guard in this frontend at all.** No `middleware.ts`
+exists, no layout redirects, and no page checks a role. The gate is the API — every
+authenticated route carries its own dependency (`CurrentUser`, or `require_admin` on
+everything under `/api/v1/admin/*`) — and each screen renders the refusal it gets back.
+This follows from the paragraph above rather than being a separate preference: the
+session cookie is `HttpOnly` and was set by another origin, so nothing in the Next app —
+middleware, layout or page — can read it. A guard would have to ask the API whether the
+caller is signed in, which is what every screen already does on its first render.
+Duplicating the check would put an authorisation decision somewhere that cannot enforce
+it, and leave two things to keep in step with each other.
+
+How a refusal reads differs by surface, and one half is better than the other. The
+`/developer` screens share an `ErrorCard`: 401 becomes "Sign in required" with a link to
+`/login?next={path}`, and 403 becomes a sentence **that screen** supplies, because the
+API's `code` is the load-bearing part of a 403 and the prose is the screen's to get
+right. The owner-facing screens render the API's own message in their error panel and
+offer no sign-in link of their own; the root layout's `SessionBar` is the way out, and it
+renders nothing for a visitor with no session — so a signed-out visitor landing on
+`/leads` reads a refusal without being handed the door. That is a real gap, recorded
+here rather than described as a decision. What the API-only gate does cost by design:
+chrome renders before the refusal arrives instead of a redirect firing before render,
+and `/developer` is not hidden from a non-admin's navigation — it answers "Not available
+on this account". On an internal console that is the right trade for having exactly one
+authority on authorisation.
 
 ---
 

@@ -5,6 +5,7 @@ secret is ever exposed to the browser -- see docs/ARCHITECTURE.md section 9.
 """
 
 import os
+from decimal import Decimal
 from functools import lru_cache
 from typing import Literal
 
@@ -14,6 +15,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 #: refuse to boot on it outside local development, comparing against the same
 #: constant the field defaults to instead of a duplicated literal that drifts.
 DEFAULT_SESSION_SECRET = "insecure-local-development-secret-change-me"  # noqa: S105
+
+#: Ceiling on what ONE business may spend on model calls inside the reporting
+#: window, in USD. `docs/ARCHITECTURE.md` section 7.4 states a per-business
+#: monthly cap as one of three cap levels; this is the number it is held to.
+#:
+#: A platform-wide default rather than a column on `businesses`, deliberately:
+#: nothing in the product can set a per-business ceiling -- there is no admin
+#: screen and no route for it -- so a column would be an unsettable value that
+#: every read would then have to defend against being NULL. A setting is the
+#: same shape every other tunable here has, and the day a business genuinely
+#: needs its own ceiling, this constant becomes the fallback for the column
+#: rather than being replaced by it.
+#:
+#: $25.00 is fifty runs at the $0.50 per-run ceiling
+#: (`agents.state.DEFAULT_MAX_USD`, not imported here so configuration stays
+#: independent of the agent package) -- comfortably more than a small business
+#: does in a month, and far below a bill anyone would want to discover after
+#: the fact.
+DEFAULT_BUSINESS_MONTHLY_CAP_USD = Decimal("25.00")
 
 Environment = Literal["local", "ci", "staging", "production"]
 
@@ -90,6 +110,16 @@ class Settings(BaseSettings):
     # maintain. If it goes a release without being touched, the builtin driver should
     # go with it.
     agent_runtime: AgentRuntime = "langgraph"
+
+    # The per-business ceiling, in USD. `Decimal`, never `float`: this number is
+    # compared against a sum of `Numeric(12, 8)` ledger rows, and a binary float
+    # would make the comparison at the boundary a matter of luck. pydantic parses
+    # the environment string straight into `Decimal`, so no float is ever formed.
+    #
+    # A non-positive value refuses every run. That is intended and is the kill
+    # switch: `BUSINESS_MONTHLY_CAP_USD=0` stops all model spend for every
+    # business without a deploy.
+    business_monthly_cap_usd: Decimal = DEFAULT_BUSINESS_MONTHLY_CAP_USD
 
 
 @lru_cache

@@ -23,6 +23,7 @@ store the right tenant in the first place.
 """
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -47,7 +48,12 @@ from backend.app.core.token_cipher import (
 from backend.app.db.models import User
 from backend.app.main import create_app
 from backend.app.services.connection_service import ConnectionStatus, ConnectionView
-from backend.app.services.platform_oauth import FakeOAuthProvider, OAuthProvider, TokenGrant
+from backend.app.services.platform_oauth import (
+    FakeOAuthProvider,
+    OAuthProvider,
+    TokenGrant,
+    fake_consent_path,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -254,6 +260,65 @@ async def _start(client: httpx.AsyncClient, platform: str = PLATFORM) -> httpx.R
     return await client.post(f"/api/v1/connections/{platform}/connect")
 
 
+def _local_path(url: str) -> str:
+    """Path and query of an absolute URL one of our own routes minted.
+
+    Both the authorization URL and the consent screen's form action are absolute, built
+    from ``public_base_url`` -- which is the point: the consent screen has to be on the
+    same origin as the callback, or the ``state`` cookie would not be presented on the way
+    back and the check it feeds would never run. The ASGI transport is mounted at
+    ``http://test``, so following one of those URLs in a test means taking its path; that
+    the origin is ours is asserted directly, in
+    ``test_the_fake_provider_sends_the_human_to_our_own_consent_screen``.
+    """
+    parts = urlsplit(url)
+    return parts.path + (f"?{parts.query}" if parts.query else "")
+
+
+_FORM_RE = re.compile(r'<form method="get" action="([^"]+)">(.*?)</form>')
+_HIDDEN_RE = re.compile(r'<input type="hidden" name="([a-z_]+)" value="([^"]*)">')
+
+
+def _consent_forms(body: str) -> list[tuple[str, dict[str, str]]]:
+    """Every form on the consent screen, as ``(action, fields)``.
+
+    Read out of the markup rather than constructed, so what these tests submit is exactly
+    what a browser with no JavaScript would submit. Anything a browser could not do with
+    the page as served -- a nonce the page never carried, a code the page never showed --
+    is therefore a deliberate deviation in a test, and the two that deviate say so.
+    """
+    return [(action, dict(_HIDDEN_RE.findall(inner))) for action, inner in _FORM_RE.findall(body)]
+
+
+class RealProviderStub:
+    """A provider that claims a real platform app behind it, and does nothing else.
+
+    ``fake`` is False and every operation raises: what it is used to assert is that the
+    stand-in consent screen refuses to render AT ALL for a platform whose provider is real,
+    so any of these being reached would itself be the failure.
+    """
+
+    @property
+    def platform(self) -> str:
+        return PLATFORM
+
+    @property
+    def fake(self) -> bool:
+        return False
+
+    def authorization_url(self, *, redirect_uri: str, state: str, scopes: Any) -> str:
+        return f"https://real.example/authorize?state={state}"
+
+    async def exchange_code(self, *, code: str, redirect_uri: str) -> TokenGrant:
+        raise AssertionError("a real provider must not be exercised by these tests")
+
+    async def refresh(self, refresh_token: Secret) -> TokenGrant:
+        raise AssertionError("a real provider must not be exercised by these tests")
+
+    async def revoke(self, credential: Secret) -> None:
+        raise AssertionError("a real provider must not be exercised by these tests")
+
+
 # --------------------------------------------------------------------------- #
 # The gap this closes
 # --------------------------------------------------------------------------- #
@@ -345,6 +410,267 @@ async def test_the_authorization_url_and_the_exchange_use_the_configured_callbac
 
     redirect = parse_qs(urlsplit(started.json()["authorizationUrl"]).query)["redirect_uri"][0]
     assert redirect == (f"{LOCAL_SETTINGS.public_base_url}/api/v1/connections/facebook/callback")
+
+
+# --------------------------------------------------------------------------- #
+# The stand-in consent screen -- what makes a connect completable by a human
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_human_can_complete_a_connect_through_the_stand_in_consent_screen() -> None:
+    """The whole point of the change: connect → consent → callback → a stored connection,
+    driven the way a browser with no JavaScript drives it.
+
+    The provider factory is NOT overridden here, deliberately -- this exercises the real
+    ``get_oauth_provider``, so it is the URL a running deployment would actually mint that
+    is being followed. Every hop is a request the httpx cookie jar carries the ``state``
+    cookie through, so ``oauth_state.verify_state`` and ``nonce_matches`` run in
+    ``finish_connect`` exactly as they do in production: nothing here signs a cookie,
+    reads ``session_secret``, or calls the callback with a value the page did not carry.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client)
+        assert started.status_code == 200, started.text
+        nonce = _nonce_from(started.json()["authorizationUrl"])
+
+        consent = await client.get(_local_path(started.json()["authorizationUrl"]))
+        assert consent.status_code == 200, consent.text
+        assert consent.headers["content-type"].startswith("text/html")
+        assert consent.headers["cache-control"] == "no-store", "a one-shot nonce is on it"
+
+        forms = _consent_forms(consent.text)
+        assert len(forms) == 2, "one form to allow, one to deny -- and no third way through"
+        action, fields = forms[0]
+        assert fields["state"] == nonce, "the screen echoes the nonce it was handed"
+        assert fields["code"].startswith("simulated-"), (
+            "the code is minted by this process, the way a platform mints a real one"
+        )
+
+        finished = await client.get(_local_path(action), params=fields)
+
+    assert finished.status_code == 200, finished.text
+    connected = finished.json()
+    assert connected["status"] == "connected"
+    assert connected["usable"] is True, "a connection made this way has to be usable"
+    assert connected["unusableReason"] is None
+    assert connected["hasCredential"] is True
+    assert connected["fake"] is True, (
+        "a connection completed through OUR consent screen must still be flagged "
+        "simulated -- it must never be mistakable for one made against a real platform app"
+    )
+
+    stored = await store.view(business_id=BUSINESS, platform=PLATFORM)
+    assert stored is not None, "the row exists, so this was a connect and not a page view"
+    assert stored.fake is True
+    assert stored.status is ConnectionStatus.CONNECTED
+
+
+async def test_the_fake_provider_sends_the_human_to_our_own_consent_screen() -> None:
+    """Where the authorization URL points is the whole bug that was fixed.
+
+    It used to be ``fake-oauth.invalid`` -- RFC 2606 reserved, so no browser could ever
+    reach the callback and no connection could be created from the UI at all. It must now
+    be OUR origin, because that is what makes the browser present the ``state`` cookie on
+    the way back; a consent screen on any other host would mean the cookie is not sent and
+    the CSRF control could only ever refuse.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client, "facebook")
+
+    url = started.json()["authorizationUrl"]
+    parts = urlsplit(url)
+    assert f"{parts.scheme}://{parts.netloc}" == LOCAL_SETTINGS.public_base_url
+    assert parts.path == fake_consent_path("facebook")
+    assert "invalid" not in parts.netloc, "an unreachable consent screen is the old bug"
+    # The state still travels in the URL and not in the response body: a client that could
+    # read the nonce could be tricked into echoing it.
+    assert "state" not in started.json()
+    assert _nonce_from(url)
+
+
+def test_the_consent_route_is_mounted_where_the_provider_points() -> None:
+    """The one place these two could drift is a link to a 404, which is the failure the
+    route exists to end -- so the router derives its path from the provider's constant and
+    this asserts the derivation still holds."""
+    assert connections_api.router.prefix + connections_api.CONSENT_PATH == fake_consent_path(
+        "{platform}"
+    )
+    mounted = {
+        route.path  # type: ignore[attr-defined]
+        for route in connections_api.router.routes
+    }
+    assert fake_consent_path("{platform}") in mounted
+
+
+async def test_the_consent_screen_is_absent_once_a_real_provider_is_configured() -> None:
+    """The guard that keeps this from being a back door around a real integration.
+
+    A stand-in for a consent screen is legitimate only while there is no consent screen to
+    stand in for. The day a real adapter is configured for a platform, this page must 404
+    for it -- otherwise it would be a way to mint a credential for a platform whose real
+    authorisation was never performed.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store, provider=RealProviderStub()) as client:
+        started = await _start(client)
+        assert started.json()["fake"] is False
+        refused = await client.get(
+            f"/api/v1/connections/{PLATFORM}/simulated-consent",
+            params={
+                "redirect_uri": (
+                    f"{LOCAL_SETTINGS.public_base_url}/api/v1/connections/{PLATFORM}/callback"
+                ),
+                "state": _nonce_from(started.json()["authorizationUrl"]),
+            },
+        )
+
+    assert refused.status_code == 404
+    assert "not available" in refused.text.lower()
+    assert not store.plaintexts, "nothing may be minted for a platform we cannot really reach"
+
+
+async def test_the_consent_screen_never_takes_the_nonce_from_the_cookie() -> None:
+    """The property that separates a stand-in from a bypass, asserted mechanically.
+
+    A consent screen that read the nonce out of the signed cookie would hand the callback
+    the cookie's own value to compare against itself, and the CSRF control would be empty
+    while still appearing to run. So: with a perfectly good cookie in the jar, ask for the
+    page with a DIFFERENT ``state`` in the query, and the page must echo the query's value.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client)
+        issued = _nonce_from(started.json()["authorizationUrl"])
+        assert client.cookies.get(oauth_state.STATE_COOKIE_BASE_NAME) is not None
+
+        consent = await client.get(
+            f"/api/v1/connections/{PLATFORM}/simulated-consent",
+            params={
+                "redirect_uri": (
+                    f"{LOCAL_SETTINGS.public_base_url}/api/v1/connections/{PLATFORM}/callback"
+                ),
+                "state": "a-nonce-this-browser-was-never-issued",
+            },
+        )
+
+    assert consent.status_code == 200
+    _, fields = _consent_forms(consent.text)[0]
+    assert fields["state"] == "a-nonce-this-browser-was-never-issued"
+    assert issued not in consent.text, "the cookie's nonce must not reach the page at all"
+
+
+async def test_a_state_the_consent_screen_did_not_carry_is_still_refused() -> None:
+    """The security property shown intact rather than assumed: the page above exists, and a
+    callback whose ``state`` does not match the cookie is refused exactly as before.
+
+    Same attack as ``test_a_callback_whose_state_does_not_match_the_cookie_is_refused``,
+    re-run through the new page so that the page cannot be what makes it pass.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client)
+        consent = await client.get(_local_path(started.json()["authorizationUrl"]))
+        action, fields = _consent_forms(consent.text)[0]
+        # The one deliberate deviation from what the page serves: a nonce it never carried.
+        response = await client.get(
+            _local_path(action), params={**fields, "state": "not-the-issued-nonce"}
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "oauth_state_refused"
+    assert not store.plaintexts, "nothing may be stored for a callback we refuse"
+    assert await store.view(business_id=BUSINESS, platform=PLATFORM) is None
+
+
+async def test_the_consent_screen_refuses_a_redirect_uri_that_is_not_ours() -> None:
+    """It must not be usable as an open redirector.
+
+    The page's form action is always the callback THIS deployment computed from
+    configuration, never the caller's string -- and a mismatching ``redirect_uri`` is
+    refused outright rather than rendered with our action, so a crafted link cannot even
+    produce a page with somebody else's host printed on it as a destination.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client)
+        refused = await client.get(
+            f"/api/v1/connections/{PLATFORM}/simulated-consent",
+            params={
+                "redirect_uri": "https://attacker.example/collect",
+                "state": _nonce_from(started.json()["authorizationUrl"]),
+            },
+        )
+        missing_state = await client.get(
+            f"/api/v1/connections/{PLATFORM}/simulated-consent",
+            params={
+                "redirect_uri": (
+                    f"{LOCAL_SETTINGS.public_base_url}/api/v1/connections/{PLATFORM}/callback"
+                )
+            },
+        )
+
+    assert refused.status_code == 404
+    assert "attacker.example" not in refused.text, "nothing from the request is reflected"
+    assert missing_state.status_code == 404, "no nonce to echo means there is no flow"
+
+
+async def test_the_consent_screen_needs_no_javascript_and_says_what_it_is() -> None:
+    """It has to work with scripting off, and it has to be unmistakable.
+
+    A stand-in that looked like a platform's own screen would be the most misleading thing
+    this feature could render, so the copy states that no real platform is involved and that
+    no real account is being connected. The deliberate action is a real submit button
+    rather than an instant redirect, because an automatic hop would make the round trip
+    invisible to whoever is trying to test it.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client)
+        consent = await client.get(_local_path(started.json()["authorizationUrl"]))
+
+    body = consent.text
+    assert "<script" not in body.lower(), "no JavaScript, so it works with scripting off"
+    assert body.count('<form method="get"') == 2, "plain form submissions, not fetch calls"
+    assert body.count("<button") == 2, "a deliberate action, not an automatic redirect"
+    assert f"This is not {PLATFORM}." in body
+    assert "no real account is connected" in body
+    assert f"There is no real {PLATFORM} app behind this build" in body
+    assert "Simulated" in body
+    assert "Allow simulated access" in body
+    # What a real authorisation would ask for -- from PLATFORM_SCOPES, not from the query.
+    assert "w_member_social" in body
+
+
+async def test_denying_at_the_consent_screen_connects_nothing() -> None:
+    """The refusal branch, driven from the page rather than by hand.
+
+    ``authorisation_declined`` is what a human clicking "cancel" at a real platform
+    produces, and it was as unreachable as the success path. Note the nonce checked out
+    first: this is a 400 because the flow was genuine and was declined, not because it was
+    refused.
+    """
+    store = FakeConnectionStore()
+
+    async with _client(store) as client:
+        started = await _start(client)
+        consent = await client.get(_local_path(started.json()["authorizationUrl"]))
+        action, fields = _consent_forms(consent.text)[1]
+        assert fields["error"] == "access_denied"
+        declined = await client.get(_local_path(action), params=fields)
+
+    assert declined.status_code == 400
+    assert declined.json()["detail"]["code"] == "authorisation_declined"
+    assert not store.plaintexts
+    assert await store.view(business_id=BUSINESS, platform=PLATFORM) is None
 
 
 # --------------------------------------------------------------------------- #

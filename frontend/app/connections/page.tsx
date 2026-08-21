@@ -562,15 +562,26 @@ function ConnectionDetail({ connection }: { connection: Connection }) {
 /**
  * What a started connect produced — and the branch that matters is `fake`.
  *
- * A simulated authorisation URL points at `fake-oauth.invalid`, a domain RFC 2606
- * reserves so that it can never resolve. Offering it as a link would send an owner to a
- * browser error and let them conclude that connecting is broken, when in fact there is no
- * real platform app to connect to. So a fake URL is shown as inert text with that said
- * plainly, and only a real one becomes a link.
+ * **Both branches are links now, and the difference is what is at the other end.** A
+ * simulated authorisation used to point at `fake-oauth.invalid` — a domain RFC 2606
+ * reserves so that it can never resolve — so it was rendered as inert text: offering it
+ * would have sent an owner to a browser error and let them conclude that connecting is
+ * broken, when in fact there was no real platform app to connect to. It now points at a
+ * stand-in consent screen served by the API itself (`api/connections.simulated_consent`),
+ * which does resolve and does complete the round trip, so rendering it as text would be
+ * the mistake: it would hide a working path.
+ *
+ * What must not change is that a simulation is never dressed as the real thing. The pill,
+ * the heading and the copy all say so, and the copy says what approving it does and does
+ * not do — the credential it produces is stored flagged as simulated, is labelled that way
+ * on the row above, and cannot publish anything.
  *
  * It is a real anchor rather than a scripted redirect, deliberately: the destination is
  * visible before the click, it can be opened in a new tab, and it is keyboard reachable
- * and announced without any of that having to be re-implemented.
+ * and announced without any of that having to be re-implemented. The address is also
+ * printed as text, because on the simulated branch it is the evidence for the sentence
+ * beside it — the consent screen is on our own origin, which is what lets the browser
+ * present the signed `state` cookie on the way back.
  */
 function ConnectStarted({ start }: { start: ConnectStart }) {
   const label = platformLabel(start.platform);
@@ -587,10 +598,21 @@ function ConnectStarted({ start }: { start: ConnectStart }) {
       {start.fake ? (
         <>
           <p className="mt-2 max-w-[70ch] text-sm" style={{ color: "var(--text-muted)" }}>
-            Nothing was sent anywhere and no account was connected. There is no real{" "}
-            {label} app behind this yet, so the authorisation address points at a reserved
-            domain that can never resolve — it is deliberately not a link, because
-            following it would look like a broken connection rather than an absent one.
+            There is no real {label} app behind this yet, so the link below is not{" "}
+            {label} — it is a stand-in consent screen served by this application. Nothing
+            signs you in at {label} and no real account is connected. Approving it stores a
+            credential that is labelled simulated wherever it appears and that nothing can
+            be published with.
+          </p>
+          <p className="mt-2">
+            <a
+              href={start.authorizationUrl}
+              rel="noopener"
+              className="text-sm font-medium underline"
+              style={{ color: "var(--primary)" }}
+            >
+              Continue to the simulated consent screen
+            </a>
           </p>
           <p
             className="tabular mt-2 overflow-x-auto rounded px-2 py-1 text-xs"

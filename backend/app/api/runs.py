@@ -15,11 +15,19 @@ connection on every reload, and browsers hold only a handful per origin.
 
 A cross-business run id returns 404 rather than 403: whether a run exists is itself
 information, and the caller has no legitimate way to know that id.
+
+**The per-business spend ceiling is checked here, before the run is handed to the
+executor.** `llm/router.py` states the rule for the per-CALL guard — "checking spend after
+the tokens are gone is accounting, not control" — and it holds one level up too: a
+business already past its monthly ceiling is refused the RUN, and the refusal happens
+before anything that could reach a provider. `_require_monthly_headroom` is therefore the
+first thing `start_run` does, ahead of even creating the row.
 """
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -32,6 +40,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.auth import CurrentUser
 from backend.app.core.config import get_settings
 from backend.app.db.adapters.run_store import PostgresRunStore
+from backend.app.llm.pricing import format_usd
+from backend.app.services.cost_service import (
+    MONTHLY_CAP_WINDOW_DAYS,
+    monthly_spend_usd,
+    over_monthly_cap,
+)
 from backend.app.services.review_service import (
     ExportPack,
     RunReview,
@@ -166,6 +180,66 @@ async def get_run_service(
     return RunService(PostgresRunStore(business_id))
 
 
+#: Reads one business's spend over the ceiling's window. A seam rather than a direct
+#: call, for the same reason `get_run_service` is one: the routes that hold the guard have
+#: to be testable without a Postgres, and a test that could only assert the refusal by
+#: seeding a ledger would not be run often enough to be worth having.
+MonthlySpendReader = Callable[[UUID], Awaitable[Decimal]]
+
+
+def get_monthly_spend_reader() -> MonthlySpendReader:
+    """The real ledger read. Overridden in tests."""
+    return monthly_spend_usd
+
+
+async def _require_monthly_headroom(business_id: UUID, spend: MonthlySpendReader) -> None:
+    """Refuse when this business has used up its ceiling for the window.
+
+    **Called before anything that can reach a provider, and that ordering is the whole
+    control.** `llm/router.py`: "checking spend after the tokens are gone is accounting,
+    not control". The per-run guard applies that to one call; this applies it to a whole
+    run, which is the level `docs/ARCHITECTURE.md` section 7.4 states the ceiling at.
+
+    **The refusal states both numbers.** "Over budget" with no figures gives the owner
+    nothing to act on and gives support nothing to check, and the two things anybody asks
+    next are what was spent and what the limit is. Both are rendered with
+    :func:`~backend.app.llm.pricing.format_usd`, so they match the cost screen digit for
+    digit rather than being a second opinion about the same ledger.
+
+    Rendered as strings and never as `Decimal`, and that is not cosmetic: FastAPI encodes
+    an exception's `detail` with `jsonable_encoder`, which turns a `Decimal` into a JSON
+    float -- so a money value put in this dict raw would leave here as binary floating
+    point, in the one code path that exists to talk about money accurately.
+
+    409 rather than 402, to match every other refusal in this module. The blocking
+    condition is the state of this business's ledger, which is the same shape of answer as
+    "this run already finished": nothing about the request is wrong, and nothing the
+    caller can pay changes it -- the window has to roll forward.
+
+    Section 7.4 says exceeding a cap "ends the run with a partial result and a stated
+    reason", which is right for a ceiling met mid-run. A ceiling already breached before
+    the run exists is refused instead of being materialised as a run that never did
+    anything: a `partial` row with no events would appear in the runs list, in the
+    dashboard's run count and in the timeline as work, and it did none.
+    """
+    cap_usd = get_settings().business_monthly_cap_usd
+    spent_usd = await spend(business_id)
+
+    if over_monthly_cap(spent_usd, cap_usd):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "monthly_cap_exceeded",
+                "message": (
+                    f"This business has spent ${format_usd(spent_usd)} of its "
+                    f"${format_usd(cap_usd)} ceiling for the last "
+                    f"{MONTHLY_CAP_WINDOW_DAYS} days, so no new run can start until that "
+                    "window rolls forward."
+                ),
+            },
+        )
+
+
 class CamelModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
@@ -283,7 +357,13 @@ async def start_run(
     business_id: Annotated[UUID, Depends(current_business)],
     service: Annotated[RunService, Depends(get_run_service)],
     executor: Annotated[RunExecutor, Depends(get_executor)],
+    spend: Annotated[MonthlySpendReader, Depends(get_monthly_spend_reader)],
 ) -> StartRunResponse:
+    # FIRST, before the row exists and long before the executor is handed anything. A
+    # business past its ceiling is refused a run rather than being given one that spends
+    # and then discovers it should not have.
+    await _require_monthly_headroom(business_id, spend)
+
     run = await service.start(business_id=business_id, goal=payload.goal)
     # 202 and then work in the background. Before this, the row was created and
     # nothing ever advanced it: `run_graph` was reachable only from tests, so a
@@ -525,6 +605,7 @@ async def resume_run(
     business_id: Annotated[UUID, Depends(current_business)],
     service: Annotated[RunService, Depends(get_run_service)],
     executor: Annotated[RunExecutor, Depends(get_executor)],
+    spend: Annotated[MonthlySpendReader, Depends(get_monthly_spend_reader)],
 ) -> StartRunResponse:
     """Pick a run back up from its checkpoint.
 
@@ -580,6 +661,21 @@ async def resume_run(
                 "message": "This run is waiting for a human decision, not stalled.",
             },
         )
+
+    # Resume is guarded too, and leaving it out would be a hole rather than a
+    # simplification: resuming restarts the graph from its checkpoint with a FRESH per-run
+    # budget, so a business past its ceiling could walk straight through it one resume at
+    # a time -- the per-run cap cannot see the total, which is why this ceiling exists.
+    # Last among the refusals on purpose: which run this is, and whether it is resumable
+    # at all, are more useful answers when both are true, and this sits immediately before
+    # the only line here that can reach a provider.
+    #
+    # `approve` is deliberately NOT guarded. It publishes work already generated and
+    # already paid for, and refusing at the review gate would strand a draft a person is
+    # looking at, in exchange for nothing: the only way to reach `awaiting_approval` is
+    # through `start_run`, which is guarded, so the spend approval can release is bounded
+    # by runs that began before the ceiling was breached.
+    await _require_monthly_headroom(business_id, spend)
 
     executor.submit(run.id, business_id, run.goal, resume=True)
     return StartRunResponse(run_id=run.id, state="running")

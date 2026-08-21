@@ -116,6 +116,22 @@ class AgentState(TypedDict):
     business_id: str
     goal: str
     surfaces: list[str]
+    #: The `runs` row this state belongs to, as a STRING -- the same reason
+    #: `business_id` is one: this is checkpointed to a JSONB column and a `UUID` does
+    #: not survive a JSON round trip.
+    #:
+    #: It is here so a side effect can be attributed to the run that caused it.
+    #: `nodes._actuate` puts it on every `Actuation`, which is what fills
+    #: `actions.run_id` and `content_pieces.run_id` -- without it a published page and
+    #: the ledger row that authorised it are both orphans, and "what did this run
+    #: publish, and how many leads did it earn" is not a question the database can
+    #: answer.
+    #:
+    #: `NotRequired` because it postdates checkpoints already written, and a run that
+    #: cannot resume because an ATTRIBUTION field is missing would lose work a customer
+    #: already paid for. `from_checkpoint` supplies `None`; the executor then stamps the
+    #: id it fetched the row by, so a pre-key checkpoint resumes fully attributed.
+    run_id: NotRequired[str | None]
 
     # Set at INTAKE, carried everywhere after.
     dna: dict[str, Any]
@@ -221,10 +237,20 @@ def new_state(
     dna: dict[str, Any] | None = None,
     remembered: list[str] | None = None,
     caps: RunCaps | None = None,
+    run_id: str | UUID | None = None,
 ) -> AgentState:
-    """A fresh run."""
+    """A fresh run.
+
+    ``run_id`` is optional rather than required, and that is a deliberate compromise
+    with the tests: the graph and its nodes are driven directly by hundreds of them,
+    none of which has a `runs` row, and making the id mandatory would force every one
+    of them to invent one. The executor -- the only caller that runs a real run --
+    always passes it, and `_actuate` reports an absent one as an unattributed
+    actuation rather than guessing.
+    """
     return AgentState(
         business_id=str(business_id),
+        run_id=str(run_id) if run_id is not None else None,
         goal=goal,
         surfaces=surfaces if surfaces is not None else ["google"],
         dna=dna or {},
@@ -253,6 +279,41 @@ def new_state(
         outcome="running",
         finished_reason=None,
     )
+
+
+def parse_run_id(raw: object) -> UUID | None:
+    """``raw`` as a run id, or ``None`` if it cannot be one.
+
+    One parser, so the checkpoint reader and the node that builds an `Actuation` cannot
+    disagree about what counts as a run id. Everything that is not a UUID -- a missing
+    key, a null, a hand-typed word, an integer some UPDATE put in the column -- is
+    `None`, because the alternatives are a crash on the publish path or a foreign key
+    pointing at nothing.
+    """
+    if isinstance(raw, UUID):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        return UUID(raw.strip())
+    except ValueError:
+        return None
+
+
+def _valid_run_id(raw: object) -> str | None:
+    """The checkpoint form of :func:`parse_run_id`: a canonical string, or ``None``."""
+    parsed = parse_run_id(raw)
+    return str(parsed) if parsed is not None else None
+
+
+def run_uuid(state: AgentState) -> UUID | None:
+    """This run's id, for the one place that needs it as a `UUID`: an `Actuation`.
+
+    A reader, not an assertion. A state with no run id is ordinary -- every test that
+    drives a node directly has one, and `new_state` allows it -- so this answers
+    "attributed or not" and leaves the caller to say so.
+    """
+    return parse_run_id(state.get("run_id"))
 
 
 def step(state: AgentState, node: str) -> AgentState:
@@ -352,6 +413,14 @@ def from_checkpoint(payload: dict[str, Any]) -> AgentState:
         if isinstance(raw_traces, list)
         else []
     )
+    # Same rule for `run_id`, and normalised rather than merely defaulted for a sharper
+    # reason than the traces: this value ends up in `Actuation.run_id`, which is typed
+    # `UUID | None` and lands in a foreign key. A checkpoint holding `7`, `"latest"` or
+    # a truncated id would either crash the publish path or write an unresolvable
+    # reference, so anything that is not a parseable UUID reads as "not attributed" --
+    # which is exactly what a pre-key checkpoint means, and the executor overwrites it
+    # with the id it fetched the row by anyway.
+    restored["run_id"] = _valid_run_id(payload.get("run_id"))
     # The payload came from JSON, so the static type is a promise about what
     # to_checkpoint wrote, not a fact the checker can verify. One cast, named.
     return cast("AgentState", restored)

@@ -62,6 +62,11 @@ class _Graph:
                 "visited_at_entry": list(state.get("visited") or []),
                 "goal": state.get("goal"),
                 "resume": resume,
+                # The run's own id, as the graph receives it. Snapshotted here for the
+                # same reason as `visited`: this is the value EXPORT puts on every
+                # `Actuation`, so reading it after the run would read whatever the stub
+                # left behind rather than what the executor supplied.
+                "run_id_at_entry": state.get("run_id"),
             }
         )
         for node, status in self.events:
@@ -284,6 +289,101 @@ async def test_resuming_a_run_with_no_checkpoint_starts_fresh_rather_than_stalli
     assert restarted is not None
     assert restarted.state == "done"
     assert restarted.resumed_count == 0
+
+
+# --------------------------------------------------------------------------- #
+# Attribution: the run id the graph publishes under
+#
+# This is the ONE place that knows a run's identity for certain -- the state is built
+# for, or restored by, an id the executor was handed. Everything downstream depends on
+# it: `nodes._actuate` puts it on every `Actuation`, the ledger writes it to
+# `actions.run_id`, and the landing actuator writes it to `content_pieces.run_id`. A
+# `None` here is a published page nobody can join back to the run that made it.
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_fresh_run_carries_its_own_id_into_the_state(
+    service: RunService, patched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state a run starts with knows which run it is.
+
+    Asserted at the graph boundary rather than on `new_state`, because the argument
+    being omitted at the ONE call site that has a real run id is exactly the bug: the
+    key can exist, the default can be right, and every page can still land unattributed.
+    """
+    graph = _Graph(outcome="done")
+    ex = _executor(service, graph, monkeypatch)
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+
+    ex.submit(run.id, BUSINESS, run.goal)
+    await ex.drain()
+
+    assert graph.calls[0]["run_id_at_entry"] == str(run.id)
+
+
+async def test_a_checkpoint_written_before_the_run_id_existed_resumes_attributed(
+    service: RunService, patched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backward-compatibility case, and the one with the most value in it.
+
+    Nothing migrates a JSONB column, so a run parked at the review gate before this key
+    existed has no run id in its checkpoint -- and EXPORT runs ONLY on a resume, so that
+    older row is precisely the one that is about to publish. Defaulting to `None` would
+    resume it (which is the minimum) and then write another NULL (which is the bug). The
+    executor stamps the id it fetched the row BY, so an old checkpoint publishes
+    attributed.
+    """
+    first = _Graph(interrupted=True, visited=["INTAKE", "HARVEST"])
+    ex = _executor(service, first, monkeypatch)
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    ex.submit(run.id, BUSINESS, run.goal)
+    await ex.drain()
+
+    # Exactly what an older row looks like: the key is simply not in the JSON.
+    parked = await service.get(run.id)
+    assert parked is not None and parked.checkpoint
+    parked.checkpoint.pop("run_id", None)
+    assert "run_id" not in parked.checkpoint
+
+    second = _Graph(outcome="done")
+    ex2 = _executor(service, second, monkeypatch)
+    ex2.submit(run.id, BUSINESS, run.goal, resume=True)
+    await ex2.drain()
+
+    assert second.calls[0]["visited_at_entry"] == ["INTAKE", "HARVEST"], (
+        "the resume must still restore the work the checkpoint holds"
+    )
+    assert second.calls[0]["run_id_at_entry"] == str(run.id), (
+        "a pre-key checkpoint must publish attributed, not merely survive"
+    )
+
+
+async def test_a_checkpoint_naming_a_different_run_is_overwritten_not_trusted(
+    service: RunService, patched: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkpoint is data; the id it was fetched by is the fact.
+
+    A `runs.checkpoint` column can hold whatever a hand-run UPDATE, a restore from a
+    backup or a copied row put there. Trusting it would attribute this run's publish to
+    another run -- a wrong join is worse than a missing one, because it reads as an
+    answer.
+    """
+    first = _Graph(interrupted=True, visited=["INTAKE"])
+    ex = _executor(service, first, monkeypatch)
+    run = await service.start(business_id=BUSINESS, goal="more leads")
+    ex.submit(run.id, BUSINESS, run.goal)
+    await ex.drain()
+
+    parked = await service.get(run.id)
+    assert parked is not None and parked.checkpoint
+    parked.checkpoint["run_id"] = "99999999-9999-4999-8999-999999999999"
+
+    second = _Graph(outcome="done")
+    ex2 = _executor(service, second, monkeypatch)
+    ex2.submit(run.id, BUSINESS, run.goal, resume=True)
+    await ex2.drain()
+
+    assert second.calls[0]["run_id_at_entry"] == str(run.id)
 
 
 # --------------------------------------------------------------------------- #

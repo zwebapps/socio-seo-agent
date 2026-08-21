@@ -98,11 +98,14 @@ export type ConnectStart = {
   authorizationUrl: string;
   scopes: string[];
   /**
-   * True when the URL points at `fake-oauth.invalid` rather than at a real platform.
+   * True when the URL points at the API's own stand-in consent screen
+   * (`api/connections.simulated_consent`) rather than at a real platform's.
    *
-   * The screen must key on this rather than on the URL's shape: a simulated
-   * authorisation that is offered as a working one is the single most misleading thing
-   * this feature could render.
+   * Both are followable links — the stand-in is what makes a connect completable at all,
+   * since the URL it replaced pointed at a domain RFC 2606 reserves so that it can never
+   * resolve. What this flag decides is the WORDS around the link, and the screen must key
+   * on it rather than on the URL's shape: a simulated authorisation offered as a real one
+   * is the single most misleading thing this feature could render.
    */
   fake: boolean;
 };

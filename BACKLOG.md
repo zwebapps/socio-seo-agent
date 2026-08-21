@@ -1064,9 +1064,12 @@ A1 is the first code to create.
     rejection is recorded on the run itself — `state` + `finished_reason` — and that is the whole
     record. *Filed, and deliberately NOT part of A10b's done:* the day a run persists its draft as
     a `content_pieces` row, a REVIEW rejection can carry piece-level feedback into `distil` and the
-    loop `DIAGRAMS.md` §4 describes closes for real. That wants its own item; today it would be a
-    fabrication, and `distil`'s theme table is style-specific while a gate rejection can be about
-    anything.
+    loop `DIAGRAMS.md` §4 describes closes for real. That wants its own item — **it is A10d below,
+    ruled and specced 2026-08-20 on the founder's decision to build it** — and the ordering was the
+    point: inside A10b it would have been a fabrication. The caveat survives into A10d rather than
+    being answered by it: `distil`'s theme table is style-specific while a gate rejection can be
+    about anything, so the honest claim is that a gate rejection FEEDS distillation, not that it
+    reliably produces a rule.
   - **(3) A reason is REQUIRED** — `min_length=10`, `max_length=240`, measured after whitespace
     collapse, refused 422 before anything is written. Required because a reasonless rejection is
     the one input this product can do nothing with, and the reviewer is the only person who will
@@ -1167,6 +1170,185 @@ A1 is the first code to create.
   decision instead of "Why it stopped" in `warn`, the runs list captions it with its own verb, and
   the review tabs stay MOUNTED so the refused draft is still readable — a rejected draft is
   evidence, and hiding it would withhold work the owner already paid for.**
+
+- [ ] **A10d · A rejection has something to ATTACH to: the draft landing page is persisted before
+  the gate, and EXPORT flips it instead of creating a second one** — RULED 2026-08-20 (architect)
+  on the founder's decision to build it; no longer a decision. This is the item A10b filed and
+  refused to do inside itself, and it REVERSES A10b's ruling (2) — conditionally, and only because
+  the condition A10b named is exactly what this task creates. Once a `content_pieces` row exists at
+  REVIEW, a rejection can carry piece-level feedback into `distil`, and `DIAGRAMS.md` §4's
+  `REVIEW --> [*]: rejected, reason feeds the feedback loop` stops being a drawing of something the
+  code cannot do. **What A10b forbade and what stays forbidden:** `feedback.content_piece_id` stays
+  NOT NULL, `feedback` gets no `run_id` column, and no `ContentPiece` is EVER created in order to
+  have something to reject. The inversion is the whole point — the piece is created because a
+  reviewer is about to review it, and the rejection attaches to it only if it happens to be there.
+  Six rulings, each answering a question the implementation cannot dodge.
+  - **(1) WHERE the draft is persisted: in `run_executor._execute`, at the park boundary — NOT a new
+    graph node, NOT inside CONVERT/REPACK, and NOT a new actuator.** Both drivers converge on
+    `GraphResult(interrupted=True)` and the executor's `if result.interrupted: await
+    service.await_approval(run_id)` is the ONE line they share, so persisting there holds in the
+    builtin driver and in LangGraph with **zero changes to `agents/`** — no `nodes/__init__.py`, no
+    `state.py`, no `graph.ORDER`, no driver. Ruled out, with reasons, so they are not re-proposed:
+    *a node* is a database write inside the graph, which is the objection that made A1a an actuator
+    in the first place and `tests/test_engine_boundary.py` is not the only reason it is wrong;
+    *CONVERT* is reachable twice (`VALIDATE --> CONVERT` on a landing-only failure), so persisting
+    there writes a piece per retry; *REPACK* is the last node before REVIEW and would work, but it
+    is a model-calling node and the write has nothing to do with repacking. *A new actuator with a
+    `publish.draft` action type* is the interesting near-miss and is REFUSED on two specific costs:
+    `actuate()` requires a non-empty `approved_by`, so a pre-gate write would have to carry
+    `"policy:…"` — putting a synthetic approver into a ledger whose `approved_by` exists to answer
+    "which human authorised this outward publish"; and it would land an `actions` row that reads as
+    a succeeded publish for something nobody can reach, on the Delivery tab whose entire job is
+    telling a real publish from a simulated one. The actuator layer buys idempotency, audit and
+    approval; this write needs the first, must not fake the third, and is actively harmed by the
+    second. So it is a service call from the composition root: `landing_service`, unchanged,
+    invoked at `status="draft"` — the mode its own docstring was written for ("approving the page
+    lights them up without touching them"). `RunService` is deliberately NOT the caller either: it
+    owns the `runs` table through a store abstraction, and handing it `content_pieces` widens it for
+    nothing.
+  - **The draft write is NON-FATAL and gated on the same audit as a publish.** It runs only when
+    `state["landing_page"]` is a mapping with a non-empty `headline` — the same guard `_publishable`
+    uses, so the two cannot disagree about whether there is a page — and `publish_landing_page`'s
+    `LandingPageNotPublishableError` is CAUGHT: a page that cannot capture a lead persists nothing
+    and the run still parks, exactly as `_resolve_owner_notice` already degrades. A run whose page
+    fails the audit therefore has no piece, and per ruling (4) its rejection carries no feedback.
+    That is the correct direction: no row, rather than a row for a page that could never be served.
+  - **(2) HOW EXPORT stops double-creating: `publish.page` LOOKS FOR the draft belonging to THIS
+    run and flips it; only when there is none does it create.** Precisely — the actuator stays thin
+    and the branch lives in `landing_service`, so it is testable with no database: a new
+    `promote_landing_draft(...) -> PublishedLandingPage | None` returns `None` when no draft exists
+    and the actuator falls through to today's `publish_landing_page`. What promotion does: re-run
+    `check_landing_page` FIRST (the refusal must not become bypassable by having pre-persisted — a
+    page that cannot convert must be refused whether or not a row exists for it), then
+    `mark_published(business_id, piece_id, url)` — a new store method rather than the existing
+    `set_status`, because it also stamps `published_at` and `published_url`, two columns that are
+    NULL on every row in the product today while `_LIST_HUB` orders by `cp.published_at DESC NULLS
+    LAST`, i.e. by nothing — then READ BACK that piece's existing `short_links` through a new
+    `links_for_piece(business_id, piece_id)` and return them as the `ctas`. **No link is minted at
+    promotion.** The `Outcome.detail` shape is unchanged (`content_piece_id`, `path`, `status`,
+    `score`, `ctas` with `channel/text/code/path/url`) so A1b's export pack keeps working, plus one
+    new key naming which branch ran, because "created" and "promoted a draft" are different facts
+    about this run even when they are the same fact about the world — the same distinction
+    `Outcome.replayed` already draws.
+  - **The lookup key is `content_pieces.run_id` via `actuation.run_id`, and NOTHING ELSE.** Not
+    "the most recent draft landing page for this business", which would flip a different run's
+    draft on a business with two parked runs — that is a wrong-page publish, not a near miss. Not a
+    piece id threaded through `AgentState`, which would be a SECOND run-attribution mechanism built
+    beside the one A1a-i is building, and would change the checkpoint shape twice. This is why A10d
+    is BLOCKED on A1a-i (ruling 6) and it is a hard dependency, not merge hygiene: until
+    `actuation.run_id` is populated the actuator cannot find the draft, so it would create a second
+    piece and a second link set — shipping the bug this ruling exists to prevent.
+  - **On a RESUME that retries EXPORT, nothing happens twice, and it is already guaranteed.**
+    `actuate()` claims the content-derived key before calling, so a second attempt with the same
+    spec is `replayed` and `perform` is never entered. What CHANGES is only what the key protects:
+    it used to mean "do not create a second page", it now means "do not flip twice" — and the flip
+    is idempotent anyway, so the two layers agree rather than depend on each other. Two adjacent
+    behaviours are pre-existing, verified, and deliberately NOT changed here: `claim` replays a
+    REFUSED row too, so a page refused by the audit cannot be retried under the same spec (it needs
+    an edited spec, which is a different effect — correct, if surprising); and a run that crashes
+    between the draft write and `await_approval` leaves an inert `draft` row nothing will promote,
+    which is residue rather than a defect, because a draft is unreachable by construction (ruling
+    4). **Re-parking is believed unreachable** — `arm_interrupt="REVIEW" not in state["visited"]`
+    means a run parks at most once — so the draft write is create-if-absent keyed on
+    `(run_id, surface='landing_page')` and, if a row already exists, it logs and creates nothing
+    rather than updating. That ordering is chosen so that if re-parking ever DOES become reachable
+    the failure is one stale draft, not duplicate pieces with duplicate link sets.
+  - **(3) A draft row is SAFE to exist, verified in code 2026-08-20 rather than assumed.**
+    `api/pages.py` `LIVE_STATUSES` and `api/leads.py` `LIVE_FORM_STATUSES` are both
+    `{"approved", "published"}`, so `GET /p/{id}` is the same 404 as a typo and the public form
+    POST is refused; `lead_store.HUB_VISIBLE_STATUSES` is the same pair, so a draft's CTAs are
+    never advertised on the link hub. `resolve_short_link` deliberately does NOT filter on status,
+    so a draft's `/l/{code}` DOES resolve and redirects to a 404 page — that is the honest
+    degradation and **must not be "fixed"**: the code is unguessable, unadvertised, and the
+    alternative is a redirect that lies. So a draft piece is visible to: nobody. Not the public,
+    not the hub, and not the owner either — there is no content-listing route and `review_service`
+    projects the review tabs from `runs.checkpoint`, so **the piece is an ANCHOR, not a new
+    surface.** Do NOT wire the export pack or the review tabs to it; the A1b invariant ("no short
+    link may appear unless a `short_links` row backs it") is satisfied by the pack reading
+    `checkpoint["published"]["refs"]`, and re-pointing it at `content_pieces` would start printing
+    a `/p/{id}` for a run that has published nothing.
+  - **(4) WHAT a rejection attaches to: the piece, with `verdict="rejected"`, `axes = {}` and the
+    reason already stored on the run — and the piece is marked `status="rejected"`, not deleted.**
+    `content_pieces.status`'s CHECK constraint already permits `'rejected'`, so this needs NO
+    migration and invents no vocabulary; and it is the right answer over leaving it `draft` (which
+    says "awaiting a decision" about something decided) and over deleting it (the refused draft is
+    evidence of work the owner paid for — the same reason A10c keeps the review tabs mounted). This
+    also gives `content_store.set_status` its first application caller: today only tests call it.
+    **`axes` is EMPTY and no code path may populate it.** `feedback_service.record` accepts a
+    partial rubric by design ("someone saying 'the voice is wrong' should not have to invent an SEO
+    score"), and `distil` reads ONLY `reject_reason` — so the four-axis rubric is satisfied by
+    omission, and a reviewer at the gate is never asked for a rating they did not give. Whether the
+    gate should ASK for the axes is a founder call, recorded below, not the loop's.
+  - **One rejection writes at most ONE feedback row, and the guard is `status='rejected'` on the
+    piece.** Not a new unique index: the existing state already answers the question. This matters
+    beyond tidiness — `distil` proposes at three occurrences, so one rejection counted twice is a
+    third of a fabricated pattern. Ordering: the piece-side writes (mark rejected → insert feedback
+    → `distil`) run FIRST, inside one `business_session` so they cannot half-apply, and
+    `service.finish(outcome="rejected")` runs LAST. If the piece side raises, nothing is written and
+    the run is still `awaiting_approval`, so the reviewer presses reject again and it converges; the
+    reverse order would leave a terminally rejected run — un-retryable, since every other state is
+    409 — with no feedback and no way to add it. A10b's guarantee is preserved: a run with NO piece
+    is still rejectable and still 200, and writes no feedback at all.
+  - **(5) The rejecter is still NOT recorded.** `Feedback.user_id` is nullable and stays NULL, and
+    the reject route still takes no `CurrentUser` — A10b's reasoning is unchanged by this task
+    (`approved_by` authorises an outward publish; a rejection authorises nothing, and with one user
+    per business a rejecter column stores what `business_id` implies).
+  - **(6) SEQUENCING. A10d-i is blocked on A1a-i — hard, per ruling (2) — and collides with
+    NEITHER A5 nor A6.** A5 touches `measure`, A6 touches `_export_refusal`, both inside
+    `nodes/__init__.py`, and A10d touches no file under `agents/` at all; the only shared file with
+    A1a-i is `run_executor.py`, and the two edits are in different functions (`_initial_state` vs
+    the park branch of `_execute`). A6 is worth landing before or after without preference, but note
+    the interaction and do not let it surprise anyone: a business at the weekly cap has EXPORT refuse
+    before actuating, so its draft stays `draft` — correct, and it is why the piece must never be
+    treated as evidence of publication.
+  - **Claims discipline.** After this lands, `CRITERIA_MAP.md`'s "the agent updates persistent
+    business preferences from explicit feedback" is true of the rejection path and is reachable from
+    a screen (A10c's control) for the first time. It must not be written up as more than that: the
+    gate rejection PROPOSES a rule, only at three occurrences, only after the owner approves the
+    proposal does anything reach `businesses.dna`, and `distil`'s theme table is style-specific — a
+    gate rejection about a wrong price falls through to exact-repeat grouping and needs three
+    identically-phrased rejections. The honest sentence is "a gate rejection is recorded against the
+    piece it refused and feeds the same distillation as a content rating", never "the agent learns
+    from rejections".
+- [ ] **A10d-i · The draft is persisted at the park boundary and EXPORT promotes it** — backend
+  only, no migration, no new action type. **Depends on A1a-i.** Atomic on purpose: persisting
+  without the promotion branch ships a duplicate-piece bug, so the two halves may not be split.
+  Touches `run_executor._execute` (park branch), `landing_service` (`promote_landing_draft`),
+  `actuators/landing.py` (the two-branch `perform`), `content_store` (`mark_published`,
+  `landing_page_for_run`) and `lead_store` (`links_for_piece`).
+  **done = a run parked at REVIEW has exactly ONE `content_pieces` row, `status='draft'`, with its
+  `run_id` set and its spec in `meta['landing']`, plus one `short_links` row per channel CTA, each
+  `?ref=<code>`-retargeted; `GET /p/{id}` on that draft is 404 and a POST to its form endpoint is
+  refused, asserted rather than assumed; approving that run PROMOTES that row — the piece count is
+  still 1 after EXPORT, no second link set exists, the row reads `status='published'` with
+  `published_at` and `published_url` stamped, and the `publish.page` `Outcome.detail.ctas` carries
+  the SAME codes the draft minted, so A1b's pack is unchanged; a run whose actuation carries no
+  draft still publishes by the create path (asserted with the promotion lookup finding nothing); a
+  landing page that fails `check_landing_page` persists NO draft and the run still parks; a second
+  EXPORT attempt is `replayed` and promotes nothing twice; and a test asserts `review_service`'s
+  pack still prints no `/p/` and no `/l/` for a run that has not published, because it still reads
+  `checkpoint['published']['refs']` and never `content_pieces`.**
+- [ ] **A10d-ii · A gate rejection is recorded against the piece it refused, and feeds `distil`** —
+  backend only, no migration. **Depends on A10d-i.** One service function so the route stays a
+  route and the three writes are one transaction; the response gains an additive
+  `proposedRules: list[str]` (camelCase, empty by default) so the loop's output is reportable
+  without A10c's screen changing.
+  **done = rejecting a run that has a draft piece leaves that piece `status='rejected'` and exactly
+  ONE `feedback` row against it, with `verdict='rejected'`, `axes == {}` and `reject_reason` equal
+  to the reason stored on the run; three rejections carrying the same themed reason produce a
+  `learned_style` row with `status='proposed'` and a test reads `businesses.dna` to assert it is
+  untouched; rejecting a run with NO piece is still 200, writes no feedback and raises nothing;
+  a second reject is still 409 `run_not_awaiting_approval` and the feedback row count is asserted to
+  be 1, because at a three-occurrence threshold one rejection counted twice is a fabricated pattern;
+  a failure injected into the piece-side writes leaves the run `awaiting_approval` and rejectable
+  rather than rejected-with-no-record; and `axes` is asserted EMPTY, with no code path and no test
+  fixture supplying a rating a reviewer did not give.**
+- [ ] **A10e · The reviewer sees what their "no" proposed** — UI only, depends on A10d-ii. The
+  rejection panel renders `proposedRules` as "we noticed a pattern" with a link to the proposals
+  panel, and renders NOTHING when the list is empty — which is the normal answer and must not read
+  as a failure. Filed separately so A10d-ii cannot grow a screen.
+  **done = a rejection that proposed a rule says so and links to where it waits; one that proposed
+  nothing shows no empty state; asserted in both cases.**
 
 - [ ] **A2c · A node that raises loses its retrieval trace along with everything else** — found
   by A2a, pre-existing, and deliberately not changed there. `GENERATE` and `CONVERT` raise

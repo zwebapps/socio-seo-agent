@@ -72,7 +72,7 @@ from backend.app.agents.nodes.prompts import (
     fence,
     system,
 )
-from backend.app.agents.state import AgentState, NodeError
+from backend.app.agents.state import AgentState, NodeError, run_uuid
 from backend.app.agents.tools import (
     CHANNEL_VALIDATE,
     CLAIMS_CHECK,
@@ -1320,6 +1320,10 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             )
 
         business = UUID(state["business_id"])
+        # Read once, here, rather than inside `_actuate`: every action this node takes
+        # belongs to the same run, and a helper that re-derived it per call is a helper
+        # that can be given a state whose id disagrees with the page it just wrote.
+        run = run_uuid(state)
         refs: list[dict[str, Any]] = []
         not_published: list[str] = []
         errors: list[NodeError] = []
@@ -1329,6 +1333,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
                 box,
                 PUBLISH,
                 business=business,
+                run=run,
                 approver=approver,
                 action_type=action_type,
                 target=target,
@@ -1382,6 +1387,7 @@ def build_nodes(deps: NodeDeps) -> dict[str, Node]:
             await _notify_owner(
                 box,
                 business=business,
+                run=run,
                 approver=approver,
                 identity=deps.owner_notice,
                 published=published,
@@ -1556,6 +1562,7 @@ async def _actuate(
     tool: str,
     *,
     business: UUID,
+    run: UUID | None,
     approver: str,
     action_type: str,
     target: str,
@@ -1572,12 +1579,21 @@ async def _actuate(
     An allowlist refusal is re-raised, exactly as everywhere else in this module: that
     is a wiring fault or an attack, and it must be loud rather than degraded into a
     channel that quietly did not publish.
+
+    `run` is what attributes the effect to its cause. It reaches `actions.run_id`
+    through the ledger and `content_pieces.run_id` through the landing actuator, and
+    without it a published page cannot be joined back to the run that made it -- so a
+    lead count per run is unanswerable however good the click tracking is. It is
+    explicitly `UUID | None` rather than defaulted: a caller that forgot it would
+    silently go back to writing NULLs, which is the state this parameter exists to
+    leave, and a node driven by a test genuinely has no run.
     """
     return await _perform(
         box,
         tool,
         Actuation(
             business_id=business,
+            run_id=run,
             action_type=action_type,
             target=target,
             payload=dict(payload),
@@ -1679,6 +1695,7 @@ async def _notify_owner(
     box: NodeToolbox,
     *,
     business: UUID,
+    run: UUID | None,
     approver: str,
     identity: OwnerNoticeIdentity | None,
     published: Sequence[str],
@@ -1716,6 +1733,7 @@ async def _notify_owner(
         NOTIFY,
         build_owner_notice_actuation(
             business_id=business,
+            run_id=run,
             identity=identity,
             subject=f"Published {len(published)} of {total}",
             approved_by=approver,
