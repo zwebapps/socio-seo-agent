@@ -20,6 +20,7 @@ from backend.app.api import (
     auth,
     connections,
     cost,
+    dashboard,
     documents,
     feedback,
     health,
@@ -132,6 +133,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(admin_models.router)
     app.include_router(connections.router)
     app.include_router(cost.router)
+    app.include_router(dashboard.router)
     app.include_router(documents.router)
     app.include_router(onboarding.router)
     app.include_router(runs.router)
