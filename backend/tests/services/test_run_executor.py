@@ -15,6 +15,12 @@ from uuid import UUID
 import pytest
 
 from backend.app.agents.nodes import NodeDeps
+from backend.app.engines.crawl.contract import (
+    CrawlErrorInfo,
+    CrawlResult,
+    Heading,
+    PageFacts,
+)
 from backend.app.services import run_executor as executor_module
 from backend.app.services.run_executor import EXECUTOR_NODE, RunExecutor, summarise_crawl
 from backend.app.services.run_service import (
@@ -457,23 +463,41 @@ async def test_only_the_configured_number_of_runs_execute_at_once(
 # --------------------------------------------------------------------------- #
 
 
-class _Page:
-    def __init__(self, url: str, text: str) -> None:
-        self.url = url
-        self.status = 200
-        self.title = "Rohrreinigung Koblenz"
-        self.meta_description = "Notdienst"
-        self.word_count = 900
-        self.h_tree = [type("H", (), {"level": 2, "text": f"H{i}"})() for i in range(12)]
-        self.main_text = text
+def _Page(url: str, text: str) -> PageFacts:  # noqa: N802 - reads as the old stub did
+    """One crawled page, as the REAL contract.
+
+    These were hand-rolled duck-typed stubs, and they stopped being adequate when
+    `summarise_crawl` began running the SEO audit: the audit reads `images` and
+    `jsonld_blocks`, which a stub carrying six attributes silently lacked. The stub
+    would have kept passing while the production path crashed, because
+    `summarise_crawl` reaches everything else through `getattr` with a default.
+    Building the real model means the test exercises the shape production passes.
+    """
+    return PageFacts(
+        url=url,
+        status=200,
+        title="Rohrreinigung Koblenz",
+        meta_description="Notdienst",
+        word_count=900,
+        h_tree=[Heading(level=2, text=f"H{i}") for i in range(12)],
+        main_text=text,
+    )
 
 
-class _Crawl:
-    def __init__(self, pages: list[_Page]) -> None:
-        self.start_url = "https://mueller.example"
-        self.pages = pages
-        self.errors = ["one 500"]
-        self.truncated = True
+def _Crawl(pages: list[PageFacts]) -> CrawlResult:  # noqa: N802 - as above
+    return CrawlResult(
+        start_url="https://mueller.example",
+        pages=pages,
+        errors=[
+            CrawlErrorInfo(
+                url="https://mueller.example/boom",
+                code="http_status",
+                message="the blog returned 500",
+                status=500,
+            )
+        ],
+        truncated=True,
+    )
 
 
 def test_the_crawl_summary_bounds_what_enters_the_checkpoint() -> None:

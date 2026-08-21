@@ -61,6 +61,7 @@ from backend.app.core.config import get_settings
 from backend.app.db.adapters.action_store import PostgresActionStore
 from backend.app.db.session import session
 from backend.app.engines.nap import extract_nap_listings
+from backend.app.engines.seo import SiteAuditResult, audit_site
 from backend.app.llm.router import ModelRouter, UsageSink
 from backend.app.services.run_service import RunService
 from backend.app.services.usage_recorder import UsageRecorder
@@ -149,6 +150,8 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
     fail or silently stringify.
     """
     pages = list(getattr(result, "pages", []) or [])
+    start_url = str(getattr(result, "start_url", "") or "")
+    truncated = bool(getattr(result, "truncated", False))
     summarised: list[dict[str, Any]] = []
     for page in pages[:MAX_SUMMARISED_PAGES]:
         text = (getattr(page, "main_text", "") or "").strip()
@@ -172,7 +175,7 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
         "start_url": getattr(result, "start_url", None),
         "page_count": len(pages),
         "pages_summarised": len(summarised),
-        "truncated": bool(getattr(result, "truncated", False)),
+        "truncated": truncated,
         "error_count": len(list(getattr(result, "errors", []) or [])),
         # The NAP the site publishes about itself, extracted HERE because this is the
         # last point at which the full page facts exist. The summary deliberately
@@ -181,7 +184,35 @@ def summarise_crawl(result: Any) -> dict[str, Any]:
         # JSON-LD block would put them in the checkpoint, which is rewritten on every
         # node. A handful of listings is small; the blocks are not.
         "nap_sources": [listing.model_dump(mode="json") for listing in extract_nap_listings(pages)],
+        # The SEO audit of the customer's OWN site, extracted here for exactly the
+        # reason `nap_sources` is: this is the last point at which the full page facts
+        # exist, and the audit reads `images` and `jsonld_blocks`, both of which the
+        # summary above drops. Running it later would mean a second crawl of a site we
+        # have just finished crawling.
+        #
+        # Audited over EVERY page, then trimmed: the cross-page findings are the
+        # valuable half (a title duplicated across 40 pages is invisible in a sample of
+        # 25) so they have to see all of them, while the per-page list is bounded by the
+        # same `MAX_SUMMARISED_PAGES` as the summary because the checkpoint carrying it
+        # is rewritten once per node.
+        "seo_audit": _summarise_audit(audit_site(start_url, pages, truncated=truncated)),
     } | {"pages": summarised}
+
+
+def _summarise_audit(result: SiteAuditResult) -> dict[str, Any]:
+    """A `SiteAuditResult` bounded for the checkpoint.
+
+    `problem_count` and `worst_severity` are computed from the WHOLE audit before the
+    page list is trimmed, so a site whose 30th page is the broken one still reports a
+    problem -- a count taken after trimming would quietly become "problems among the
+    first 25 pages" while still being displayed as the site's total.
+    """
+    payload: dict[str, Any] = result.model_dump(mode="json")
+    payload["problem_count"] = result.problem_count
+    payload["worst_severity"] = result.worst_severity
+    payload["pages_audited"] = len(payload.get("pages") or [])
+    payload["pages"] = (payload.get("pages") or [])[:MAX_SUMMARISED_PAGES]
+    return payload
 
 
 async def _load_revocations() -> Mapping[str, frozenset[str]]:
