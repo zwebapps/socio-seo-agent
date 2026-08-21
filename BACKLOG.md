@@ -702,6 +702,18 @@ one an owner can see.
   the arithmetic, so the screen and the worker cannot disagree), turning it OFF stops the
   worker picking it up, and the screen states when the next run is due rather than implying
   it already happened.**
+  **BACKEND HALF LANDED** — `GET`/`PUT /api/v1/automation` (`api/automation.py`) over
+  `services/automation_settings_service.py`, business derived from the session, PUT a full
+  replacement, `nextRunAt` computed on every save and read-only on the wire, off clears the
+  slot as well as the mode, an explicit enable clears a system pause, and the channel rule is
+  now literally the same function `POST /runs` validates against
+  (`specs.canonicalise_known`). 20 tests on real SQL asserting through `due_automations()`
+  itself + 19 hermetic route tests; verified by hand against the dev database. **STILL OPEN,
+  and this box stays unticked for it: there is no SCREEN.** A route an owner cannot reach is
+  the same shape of gap this item was filed for, one layer up — so the remaining work is
+  `frontend/app/automation/` (or a panel on `/dashboard`) reading `knownChannels` /
+  `knownCadences` / `pollIntervalSeconds` from the response rather than restating them, and
+  rendering `nextRunAt` and `pausedReason` verbatim.
 
 - [ ] **N2 · A SCHEDULED run is not subject to the monthly USD cap** — found while verifying
   A7, and it is a money hole rather than a tidy-up. `_require_monthly_headroom` lives in

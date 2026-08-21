@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.auth import CurrentUser
 from backend.app.core.config import get_settings
 from backend.app.db.adapters.run_store import PostgresRunStore
-from backend.app.engines.channel.specs import CHANNEL_SPECS, canonical_channel, has_spec
+from backend.app.engines.channel.specs import canonicalise_known
 from backend.app.llm.pricing import format_usd
 from backend.app.services.cost_service import (
     MONTHLY_CAP_WINDOW_DAYS,
@@ -259,31 +259,17 @@ class StartRunRequest(BaseModel):
 
         A 422 naming the channel, not a silent drop, and the difference matters to the
         caller: a request for `["linkedin", "threads"]` that quietly rendered LinkedIn
-        alone would look like a successful run that simply produced nothing for
-        Threads. A channel with no entry in `engines/channel/specs.py` cannot be
-        length- or link-checked, which is already why `actuators/social.py` refuses
-        one, so accepting it here would only defer the refusal to a point where it
-        costs a model call.
+        alone would look like a successful run that simply produced nothing for Threads.
 
-        Canonicalised on the way through, so `facebook_post` and `facebook` are one
-        channel rather than two renderings of the same post.
+        The rule itself lives in `engines/channel/specs.canonicalise_known`, which is
+        also what `PUT /automation` validates against — two copies of it is how a
+        channel becomes acceptable when starting a run and refused when scheduling one.
+        `None` passes straight through: omitted means "the caller did not choose", which
+        `normalise_channels` resolves to the default set, and is not the same as `[]`.
         """
         if value is None:
             return None
-        canonical: list[str] = []
-        unknown: list[str] = []
-        for raw in value:
-            channel = canonical_channel(raw.strip())
-            if channel and has_spec(channel):
-                canonical.append(channel)
-            else:
-                unknown.append(raw.strip() or raw)
-        if unknown:
-            known = ", ".join(sorted(CHANNEL_SPECS))
-            raise ValueError(f"unknown channel(s): {', '.join(unknown)}. Known: {known}")
-        # Deduplicated, order preserved: it is the order the review screen and the
-        # export pack list the posts in.
-        return list(dict.fromkeys(canonical))
+        return canonicalise_known(value)
 
 
 class StartRunResponse(CamelModel):

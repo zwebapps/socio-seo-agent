@@ -40,7 +40,7 @@ layer that first needed it.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Final
 
@@ -49,6 +49,7 @@ __all__ = [
     "CHANNEL_SPECS",
     "ChannelSpec",
     "canonical_channel",
+    "canonicalise_known",
     "hard_char_limits",
     "has_spec",
     "spec_for",
@@ -183,6 +184,42 @@ def has_spec(channel: str) -> bool:
     actually grade, and an exception is the wrong control flow for a question.
     """
     return canonical_channel(channel) in CHANNEL_SPECS
+
+
+def canonicalise_known(channels: Iterable[str]) -> list[str]:
+    """``channels`` canonicalised and deduplicated, or ``ValueError`` naming the strays.
+
+    The single authority for "is this a channel a caller may ASK for", shared by every
+    write that accepts a channel list from outside — starting a run and configuring an
+    automation. It exists because those two had begun to answer the question separately,
+    and two copies of a validation rule is how a channel becomes acceptable on one route
+    and refused on the other.
+
+    **Refusing beats dropping, and only because a human is present.** A request for
+    ``["linkedin", "threads"]`` that quietly kept LinkedIn alone looks like a success
+    that simply produced nothing for Threads. A channel with no entry in
+    :data:`CHANNEL_SPECS` cannot be length- or link-checked, which is already why
+    ``actuators/social.py`` refuses one, so accepting it here only defers the refusal to
+    a point where it costs a model call. That is the opposite of
+    :func:`backend.app.agents.state.normalise_channels`, which DROPS — deliberately: it
+    reads a JSONB column written months ago, where the alternative to dropping is a run
+    that cannot start because a spec was retired after the row was stored.
+
+    Order is the caller's, deduplicated: it is the order the review screen and the export
+    pack list the posts in.
+    """
+    canonical: dict[str, None] = {}
+    unknown: list[str] = []
+    for raw in channels:
+        name = canonical_channel(raw)
+        if name and has_spec(name):
+            canonical[name] = None
+        else:
+            unknown.append(raw.strip() or raw)
+    if unknown:
+        known = ", ".join(sorted(CHANNEL_SPECS))
+        raise ValueError(f"unknown channel(s): {', '.join(unknown)}. Known: {known}")
+    return list(canonical)
 
 
 def hard_char_limits() -> dict[str, int]:
